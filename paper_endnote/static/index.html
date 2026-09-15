@@ -1,0 +1,101 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>论文 PDF → Zotero / EndNote</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <header>
+    <div>
+      <p class="eyebrow">LOCAL RESEARCH WORKFLOW</p>
+      <h1>论文 PDF → Zotero / EndNote</h1>
+      <p class="lede">整理 DOI 或题名，获取可用全文，并把题录与 PDF 写入指定文献库。</p>
+    </div>
+    <span id="system-badge" class="badge muted">检查环境…</span>
+  </header>
+
+  <main>
+    <nav class="tabs" aria-label="主导航">
+      <button class="tab active" data-tab="new">新建任务</button>
+      <button class="tab" data-tab="tasks">任务</button>
+      <button class="tab" data-tab="settings">设置</button>
+    </nav>
+
+    <section id="tab-new" class="panel tab-panel active">
+      <form id="batch-form">
+        <div class="grid two">
+          <label>批次名称<input id="batch-name" required maxlength="120" placeholder="例如：膜蛋白综述 2026-09"></label>
+          <label>文献管理器<select id="reference-manager"><option value="zotero">Zotero（推荐）</option><option value="endnote">EndNote</option></select></label>
+        </div>
+        <div class="grid two">
+          <label>目标模式<select id="library-mode"><option value="new">新建 collection/库</option><option value="existing">使用已有 collection/库</option></select></label>
+          <label><span id="target-label">Zotero collection 名称</span>
+          <input id="target-library" list="library-options" required value="DTN" placeholder="DTN">
+          <datalist id="library-options"></datalist>
+          <small id="target-help">Zotero 中将新建或复用这个 collection。</small>
+          </label>
+        </div>
+        <label>论文清单
+          <textarea id="items-text" rows="11" required placeholder="每行一个 DOI 或完整题名；也可粘贴含 doi,title,year,author 列的 CSV。"></textarea>
+        </label>
+        <div class="inline-actions">
+          <label class="file-button">读取 TXT/CSV<input id="list-file" type="file" accept=".txt,.csv,text/plain,text/csv"></label>
+          <span id="parse-summary" class="muted"></span>
+          <button class="primary" type="submit">创建并开始</button>
+        </div>
+      </form>
+    </section>
+
+    <section id="tab-tasks" class="tab-panel">
+      <div class="task-layout">
+        <aside class="panel task-list-panel">
+          <div class="section-title"><h2>批次</h2><button id="refresh-batches" class="quiet">刷新</button></div>
+          <div id="batch-list" class="batch-list"><p class="muted">尚无任务</p></div>
+        </aside>
+        <article id="task-detail" class="panel task-detail">
+          <div class="empty-state">选择一个批次查看论文状态。</div>
+        </article>
+      </div>
+    </section>
+
+    <section id="tab-settings" class="panel tab-panel">
+      <form id="settings-form">
+        <h2>服务设置</h2>
+        <p class="muted">Unpaywall 要求请求中提供电子邮箱；Crossref 邮箱用于 polite pool。设置仅保存在本机。</p>
+        <label>Crossref 联系邮箱<input id="crossref-email" type="email" autocomplete="email"></label>
+        <label>Unpaywall 联系邮箱<input id="unpaywall-email" type="email" autocomplete="email"></label>
+        <button class="primary" type="submit">保存设置</button>
+        <hr>
+        <h2>本机环境</h2>
+        <p class="muted">Zotero 10+ 需在 Settings → Advanced 启用本地 API，然后授权本工具写入。</p>
+        <button id="authorize-zotero" type="button">授权 Zotero 本地写入</button>
+        <pre id="system-info">加载中…</pre>
+      </form>
+    </section>
+  </main>
+
+  <dialog id="candidate-dialog">
+    <form method="dialog"><button class="dialog-close" value="cancel" aria-label="关闭">×</button></form>
+    <h2>确认题录</h2>
+    <p id="candidate-source" class="muted"></p>
+    <div class="inline-actions">
+      <input id="manual-doi" type="text" placeholder="补充 DOI，例如 10.1000/example">
+      <button id="resolve-doi" type="button">按 DOI 重新解析</button>
+    </div>
+    <div id="candidate-list"></div>
+  </dialog>
+
+  <dialog id="pdf-dialog">
+    <form method="dialog"><button class="dialog-close" value="cancel" aria-label="关闭">×</button></form>
+    <h2>确认 PDF</h2>
+    <p id="pdf-review-text"></p>
+    <label>版本<select id="pdf-version"><option value="published">正式发表版本</option><option value="accepted">作者接受稿</option><option value="preprint">预印本</option><option value="unknown">不确定</option></select></label>
+    <div class="inline-actions"><button id="reject-pdf" class="danger">拒绝</button><button id="accept-pdf" class="primary">接受 PDF</button></div>
+  </dialog>
+
+  <div id="toast" role="status" aria-live="polite"></div>
+  <script src="/static/app.js"></script>
+</body>
+</html>

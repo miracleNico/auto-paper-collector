@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=75", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "paper-endnote"
+version = "0.3.0"
+description = "Local Windows workflow for resolving papers, acquiring PDFs, and importing them into Zotero or EndNote."
+requires-python = ">=3.12"
+dependencies = [
+  "fastapi==0.115.14",
+  "httpx==0.28.1",
+  "playwright==1.52.0",
+  "pypdf==5.6.0",
+  "python-multipart==0.0.20",
+  "pywinauto==0.6.9",
+  "uvicorn==0.34.3",
+]
+
+[project.scripts]
+paper-endnote = "paper_endnote.app:main"
+
+[tool.setuptools.packages.find]
+include = ["paper_endnote*"]
+
+[tool.setuptools.package-data]
+paper_endnote = ["static/*"]

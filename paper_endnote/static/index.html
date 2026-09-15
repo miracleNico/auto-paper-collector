@@ -3,15 +3,15 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
-  <title>论文 PDF → Zotero / EndNote</title>
+  <title>论文 PDF → Zotero → EndNote</title>
   <link rel="stylesheet" href="/static/style.css">
 </head>
 <body>
   <header>
     <div>
       <p class="eyebrow">LOCAL RESEARCH WORKFLOW</p>
-      <h1>论文 PDF → Zotero / EndNote</h1>
-      <p class="lede">整理 DOI 或题名，获取可用全文，并把题录与 PDF 写入指定文献库。</p>
+      <h1>论文 PDF → Zotero → EndNote</h1>
+      <p class="lede">整理 DOI 或题名，获取可用全文，写入 Zotero，再导出 EndNote 可导入的 XML/PDF 包。</p>
     </div>
     <span id="system-badge" class="badge muted">检查环境…</span>
   </header>
@@ -27,16 +27,12 @@
       <form id="batch-form">
         <div class="grid two">
           <label>批次名称<input id="batch-name" required maxlength="120" placeholder="例如：膜蛋白综述 2026-09"></label>
-          <label>文献管理器<select id="reference-manager"><option value="zotero">Zotero（推荐）</option><option value="endnote">EndNote</option></select></label>
+          <label>目标模式<select id="library-mode"><option value="new">新建 Zotero collection</option><option value="existing">使用已有 collection</option></select></label>
         </div>
-        <div class="grid two">
-          <label>目标模式<select id="library-mode"><option value="new">新建 collection/库</option><option value="existing">使用已有 collection/库</option></select></label>
-          <label><span id="target-label">Zotero collection 名称</span>
-          <input id="target-library" list="library-options" required value="DTN" placeholder="DTN">
-          <datalist id="library-options"></datalist>
-          <small id="target-help">Zotero 中将新建或复用这个 collection。</small>
-          </label>
-        </div>
+        <label>Zotero collection 名称
+          <input id="target-library" required value="DTN" placeholder="DTN">
+          <small>题录和 PDF 先写入这个 Zotero collection，再导出给 EndNote。</small>
+        </label>
         <label>论文清单
           <textarea id="items-text" rows="11" required placeholder="每行一个 DOI 或完整题名；也可粘贴含 doi,title,year,author 列的 CSV。"></textarea>
         </label>
@@ -66,10 +62,14 @@
         <p class="muted">Unpaywall 要求请求中提供电子邮箱；Crossref 邮箱用于 polite pool。设置仅保存在本机。</p>
         <label>Crossref 联系邮箱<input id="crossref-email" type="email" autocomplete="email"></label>
         <label>Unpaywall 联系邮箱<input id="unpaywall-email" type="email" autocomplete="email"></label>
+        <label>EndNote 库路径（可选）
+          <input id="endnote-library" placeholder="C:\Users\...\DTN & FL.enl">
+          <small>填写已有 .enl 后，导出会把 PDF 子文件夹复制到该库的 .Data\PDF。仍需在 EndNote 中导入 XML。</small>
+        </label>
         <button class="primary" type="submit">保存设置</button>
         <hr>
         <h2>本机环境</h2>
-        <p class="muted">Zotero 10+ 需在 Settings → Advanced 启用本地 API，然后授权本工具写入。</p>
+        <p class="muted">Zotero 10+ 需在 Settings → Advanced 启用本地 API，然后授权本工具写入。EndNote 只接收导出的 XML/PDF 包，不再模拟菜单或鼠标。</p>
         <button id="authorize-zotero" type="button">授权 Zotero 本地写入</button>
         <pre id="system-info">加载中…</pre>
       </form>

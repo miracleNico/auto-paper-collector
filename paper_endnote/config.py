@@ -15,6 +15,7 @@ class Settings:
     backup_dir: Path
     browser_profile_dir: Path
     endnote_exe: Path
+    endnote_library: Path | None
     crossref_mailto: str
     unpaywall_email: str
     max_pdf_bytes: int = 100 * 1024 * 1024
@@ -31,6 +32,7 @@ class Settings:
                 r"C:\Program Files (x86)\EndNote 21\EndNote.exe",
             )
         )
+        library_value = os.environ.get("PAPER_ENDNOTE_LIBRARY", "").strip()
         settings = cls(
             app_root=app_root,
             runtime_dir=base,
@@ -40,6 +42,7 @@ class Settings:
             backup_dir=base / "backups",
             browser_profile_dir=base / "playwright-profile",
             endnote_exe=endnote,
+            endnote_library=Path(library_value).expanduser() if library_value else None,
             crossref_mailto=os.environ.get("PAPER_ENDNOTE_CROSSREF_EMAIL", "").strip(),
             unpaywall_email=os.environ.get("PAPER_ENDNOTE_UNPAYWALL_EMAIL", "").strip(),
         )

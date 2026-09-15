@@ -51,6 +51,7 @@ class Database:
             status TEXT NOT NULL DEFAULT 'draft',
             paused INTEGER NOT NULL DEFAULT 0,
             backup_path TEXT,
+            endnote_export_path TEXT,
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL,
             error TEXT
@@ -125,8 +126,10 @@ class Database:
             columns = {row[1] for row in connection.execute("PRAGMA table_info(batches)")}
             if "reference_manager" not in columns:
                 connection.execute(
-                    "ALTER TABLE batches ADD COLUMN reference_manager TEXT NOT NULL DEFAULT 'endnote'"
+                    "ALTER TABLE batches ADD COLUMN reference_manager TEXT NOT NULL DEFAULT 'zotero'"
                 )
+            if "endnote_export_path" not in columns:
+                connection.execute("ALTER TABLE batches ADD COLUMN endnote_export_path TEXT")
 
     def create_batch(
         self,
@@ -135,7 +138,7 @@ class Database:
         target_library: str,
         library_mode: str,
         items: Iterable[dict[str, Any]],
-        reference_manager: str = "endnote",
+        reference_manager: str = "zotero",
     ) -> str:
         batch_id = str(uuid.uuid4())
         now = utc_now()
@@ -256,7 +259,10 @@ class Database:
             )
 
     def update_batch(self, batch_id: str, **fields: Any) -> None:
-        allowed = {"status", "paused", "backup_path", "error", "library_mode", "reference_manager"}
+        allowed = {
+            "status", "paused", "backup_path", "endnote_export_path", "error",
+            "library_mode", "reference_manager",
+        }
         unknown = set(fields) - allowed
         if unknown:
             raise ValueError(f"Unsupported batch fields: {sorted(unknown)}")

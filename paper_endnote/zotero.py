@@ -347,3 +347,64 @@ class ZoteroAdapter:
             "attachment_key": attachment_key,
             "collection_key": collection_key,
         }
+
+    @staticmethod
+    def metadata_from_item(item: dict[str, Any]) -> dict[str, Any]:
+        data = _data(item)
+        authors: list[str] = []
+        for creator in data.get("creators") or []:
+            if (creator.get("creatorType") or "author") != "author":
+                continue
+            if creator.get("name"):
+                authors.append(str(creator["name"]).strip())
+            elif creator.get("lastName"):
+                family = str(creator.get("lastName") or "").strip()
+                given = str(creator.get("firstName") or "").strip()
+                authors.append(", ".join(part for part in (family, given) if part))
+        date = str(data.get("date") or "")
+        year_match = date[:4] if date[:4].isdigit() else None
+        return {
+            "doi": normalize_doi(data.get("DOI")),
+            "title": data.get("title") or "",
+            "year": int(year_match) if year_match else None,
+            "authors": authors,
+            "journal": data.get("publicationTitle") or "",
+            "volume": data.get("volume") or "",
+            "issue": data.get("issue") or "",
+            "pages": data.get("pages") or "",
+            "url": data.get("url") or "",
+            "abstract": data.get("abstractNote") or "",
+            "type": "journal-article",
+        }
+
+    async def export_row(self, item_key: str, fallback_metadata: dict[str, Any] | None = None) -> dict[str, Any]:
+        await self._ensure_server()
+        item = (await self._request("GET", f"/users/0/items/{item_key}")).json()
+        metadata = self.metadata_from_item(item)
+        if fallback_metadata:
+            for key in ("doi", "title", "year", "authors", "journal", "volume", "issue", "pages", "url"):
+                if not metadata.get(key) and fallback_metadata.get(key):
+                    metadata[key] = fallback_metadata[key]
+        children = await self._children(item_key)
+        pdf_path = None
+        attachment_key = None
+        for child in children:
+            data = _data(child)
+            if data.get("contentType") != "application/pdf":
+                continue
+            key = data.get("key") or child.get("key")
+            path = await self._attachment_path(key)
+            if path and path.is_file():
+                pdf_path = path
+                attachment_key = key
+                result = validate_pdf(
+                    path, expected_doi=metadata.get("doi"), expected_title=metadata.get("title")
+                )
+                if result.valid_pdf and result.identity == "verified" and result.role == "main":
+                    break
+        return {
+            "zotero_key": item_key,
+            "attachment_key": attachment_key,
+            "metadata": metadata,
+            "pdf_path": pdf_path,
+        }

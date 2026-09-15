@@ -1,26 +1,45 @@
 from __future__ import annotations
 
+import json
 import os
 import re
 import shutil
-import subprocess
-import threading
-import time
-import uuid
-import xml.etree.ElementTree as ET
 import zipfile
-from dataclasses import asdict, dataclass
-from datetime import datetime
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable
 from urllib.parse import unquote
+from xml.etree import ElementTree as ET
 
-from .inputs import normalize_doi, normalize_title, title_similarity
+from .downloader import safe_filename
+from .inputs import normalize_doi, title_similarity
 from .pdf_validation import validate_pdf
 
 
 class EndNoteError(RuntimeError):
     pass
+
+
+REF_TYPE_JOURNAL = "17"
+IMPORT_INSTRUCTIONS = """Zotero → EndNote 导入说明
+
+本目录由本机工具从 Zotero collection 导出，不要用 EndNote 桌面控件自动写入。
+
+方法 A（推荐，本机导入）
+1. 打开 EndNote，打开或新建目标库。
+2. File → Import → File。
+3. Import File 选择本目录的 records.xml。
+4. Import Option 选择 EndNote Generated XML。
+5. 点击 Import。XML 使用本机绝对路径指向 PDF 子目录中的文件。
+
+方法 B（与 Clarivate 文档一致）
+1. 按方法 A 导入 records-internal.xml。
+2. 把本目录 PDF 文件夹中的全部子文件夹复制到：
+   <库名>.Data\\PDF\\
+3. 重新打开该库，让 EndNote 索引附件。
+
+不要重复导入同一批次，否则会生成重复题录。更新时请导入到新库，或只导入新增条目。
+"""
 
 
 def _plain(value: Any) -> str:
@@ -57,6 +76,41 @@ def write_enw(path: Path, metadata: dict[str, Any]) -> Path:
     return path
 
 
+def write_ris(path: Path, records: Iterable["EndNoteExportRecord"]) -> Path:
+    blocks: list[str] = []
+    for record in records:
+        metadata = record.metadata
+        lines = ["TY  - JOUR"]
+        for author in metadata.get("authors") or []:
+            lines.append(f"AU  - {_plain(author)}")
+        if metadata.get("title"):
+            lines.append(f"TI  - {_plain(metadata['title'])}")
+        if metadata.get("journal"):
+            lines.append(f"JO  - {_plain(metadata['journal'])}")
+        if metadata.get("year"):
+            lines.append(f"PY  - {_plain(metadata['year'])}")
+        if metadata.get("volume"):
+            lines.append(f"VL  - {_plain(metadata['volume'])}")
+        if metadata.get("issue"):
+            lines.append(f"IS  - {_plain(metadata['issue'])}")
+        if metadata.get("pages"):
+            lines.append(f"SP  - {_plain(metadata['pages'])}")
+        doi = normalize_doi(metadata.get("doi"))
+        if doi:
+            lines.append(f"DO  - {doi}")
+        if metadata.get("url"):
+            lines.append(f"UR  - {_plain(metadata['url'])}")
+        elif doi:
+            lines.append(f"UR  - https://doi.org/{doi}")
+        if record.copied_pdf and record.copied_pdf.is_file():
+            lines.append(f"L1  - {record.copied_pdf.resolve().as_uri()}")
+        lines.append("ER  - ")
+        blocks.append("\n".join(lines))
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("\n\n".join(blocks) + ("\n" if blocks else ""), encoding="utf-8-sig", newline="\n")
+    return path
+
+
 @dataclass(frozen=True)
 class EndNoteRecord:
     record_number: str | None
@@ -65,6 +119,17 @@ class EndNoteRecord:
     year: int | None
     authors: list[str]
     attachments: list[str]
+
+
+@dataclass
+class EndNoteExportRecord:
+    rec_number: int
+    metadata: dict[str, Any]
+    source_pdf: Path | None
+    folder_id: str
+    filename: str
+    copied_pdf: Path | None = None
+    zotero_key: str | None = None
 
 
 def _text(element: ET.Element | None) -> str:
@@ -130,6 +195,21 @@ def resolve_internal_attachment(library_path: Path, attachment: str) -> Path | N
     return library_path.with_suffix(".Data") / "PDF" / relative
 
 
+def resolve_export_attachment(export_dir: Path, attachment: str) -> Path | None:
+    attachment = unquote(attachment)
+    if attachment.casefold().startswith("internal-pdf://"):
+        relative = attachment[len("internal-pdf://") :].lstrip("/\\").replace("/", os.sep)
+        candidate = export_dir / "PDF" / relative
+        return candidate if candidate.is_file() else None
+    if attachment.casefold().startswith("file:"):
+        value = attachment.replace("file:///", "")
+        if re.match(r"^/[A-Za-z]:/", value):
+            value = value[1:]
+        candidate = Path(value)
+        return candidate if candidate.is_file() else None
+    return None
+
+
 def verified_main_attachments(
     library_path: Path, record: EndNoteRecord, metadata: dict[str, Any]
 ) -> list[Path]:
@@ -149,394 +229,194 @@ def verified_main_attachments(
     return result
 
 
-class EndNoteAdapter:
-    """Serializes all EndNote UI writes and verifies through exported XML.
+def _xml_text(parent: ET.Element, tag: str, value: Any) -> ET.Element | None:
+    text = _plain(value)
+    if not text:
+        return None
+    element = ET.SubElement(parent, tag)
+    element.text = text
+    return element
 
-    EndNote does not expose a supported public automation API. This adapter uses
-    the native import and attachment UI, scoped to one explicitly opened library.
-    """
 
-    def __init__(self, endnote_exe: Path, generated_dir: Path, backup_dir: Path):
-        self.endnote_exe = Path(endnote_exe)
-        self.generated_dir = Path(generated_dir)
-        self.backup_dir = Path(backup_dir)
-        self._lock = threading.Lock()
+def _attachment_url(record: EndNoteExportRecord, *, internal: bool) -> str | None:
+    if not record.copied_pdf or not record.copied_pdf.is_file():
+        return None
+    if internal:
+        return f"internal-pdf://{record.folder_id}/{record.filename}"
+    return record.copied_pdf.resolve().as_uri()
 
-    def probe(self) -> dict[str, Any]:
-        process_ids = self.process_ids()
-        visible_windows = self.visible_window_titles()
-        result: dict[str, Any] = {
-            "platform": os.name,
-            "endnote_exe": str(self.endnote_exe),
-            "endnote_exists": self.endnote_exe.exists(),
-            "pywinauto": False,
-            "ready": False,
-            "process_ids": process_ids,
-            "visible_windows": visible_windows,
-            "details": [],
-        }
-        try:
-            import pywinauto  # noqa: F401
 
-            result["pywinauto"] = True
-        except Exception as exc:
-            result["details"].append(f"pywinauto 不可用：{exc}")
-        if os.name != "nt":
-            result["details"].append("EndNote 自动化仅支持 Windows")
-        if not self.endnote_exe.exists():
-            result["details"].append("未找到 EndNote.exe")
-        if process_ids and not visible_windows:
-            result["details"].append("EndNote 正在后台运行，但没有可控制的窗口；请在任务管理器中结束该后台进程后重试")
-        result["ready"] = bool(
-            os.name == "nt"
-            and result["endnote_exists"]
-            and result["pywinauto"]
-            and not (process_ids and not visible_windows)
-        )
-        return result
+def write_endnote_xml(
+    path: Path,
+    records: Iterable[EndNoteExportRecord],
+    *,
+    internal_pdf: bool,
+) -> Path:
+    root = ET.Element("xml")
+    records_el = ET.SubElement(root, "records")
+    for record in records:
+        metadata = record.metadata
+        item = ET.SubElement(records_el, "record")
+        _xml_text(item, "rec-number", record.rec_number)
+        ref_type = ET.SubElement(item, "ref-type")
+        ref_type.set("name", "Journal Article")
+        ref_type.text = REF_TYPE_JOURNAL
+        contributors = ET.SubElement(item, "contributors")
+        authors_el = ET.SubElement(contributors, "authors")
+        authors = list(metadata.get("authors") or [])
+        if authors:
+            for author in authors:
+                _xml_text(authors_el, "author", author)
+        else:
+            ET.SubElement(authors_el, "author")
+        titles = ET.SubElement(item, "titles")
+        _xml_text(titles, "title", metadata.get("title"))
+        if metadata.get("journal"):
+            _xml_text(titles, "secondary-title", metadata.get("journal"))
+            periodical = ET.SubElement(item, "periodical")
+            _xml_text(periodical, "full-title", metadata.get("journal"))
+        dates = ET.SubElement(item, "dates")
+        _xml_text(dates, "year", metadata.get("year"))
+        _xml_text(item, "volume", metadata.get("volume"))
+        _xml_text(item, "number", metadata.get("issue"))
+        _xml_text(item, "pages", metadata.get("pages"))
+        doi = normalize_doi(metadata.get("doi"))
+        _xml_text(item, "electronic-resource-num", doi)
+        urls = ET.SubElement(item, "urls")
+        pdf_url = _attachment_url(record, internal=internal_pdf)
+        if pdf_url:
+            pdf_urls = ET.SubElement(urls, "pdf-urls")
+            _xml_text(pdf_urls, "url", pdf_url)
+        related = metadata.get("url") or (f"https://doi.org/{doi}" if doi else "")
+        if related:
+            related_urls = ET.SubElement(urls, "related-urls")
+            _xml_text(related_urls, "url", related)
+        source_app = ET.SubElement(item, "source-app")
+        source_app.set("name", "Zotero")
+        source_app.text = "Zotero"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    ET.indent(root, space="  ")
+    path.write_text(
+        '<?xml version="1.0" encoding="UTF-8"?>\n' + ET.tostring(root, encoding="unicode"),
+        encoding="utf-8",
+        newline="\n",
+    )
+    return path
 
-    @staticmethod
-    def validate_library_path(path: str, mode: str) -> Path:
-        library = Path(path).expanduser().resolve()
-        if library.suffix.casefold() != ".enl":
-            raise EndNoteError("目标库必须使用 .enl 扩展名")
-        if mode == "existing" and not library.is_file():
-            raise EndNoteError(f"EndNote 库不存在：{library}")
-        if mode == "new" and (library.exists() or library.with_suffix(".Data").exists()):
-            raise EndNoteError(f"目标库或 .Data 目录已经存在：{library}")
-        if not library.parent.exists():
-            raise EndNoteError(f"目标目录不存在：{library.parent}")
-        return library
 
-    def create_filesystem_backup(self, library: Path, batch_id: str) -> Path:
-        """Create a recoverable snapshot while EndNote is closed.
+def copy_pdf_for_export(record: EndNoteExportRecord, pdf_root: Path) -> Path | None:
+    if not record.source_pdf or not Path(record.source_pdf).is_file():
+        return None
+    destination = pdf_root / record.folder_id / record.filename
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(record.source_pdf, destination)
+    record.copied_pdf = destination
+    return destination
 
-        The caller must use `is_endnote_running` first. Copying an open EndNote
-        database could produce an inconsistent snapshot.
-        """
-        if self.is_endnote_running():
-            raise EndNoteError("创建备份前请关闭 EndNote；已打开的库不能安全复制")
-        if not library.exists():
-            raise EndNoteError(f"无法备份不存在的库：{library}")
-        timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-        destination = self.backup_dir / f"{library.stem}-{timestamp}-{batch_id[:8]}.zip"
-        data_dir = library.with_suffix(".Data")
-        with zipfile.ZipFile(destination, "x", compression=zipfile.ZIP_DEFLATED) as archive:
-            archive.write(library, library.name)
-            if data_dir.is_dir():
-                for child in data_dir.rglob("*"):
-                    if child.is_file():
-                        archive.write(child, str(Path(data_dir.name) / child.relative_to(data_dir)))
+
+def copy_pdfs_into_endnote_library(pdf_root: Path, library: Path) -> Path:
+    library = Path(library).expanduser().resolve()
+    if library.suffix.casefold() != ".enl":
+        raise EndNoteError("目标库必须使用 .enl 扩展名")
+    if not library.is_file():
+        raise EndNoteError(f"EndNote 库不存在：{library}")
+    destination = library.with_suffix(".Data") / "PDF"
+    destination.mkdir(parents=True, exist_ok=True)
+    if not pdf_root.is_dir():
         return destination
+    for child in pdf_root.iterdir():
+        if not child.is_dir():
+            continue
+        target = destination / child.name
+        if target.exists():
+            shutil.rmtree(target)
+        shutil.copytree(child, target)
+    return destination
 
-    @staticmethod
-    def is_endnote_running() -> bool:
-        return bool(EndNoteAdapter.process_ids())
 
-    @staticmethod
-    def process_ids() -> list[int]:
+def zip_export_package(export_dir: Path, zip_path: Path | None = None) -> Path:
+    zip_path = zip_path or export_dir.with_suffix(".zip")
+    zip_path.parent.mkdir(parents=True, exist_ok=True)
+    with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        for child in export_dir.rglob("*"):
+            if child.is_file():
+                archive.write(child, child.relative_to(export_dir))
+    return zip_path
+
+
+def build_endnote_export_package(
+    records: list[EndNoteExportRecord],
+    destination: Path,
+    *,
+    collection_name: str,
+    library: Path | None = None,
+) -> dict[str, Any]:
+    if destination.exists():
+        shutil.rmtree(destination)
+    destination.mkdir(parents=True, exist_ok=True)
+    pdf_root = destination / "PDF"
+    pdf_root.mkdir(parents=True, exist_ok=True)
+    copied = 0
+    for record in records:
+        if copy_pdf_for_export(record, pdf_root):
+            copied += 1
+    xml_path = write_endnote_xml(destination / "records.xml", records, internal_pdf=False)
+    internal_xml = write_endnote_xml(destination / "records-internal.xml", records, internal_pdf=True)
+    ris_path = write_ris(destination / "records.ris", records)
+    (destination / "IMPORT.txt").write_text(IMPORT_INSTRUCTIONS, encoding="utf-8", newline="\n")
+    library_pdf_dir = None
+    library_copy_error = None
+    if library:
         try:
-            import win32api
-            import win32con
-            import win32process
-
-            result: list[int] = []
-            for pid in win32process.EnumProcesses():
-                try:
-                    handle = win32api.OpenProcess(win32con.PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
-                    try:
-                        executable = win32process.GetModuleFileNameEx(handle, 0)
-                    finally:
-                        handle.Close()
-                    if Path(executable).name.casefold() == "endnote.exe":
-                        result.append(pid)
-                except Exception:
-                    continue
-            return result
-        except Exception:
-            return []
-
-    @staticmethod
-    def visible_window_titles() -> list[str]:
-        try:
-            from pywinauto import Desktop
-
-            return [
-                window.window_text() for window in Desktop(backend="win32").windows()
-                if "endnote" in window.window_text().casefold()
-            ]
-        except Exception:
-            return []
-
-    def _desktop(self):
-        from pywinauto import Desktop
-
-        return Desktop(backend="win32")
-
-    @staticmethod
-    def _main_windows(desktop) -> list[Any]:
-        result: list[Any] = []
-        for window in desktop.windows():
-            try:
-                if (
-                    window.is_visible()
-                    and window.class_name() != "#32770"
-                    and re.match(
-                        r"^EndNote(?:\s+\d+)?(?:\s+-|$)",
-                        window.window_text(),
-                        re.IGNORECASE,
-                    )
-                ):
-                    result.append(window)
-            except Exception:
-                # EndNote recreates its frame while a library is loading.  A
-                # wrapper returned by EnumWindows may therefore already be
-                # stale by the time its properties are inspected.
-                continue
-        return result
-
-    def _target_window(self, library: Path, timeout: float = 30.0):
-        deadline = time.monotonic() + timeout
-        stem = library.stem.casefold()
-        while time.monotonic() < deadline:
-            windows = self._main_windows(self._desktop())
-            candidates = [w for w in windows if stem in w.window_text().casefold()]
-            if len(candidates) == 1:
-                return candidates[0]
-            if len(candidates) > 1:
-                raise EndNoteError(f"发现多个同名 EndNote 窗口：{library.stem}")
-            time.sleep(0.5)
-        raise EndNoteError(f"无法确认目标 EndNote 库窗口：{library}")
-
-    def _focus_target_window(self, library: Path, timeout: float = 30.0):
-        """Reacquire the EndNote frame until a live handle accepts focus."""
-        deadline = time.monotonic() + timeout
-        last_error: Exception | None = None
-        while time.monotonic() < deadline:
-            try:
-                window = self._target_window(library, timeout=min(2.0, max(0.5, deadline - time.monotonic())))
-                window.set_focus()
-                return window
-            except Exception as exc:
-                last_error = exc
-                time.sleep(0.5)
-        raise EndNoteError(f"无法聚焦目标 EndNote 库窗口：{library}；{last_error}")
-
-    def open_library(self, library: Path) -> None:
-        if not self.endnote_exe.exists():
-            raise EndNoteError(f"未找到 EndNote：{self.endnote_exe}")
-        desktop = self._desktop()
-        stem = library.stem.casefold()
-        existing = [
-            window for window in self._main_windows(desktop)
-            if stem in window.window_text().casefold()
-        ]
-        if len(existing) == 1:
-            self._focus_target_window(library)
-            return
-        if len(existing) > 1:
-            raise EndNoteError(f"发现多个同名 EndNote 窗口：{library.stem}")
-        other_windows = self._main_windows(desktop)
-        if other_windows:
-            titles = ", ".join(window.window_text() for window in other_windows)
-            raise EndNoteError(f"写入前请关闭其他 EndNote 库窗口：{titles}")
-        subprocess.Popen([str(self.endnote_exe), str(library)])
-        self._focus_target_window(library)
-
-    def create_library(self, library: Path) -> None:
-        from pywinauto import Desktop, keyboard
-
-        if library.exists() or library.with_suffix(".Data").exists():
-            raise EndNoteError(f"不会覆盖现有库：{library}")
-        if self.process_ids() and not self.visible_window_titles():
-            raise EndNoteError("EndNote 后台进程没有可见窗口；请先在任务管理器中结束 EndNote.exe")
-        desktop = Desktop(backend="win32")
-        windows = self._main_windows(desktop)
-        if len(windows) > 1:
-            raise EndNoteError("创建新库前请只保留一个 EndNote 主窗口")
-        window = windows[0] if windows else None
-        if window is None:
-            subprocess.Popen([str(self.endnote_exe)])
-            deadline = time.monotonic() + 30
-            while time.monotonic() < deadline:
-                windows = self._main_windows(desktop)
-                if len(windows) == 1:
-                    window = windows[0]
-                    break
-                if len(windows) > 1:
-                    raise EndNoteError("EndNote 启动后出现多个主窗口，无法安全选择")
-                time.sleep(0.5)
-        if window is None:
-            raise EndNoteError("EndNote 未能启动")
-        window.set_focus()
-        try:
-            window.menu_select("File->New...")
-        except Exception:
-            keyboard.send_keys("%fn")
-        dialog = Desktop(backend="win32").window(class_name="#32770")
-        dialog.wait("visible", timeout=15)
-        self._fill_file_dialog(dialog, library)
-        dialog.child_window(title_re="Save|保存", class_name="Button").click()
-        self._target_window(library)
-
-    @staticmethod
-    def _fill_file_dialog(dialog, path: Path) -> None:
-        from pywinauto import keyboard
-
-        edit = dialog.child_window(class_name="Edit")
-        try:
-            edit.set_edit_text(str(path))
-        except Exception:
-            dialog.set_focus()
-            keyboard.send_keys("^a")
-            keyboard.send_keys(str(path), with_spaces=True)
-
-    def export_xml(self, library: Path, output: Path) -> Path:
-        from pywinauto import Desktop, keyboard
-
-        output.parent.mkdir(parents=True, exist_ok=True)
-        window = self._focus_target_window(library)
-        try:
-            window.menu_select("File->Export...")
-        except Exception:
-            keyboard.send_keys("^e")
-        dialog = Desktop(backend="win32").window(class_name="#32770")
-        dialog.wait("visible", timeout=15)
-        self._fill_file_dialog(dialog, output)
-        combos = dialog.descendants(class_name="ComboBox")
-        selected_xml = False
-        for combo in combos:
-            try:
-                choices = combo.item_texts()
-                xml_choice = next((item for item in choices if "XML" in item.upper()), None)
-                if xml_choice:
-                    combo.select(xml_choice)
-                    selected_xml = True
-                    break
-            except Exception:
-                continue
-        if not selected_xml:
-            raise EndNoteError("导出对话框中未找到 XML 文件类型")
-        button = dialog.child_window(title_re="Save|保存", class_name="Button")
-        button.click()
-        deadline = time.monotonic() + 20
-        while time.monotonic() < deadline and not output.exists():
-            time.sleep(0.25)
-        if not output.exists():
-            raise EndNoteError("EndNote XML 导出未生成文件")
-        return output
-
-    def import_enw(self, library: Path, enw_path: Path) -> None:
-        """Import one tagged record into the explicitly opened library."""
-        self._focus_target_window(library)
-        subprocess.Popen([str(self.endnote_exe), str(enw_path)])
-        time.sleep(2.0)
-        self._focus_target_window(library)
-
-    def select_reference(self, library: Path, query: str) -> None:
-        from pywinauto import keyboard
-
-        window = self._focus_target_window(library)
-        keyboard.send_keys("^f")
-        time.sleep(0.3)
-        keyboard.send_keys("^a")
-        keyboard.send_keys(query, with_spaces=True)
-        keyboard.send_keys("{ENTER}")
-        time.sleep(1.0)
-        keyboard.send_keys("^a")
-
-    def attach_pdf(self, library: Path, query: str, pdf_path: Path) -> None:
-        from pywinauto import Desktop, keyboard
-
-        self.select_reference(library, query)
-        window = self._focus_target_window(library)
-        try:
-            window.menu_select("References->File Attachments->Attach File...")
-        except Exception as exc:
-            raise EndNoteError("无法打开 EndNote 的 Attach File 对话框") from exc
-        dialog = Desktop(backend="win32").window(class_name="#32770")
-        dialog.wait("visible", timeout=15)
-        self._fill_file_dialog(dialog, pdf_path)
-        for checkbox in dialog.descendants(class_name="Button"):
-            try:
-                if "copy this file" in checkbox.window_text().casefold() and checkbox.get_check_state() == 0:
-                    checkbox.click()
-            except Exception:
-                continue
-        open_button = dialog.child_window(title_re="Open|打开", class_name="Button")
-        open_button.click()
-        time.sleep(1.0)
-
-    def prepare_index(self, library: Path, batch_id: str) -> tuple[Path, list[EndNoteRecord]]:
-        output = self.generated_dir / batch_id / f"index-{uuid.uuid4().hex}.xml"
-        self.export_xml(library, output)
-        return output, parse_endnote_xml(output)
-
-    def commit_paper(self, library: Path, paper_id: str, metadata: dict[str, Any], pdf_path: Path | None) -> dict[str, Any]:
-        """Commit one paper and return verified state.
-
-        This method is intentionally serialized because EndNote UI operations
-        and SQLite state cannot be committed atomically.
-        """
-        with self._lock:
-            before_path, before = self.prepare_index(library, paper_id)
-            existing = match_records(before, metadata)
-            if len(existing) > 1:
-                raise EndNoteError("目标库中有多个匹配题录，需要人工选择")
-            created = False
-            if not existing:
-                enw = write_enw(self.generated_dir / paper_id / "record.enw", metadata)
-                self.import_enw(library, enw)
-                created = True
-            after_meta_path, after_meta = self.prepare_index(library, paper_id)
-            matched = match_records(after_meta, metadata)
-            if len(matched) != 1:
-                raise EndNoteError(f"导入后无法唯一定位题录（匹配数：{len(matched)}）")
-            record = matched[0]
-            existing_main = verified_main_attachments(library, record, metadata)
-            attached = False
-            if pdf_path and not existing_main:
-                wanted_hash = _sha256(pdf_path)
-                already = False
-                for attachment in record.attachments:
-                    resolved = resolve_internal_attachment(library, attachment)
-                    if resolved and resolved.is_file() and _sha256(resolved) == wanted_hash:
-                        already = True
-                        break
-                if not already:
-                    self.attach_pdf(library, metadata.get("doi") or metadata.get("title") or "", pdf_path)
-                    attached = True
-            final_path, final_records = self.prepare_index(library, paper_id)
-            final_match = match_records(final_records, metadata)
-            if len(final_match) != 1:
-                raise EndNoteError("最终核验无法唯一定位题录")
-            final = final_match[0]
-            if pdf_path and not existing_main:
-                wanted_hash = _sha256(pdf_path)
-                verified_attachment = False
-                for attachment in final.attachments:
-                    resolved = resolve_internal_attachment(library, attachment)
-                    if resolved and resolved.is_file() and _sha256(resolved) == wanted_hash:
-                        verified_attachment = True
-                        break
-                if not verified_attachment:
-                    raise EndNoteError("最终核验未找到本次 PDF 的库内相对附件")
-            return {
-                "created": created,
-                "attached": attached,
-                "existing_full_text": bool(existing_main),
-                "existing_full_text_paths": [str(path) for path in existing_main],
-                "record_number": final.record_number,
-                "attachments": final.attachments,
-                "xml_snapshot": str(final_path),
+            library_pdf_dir = str(copy_pdfs_into_endnote_library(pdf_root, library))
+        except EndNoteError as exc:
+            library_copy_error = str(exc)
+    zip_path = zip_export_package(destination)
+    manifest = {
+        "collection": collection_name,
+        "record_count": len(records),
+        "pdf_count": copied,
+        "xml": str(xml_path),
+        "xml_internal": str(internal_xml),
+        "ris": str(ris_path),
+        "zip": str(zip_path),
+        "library_pdf_dir": library_pdf_dir,
+        "library_copy_error": library_copy_error,
+        "records": [
+            {
+                "rec_number": record.rec_number,
+                "doi": normalize_doi(record.metadata.get("doi")),
+                "title": record.metadata.get("title"),
+                "zotero_key": record.zotero_key,
+                "pdf": str(record.copied_pdf) if record.copied_pdf else None,
             }
+            for record in records
+        ],
+    }
+    (destination / "manifest.json").write_text(
+        json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+    return manifest
 
 
-def _sha256(path: Path) -> str:
-    import hashlib
+def export_filename(metadata: dict[str, Any], fallback: str) -> str:
+    doi = normalize_doi(metadata.get("doi"))
+    stem = doi.replace("/", "_") if doi else _plain(metadata.get("title")) or fallback
+    return safe_filename(f"{stem}.pdf")
 
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
+
+def probe_endnote(endnote_exe: Path, library: Path | None = None) -> dict[str, Any]:
+    result: dict[str, Any] = {
+        "platform": os.name,
+        "endnote_exe": str(endnote_exe),
+        "endnote_exists": Path(endnote_exe).exists(),
+        "library": str(library) if library else None,
+        "library_exists": bool(library and Path(library).is_file()),
+        "ready": True,
+        "details": [
+            "EndNote 不再通过桌面控件写入。提交到 Zotero 后导出导入包，再由 EndNote 导入 XML。"
+        ],
+    }
+    if library and not Path(library).is_file():
+        result["details"].append(f"已配置的 EndNote 库不存在：{library}")
+    return result

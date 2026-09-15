@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import tempfile
 import unittest
+from pathlib import Path
 
 import httpx
 
@@ -81,6 +83,57 @@ class ZoteroAsyncTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["record_number"], "ITEM1234")
         self.assertTrue(result["created"])
         self.assertIn('"collections":["COLL1234"]', created_items[0].replace(" ", ""))
+
+    async def test_export_row_reads_zotero_file_url(self) -> None:
+        pdf_path = None
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            headers = {
+                "Zotero-Server-ID": "SERVER123",
+                "Zotero-API-Version": "3",
+                "X-Zotero-Version": "10.0.2",
+            }
+            path = request.url.path
+            if path == "/api/":
+                return httpx.Response(200, headers=headers, json={})
+            if path == "/api/users/0/items/ITEM1234":
+                return httpx.Response(
+                    200,
+                    headers=headers,
+                    json={
+                        "data": {
+                            "key": "ITEM1234",
+                            "DOI": "10.1000/example",
+                            "title": "An Example",
+                            "date": "2024",
+                            "creators": [{"creatorType": "author", "firstName": "Jane", "lastName": "Doe"}],
+                        }
+                    },
+                )
+            if path == "/api/users/0/items/ITEM1234/children":
+                return httpx.Response(
+                    200,
+                    headers=headers,
+                    json=[{"data": {"key": "FILE1234", "contentType": "application/pdf"}}],
+                )
+            if path == "/api/users/0/items/FILE1234/file/view/url":
+                return httpx.Response(200, headers=headers, text=pdf_path.as_uri())
+            return httpx.Response(404, headers=headers, text=path)
+
+        with tempfile.TemporaryDirectory() as directory:
+            pdf_path = Path(directory) / "paper.pdf"
+            pdf_path.write_bytes(b"%PDF-1.4\n1 0 obj<<>>endobj\ntrailer<<>>\n%%EOF\n")
+            adapter = ZoteroAdapter(api_key="test-key")
+            await adapter.client.aclose()
+            adapter.client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+            try:
+                row = await adapter.export_row("ITEM1234")
+            finally:
+                await adapter.close()
+        self.assertEqual(row["zotero_key"], "ITEM1234")
+        self.assertEqual(row["attachment_key"], "FILE1234")
+        self.assertEqual(row["metadata"]["title"], "An Example")
+        self.assertEqual(row["pdf_path"], pdf_path)
 
 
 if __name__ == "__main__":

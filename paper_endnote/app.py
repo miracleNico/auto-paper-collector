@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import argparse
-import asyncio
 import os
 import secrets
 import threading
@@ -18,6 +17,7 @@ from pydantic import BaseModel, Field
 
 from .config import Settings
 from .db import Database
+from .endnote import probe_endnote
 from .inputs import parse_input
 from .inputs import normalize_doi
 from .pipeline import PipelineManager
@@ -28,6 +28,8 @@ settings = Settings.load()
 database = Database(settings.database_path)
 settings.crossref_mailto = database.get_setting("crossref_email", settings.crossref_mailto)
 settings.unpaywall_email = database.get_setting("unpaywall_email", settings.unpaywall_email)
+library_setting = database.get_setting("endnote_library", str(settings.endnote_library or ""))
+settings.endnote_library = Path(library_setting).expanduser() if library_setting.strip() else None
 pipeline = PipelineManager(settings, database)
 SESSION_TOKEN = secrets.token_urlsafe(32)
 
@@ -38,7 +40,7 @@ async def lifespan(_: FastAPI):
     await pipeline.close()
 
 
-app = FastAPI(title="Paper Reference Workflow", version="0.3.0", lifespan=lifespan)
+app = FastAPI(title="Paper Reference Workflow", version="0.4.0", lifespan=lifespan)
 app.mount("/static", StaticFiles(directory=settings.app_root / "paper_endnote" / "static"), name="static")
 
 
@@ -66,7 +68,7 @@ class BatchCreate(BaseModel):
     items_text: str = Field(min_length=1)
     target_library: str = Field(min_length=1)
     library_mode: str = Field(pattern="^(existing|new)$")
-    reference_manager: str = Field(default="zotero", pattern="^(zotero|endnote)$")
+    reference_manager: str = Field(default="zotero", pattern="^zotero$")
     start_immediately: bool = True
 
 
@@ -87,6 +89,7 @@ class PDFConfirm(BaseModel):
 class SettingsUpdate(BaseModel):
     crossref_email: str = ""
     unpaywall_email: str = ""
+    endnote_library: str = ""
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -97,15 +100,15 @@ async def index() -> FileResponse:
 @app.get("/api/state")
 async def state() -> dict[str, Any]:
     return {
-        "version": "0.3.0",
+        "version": "0.4.0",
         "runtime_dir": str(settings.runtime_dir),
-        "endnote": pipeline.endnote.probe(),
+        "endnote": probe_endnote(settings.endnote_exe, settings.endnote_library),
         "zotero": await pipeline.zotero.probe(),
         "settings": {
             "crossref_email": settings.crossref_mailto,
             "unpaywall_email": settings.unpaywall_email,
+            "endnote_library": str(settings.endnote_library) if settings.endnote_library else "",
         },
-        "libraries": discover_libraries(),
     }
 
 
@@ -126,8 +129,11 @@ async def authorize_zotero() -> dict[str, Any]:
 async def update_settings(payload: SettingsUpdate) -> dict[str, str]:
     settings.crossref_mailto = payload.crossref_email.strip()
     settings.unpaywall_email = payload.unpaywall_email.strip()
+    library = payload.endnote_library.strip()
+    settings.endnote_library = Path(library).expanduser() if library else None
     database.set_setting("crossref_email", settings.crossref_mailto)
     database.set_setting("unpaywall_email", settings.unpaywall_email)
+    database.set_setting("endnote_library", str(settings.endnote_library) if settings.endnote_library else "")
     return {"status": "saved"}
 
 
@@ -143,18 +149,12 @@ async def create_batch(payload: BatchCreate) -> dict[str, str]:
         raise HTTPException(400, "没有识别到 DOI 或题名")
     if len(items) > 100:
         raise HTTPException(400, "单批最多 100 篇；建议保持在 20–50 篇")
-    if payload.reference_manager == "endnote":
-        try:
-            target = str(pipeline.endnote.validate_library_path(payload.target_library, payload.library_mode))
-        except Exception as exc:
-            raise HTTPException(400, str(exc)) from exc
-    else:
-        target = payload.target_library.strip()
-        if not target or len(target) > 120 or any(character in target for character in "\\/\0"):
-            raise HTTPException(400, "Zotero collection 名称无效")
+    target = payload.target_library.strip()
+    if not target or len(target) > 120 or any(character in target for character in "\\/\0"):
+        raise HTTPException(400, "Zotero collection 名称无效")
     batch_id = database.create_batch(
         name=payload.name.strip(), target_library=target, library_mode=payload.library_mode,
-        reference_manager=payload.reference_manager, items=items
+        reference_manager="zotero", items=items
     )
     if payload.start_immediately:
         pipeline.start(batch_id)
@@ -192,16 +192,38 @@ async def resume_batch(batch_id: str) -> dict[str, str]:
 
 @app.post("/api/batches/{batch_id}/commit")
 async def commit_batch(batch_id: str) -> dict[str, str]:
-    batch = require_batch(batch_id)
-    if (
-        batch.get("reference_manager") != "zotero"
-        and batch["library_mode"] == "existing"
-        and not batch.get("backup_path")
-        and pipeline.endnote.is_endnote_running()
-    ):
-        raise HTTPException(409, "首次写入前需要备份目标库。请关闭 EndNote，然后再次点击提交。")
+    require_batch(batch_id)
     pipeline.commit(batch_id)
     return {"status": "started"}
+
+
+@app.post("/api/batches/{batch_id}/export-endnote")
+async def export_endnote(batch_id: str) -> dict[str, Any]:
+    require_batch(batch_id)
+    try:
+        return await pipeline.export_endnote(batch_id)
+    except Exception as exc:
+        raise HTTPException(409, str(exc)) from exc
+
+
+@app.get("/api/batches/{batch_id}/endnote-export.zip")
+async def download_endnote_export(batch_id: str) -> FileResponse:
+    batch = require_batch(batch_id)
+    export_dir = Path(batch["endnote_export_path"]) if batch.get("endnote_export_path") else None
+    zip_path = export_dir.with_suffix(".zip") if export_dir else None
+    if not zip_path or not zip_path.is_file():
+        raise HTTPException(404, "还没有 EndNote 导入包。请先提交到 Zotero 或点击导出。")
+    return FileResponse(zip_path, filename=f"endnote-export-{batch_id[:8]}.zip", media_type="application/zip")
+
+
+@app.post("/api/batches/{batch_id}/open-endnote-export")
+async def open_endnote_export(batch_id: str) -> dict[str, str]:
+    batch = require_batch(batch_id)
+    export_dir = Path(batch["endnote_export_path"]) if batch.get("endnote_export_path") else None
+    if not export_dir or not export_dir.is_dir():
+        raise HTTPException(404, "还没有 EndNote 导入包")
+    os.startfile(export_dir)  # noqa: S606 - local Windows helper
+    return {"status": "opened", "path": str(export_dir)}
 
 
 @app.get("/api/batches/{batch_id}/events")
@@ -366,25 +388,6 @@ def require_paper(paper_id: str) -> dict[str, Any]:
     if not paper:
         raise HTTPException(404, "论文不存在")
     return paper
-
-
-def discover_libraries() -> list[str]:
-    roots = [Path.home() / "Documents", Path.home() / "Desktop"]
-    found: set[str] = set()
-    for root in roots:
-        if not root.is_dir():
-            continue
-        for current, directories, files in os.walk(root):
-            relative_depth = len(Path(current).relative_to(root).parts)
-            if relative_depth >= 5:
-                directories[:] = []
-            directories[:] = [item for item in directories if not item.startswith(".")]
-            for name in files:
-                if name.casefold().endswith(".enl"):
-                    found.add(str((Path(current) / name).resolve()))
-            if len(found) >= 100:
-                break
-    return sorted(found, key=str.casefold)
 
 
 def main() -> None:

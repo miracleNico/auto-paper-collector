@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import json
 import shutil
 from pathlib import Path
 from typing import Any
@@ -18,7 +17,12 @@ from .clients import (
 from .config import Settings
 from .db import Database
 from .downloader import download_pdf, safe_filename
-from .endnote import EndNoteAdapter, EndNoteError
+from .endnote import (
+    EndNoteError,
+    EndNoteExportRecord,
+    build_endnote_export_package,
+    export_filename,
+)
 from .inputs import normalize_doi, title_similarity
 from .pdf_validation import validate_pdf
 from .zotero import ZoteroAdapter
@@ -32,11 +36,10 @@ class PipelineManager:
         self.unpaywall = UnpaywallClient(settings)
         self.browser = BrowserSession(settings)
         self.browser.set_download_callback(self._browser_downloaded)
-        self.endnote = EndNoteAdapter(settings.endnote_exe, settings.generated_dir, settings.backup_dir)
         self.zotero = ZoteroAdapter(database.get_setting("zotero_api_key", ""))
         self._batch_tasks: dict[str, asyncio.Task] = {}
         self._commit_tasks: dict[str, asyncio.Task] = {}
-        self._endnote_commit_lock = asyncio.Lock()
+        self._commit_lock = asyncio.Lock()
 
     async def close(self) -> None:
         for task in [*self._batch_tasks.values(), *self._commit_tasks.values()]:
@@ -303,60 +306,81 @@ class PipelineManager:
         self._commit_tasks[batch_id] = asyncio.create_task(self._commit_batch(batch_id))
 
     async def _commit_batch(self, batch_id: str) -> None:
-        async with self._endnote_commit_lock:
+        async with self._commit_lock:
             batch = self.db.get_batch(batch_id)
             if not batch:
                 return
-            if batch.get("reference_manager") == "zotero":
-                await self._commit_zotero_batch(batch)
-                return
-            library = self.endnote.validate_library_path(batch["target_library"], batch["library_mode"])
-            try:
-                if batch["library_mode"] == "existing" and not batch.get("backup_path"):
-                    backup = await asyncio.to_thread(self.endnote.create_filesystem_backup, library, batch_id)
-                    self.db.update_batch(batch_id, backup_path=str(backup))
-                    self.db.event(batch_id, f"已创建目标库备份：{backup}")
-                if batch["library_mode"] == "new":
-                    await asyncio.to_thread(self.endnote.create_library, library)
-                    self.db.update_batch(batch_id, library_mode="existing")
-                else:
-                    await asyncio.to_thread(self.endnote.open_library, library)
-            except Exception as exc:
-                self.db.update_batch(batch_id, status="failed", error=str(exc))
-                self.db.event(batch_id, f"EndNote 准备失败：{exc}", level="error")
-                return
+            await self._commit_zotero_batch(batch)
 
-            for paper in self.db.get_batch(batch_id)["papers"]:
-                if paper["metadata_status"] != "verified" or paper["endnote_status"] == "verified":
-                    continue
-                operation_id = self.db.start_operation(paper["id"], "endnote_commit", {"library": str(library)})
-                self.db.update_paper(paper["id"], endnote_status="pending_commit")
-                metadata = dict(paper.get("metadata") or {})
-                metadata.update({
-                    "doi": paper.get("doi"), "title": paper.get("title"), "year": paper.get("year"),
-                    "authors": paper.get("authors") or [], "journal": paper.get("journal") or "",
-                })
-                pdf_path = Path(paper["pdf_path"]) if paper.get("pdf_path") and paper["pdf_status"] in {"verified", "accepted"} else None
+    async def export_endnote(self, batch_id: str) -> dict[str, Any]:
+        batch = self.db.get_batch(batch_id)
+        if not batch:
+            raise KeyError(batch_id)
+        return await self._export_endnote_from_zotero(batch)
+
+    async def _export_endnote_from_zotero(self, batch: dict[str, Any]) -> dict[str, Any]:
+        batch_id = batch["id"]
+        collection_name = batch["target_library"].strip()
+        records: list[EndNoteExportRecord] = []
+        rec_number = 1
+        for paper in batch["papers"]:
+            if paper.get("metadata_status") != "verified":
+                continue
+            metadata = dict(paper.get("metadata") or {})
+            metadata.update({
+                "doi": paper.get("doi"), "title": paper.get("title"), "year": paper.get("year"),
+                "authors": paper.get("authors") or [], "journal": paper.get("journal") or "",
+            })
+            source_pdf = None
+            folder_id = (paper.get("record_number") or paper["id"])[:16]
+            zotero_key = paper.get("record_number")
+            if zotero_key:
                 try:
-                    result = await asyncio.to_thread(self.endnote.commit_paper, library, paper["id"], metadata, pdf_path)
-                    has_full_text = bool(pdf_path or result.get("existing_full_text"))
-                    final_status = "complete" if has_full_text else "needs_pdf"
-                    needs_action = None if has_full_text else "manual_pdf"
-                    self.db.update_paper(
-                        paper["id"], endnote_status="verified", status=final_status,
-                        record_number=result.get("record_number"), needs_action=needs_action, error=None,
-                    )
-                    self.db.finish_operation(operation_id, "verified", result)
-                    self.db.event(batch_id, "EndNote 写入及对账完成", paper_id=paper["id"])
+                    row = await self.zotero.export_row(zotero_key, metadata)
+                    metadata = row["metadata"] or metadata
+                    source_pdf = row.get("pdf_path")
+                    folder_id = row.get("attachment_key") or zotero_key
                 except Exception as exc:
-                    self.db.finish_operation(operation_id, "uncertain", {"error": str(exc)})
-                    self.db.update_paper(
-                        paper["id"], endnote_status="uncertain", status="failed",
-                        needs_action="reconcile_endnote", error=str(exc),
-                    )
-                    self.db.event(batch_id, f"EndNote 提交状态不确定：{exc}", level="error", paper_id=paper["id"])
-            self.db.update_batch(batch_id, status="completed")
-            self.db.event(batch_id, "EndNote 提交阶段结束")
+                    self.db.event(batch_id, f"从 Zotero 读取附件失败，改用本机文件：{exc}", level="warning", paper_id=paper["id"])
+            if source_pdf is None and paper.get("pdf_path") and paper.get("pdf_status") in {"verified", "accepted"}:
+                source_pdf = Path(paper["pdf_path"])
+            records.append(
+                EndNoteExportRecord(
+                    rec_number=rec_number,
+                    metadata=metadata,
+                    source_pdf=Path(source_pdf) if source_pdf else None,
+                    folder_id=folder_id,
+                    filename=export_filename(metadata, paper["id"]),
+                    zotero_key=zotero_key,
+                )
+            )
+            rec_number += 1
+        if not records:
+            raise EndNoteError("没有已确认题录可导出到 EndNote")
+        destination = self.settings.generated_dir / batch_id / "endnote-export"
+        library = self.settings.endnote_library
+        if self.db.get_setting("endnote_library"):
+            library = Path(self.db.get_setting("endnote_library"))
+        try:
+            manifest = await asyncio.to_thread(
+                build_endnote_export_package,
+                records,
+                destination,
+                collection_name=collection_name,
+                library=library,
+            )
+        except Exception as exc:
+            self.db.event(batch_id, f"EndNote 导出失败：{exc}", level="error")
+            raise
+        self.db.update_batch(batch_id, endnote_export_path=str(destination))
+        copied = manifest.get("pdf_count", 0)
+        message = f"已从 Zotero 导出 EndNote 导入包：{destination}（{len(records)} 篇，{copied} 个 PDF）"
+        if manifest.get("library_pdf_dir"):
+            message += f"；已复制附件到 {manifest['library_pdf_dir']}"
+        if manifest.get("library_copy_error"):
+            message += f"；未写入 EndNote 库目录：{manifest['library_copy_error']}"
+        self.db.event(batch_id, message)
+        return manifest
 
     async def _commit_zotero_batch(self, batch: dict[str, Any]) -> None:
         batch_id = batch["id"]
@@ -411,3 +435,7 @@ class PipelineManager:
                 self.db.event(batch_id, f"Zotero 提交状态不确定：{exc}", level="error", paper_id=paper["id"])
         self.db.update_batch(batch_id, status="completed")
         self.db.event(batch_id, "Zotero 提交阶段结束")
+        try:
+            await self._export_endnote_from_zotero(self.db.get_batch(batch_id) or batch)
+        except Exception as exc:
+            self.db.event(batch_id, f"Zotero 已写入，但 EndNote 导出未完成：{exc}", level="warning")

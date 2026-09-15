@@ -20,7 +20,7 @@ if (-not (Test-Path -LiteralPath $venvPython)) {
     if ($LASTEXITCODE -ne 0) { throw '无法创建 Python 虚拟环境。' }
 }
 
-& $venvPython -c "import fastapi,httpx,playwright,pypdf,pywinauto,uvicorn" 2>$null
+& $venvPython -c "import fastapi,httpx,playwright,pypdf,uvicorn" 2>$null
 $needsInstall = $LASTEXITCODE -ne 0
 if ($needsInstall) {
     $installArguments = @('install', '--disable-pip-version-check')

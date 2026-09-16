@@ -596,5 +596,5 @@ class PipelineManager:
                     needs_action="reconcile_endnote", error=str(exc),
                 )
                 self.db.event(batch_id, f"Zotero 提交状态不确定：{exc}", level="error", paper_id=paper["id"])
-        self.db.update_batch(batch_id, status="completed")
+        self.db.update_batch(batch_id, status="completed", error=None)
         self.db.event(batch_id, "Zotero 提交阶段结束")

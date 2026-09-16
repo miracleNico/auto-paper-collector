@@ -10,6 +10,7 @@ const state = {
   pollTimer: null,
   pollBusy: false,
   pollCount: 0,
+  systemRequestToken: 0,
   listRequestToken: 0,
   detailRequestToken: 0,
   detailController: null,
@@ -207,17 +208,37 @@ async function showTab(name) {
     stopPolling();
   }
   if (name === "tools") await loadToolSources();
+  if (name === "settings") await refreshSystemStatus();
 }
 
-async function loadSystem() {
-  state.system = await api("/api/state");
-  const probe = state.system.zotero || {};
+function renderSystemStatus() {
+  const probe = state.system?.zotero || {};
   const badge = $("#system-badge");
   badge.textContent = probe.ready ? "Zotero 已连接" : (probe.enabled ? "Zotero 待授权" : "Zotero 未连接");
   badge.className = `badge ${probe.ready ? "" : probe.enabled ? "warn" : "error"}`;
   $("#system-info").textContent = JSON.stringify(state.system, null, 2);
 
-  const cfg = state.system.settings || {};
+  const ocr = state.system?.ocr || {};
+  const ocrStatus = $("#ocr-status");
+  ocrStatus.textContent = ocr.ready ? `Tesseract ${ocr.tesseract_version || "可用"}` : "Tesseract 未就绪";
+  ocrStatus.className = `status-pill ${ocr.ready ? "" : "warn"}`;
+  renderEnvironmentStatus();
+}
+
+async function refreshSystemStatus() {
+  const token = ++state.systemRequestToken;
+  const system = await api("/api/state");
+  if (token !== state.systemRequestToken) return null;
+  state.system = system;
+  renderSystemStatus();
+  return system;
+}
+
+async function loadSystem() {
+  const system = await refreshSystemStatus();
+  if (!system) return;
+
+  const cfg = system.settings || {};
   $("#crossref-email").value = cfg.crossref_email || "";
   $("#unpaywall-email").value = cfg.unpaywall_email || "";
   $("#endnote-library").value = cfg.endnote_library || "";
@@ -230,19 +251,14 @@ async function loadSystem() {
   $("#ocr-languages").value = cfg.ocr_languages || "eng";
   $("#ocr-max-pages").value = cfg.ocr_max_pages || 2;
 
-  const ocr = state.system.ocr || {};
-  const ocrStatus = $("#ocr-status");
-  ocrStatus.textContent = ocr.ready ? `Tesseract ${ocr.tesseract_version || "可用"}` : "Tesseract 未就绪";
-  ocrStatus.className = `status-pill ${ocr.ready ? "" : "warn"}`;
-  fillInstitution(cfg.institution || {}, state.system.presets || []);
+  fillInstitution(cfg.institution || {}, system.presets || []);
 
-  const credentials = state.system.credentials || {};
+  const credentials = system.credentials || {};
   $("#institution-username").value = credentials.username || "";
   $("#institution-password").value = "";
   $("#credentials-status").textContent = credentials.password_saved
     ? `已保存 ${cfg.institution?.name || "机构"}账号${credentials.username ? ` · ${credentials.username}` : ""}`
     : "尚未保存密码";
-  renderEnvironmentStatus();
 }
 
 function renderEnvironmentStatus() {
@@ -387,6 +403,9 @@ function renderBatchDetail(batch) {
   const pct = papers.length ? Math.round(counts.complete / papers.length * 100) : 0;
   const paused = batch.status !== "running";
   const exportPath = batch.endnote_export_path;
+  const batchError = batch.error === "Zotero 本地 API 未启用" && state.system?.zotero?.ready
+    ? "上次提交时 Zotero 本地 API 未启用；当前已连接，可重新提交。"
+    : batch.error;
   $("#task-detail").innerHTML = `
     <div class="task-head">
       <div><h2>${esc(batch.name)}</h2><p class="task-subtitle">${statusChip(batch.status)}<span>Zotero · ${esc(batch.target_library || "未命名")}</span></p></div>
@@ -412,7 +431,7 @@ function renderBatchDetail(batch) {
       <div class="summary-card"><b>${counts.zotero}</b><span>Zotero 已核验</span></div>
       <div class="summary-card"><b>${counts.needs}</b><span>等待处理</span></div>
     </div>
-    ${batch.error ? `<div class="batch-alert" role="alert">${esc(batch.error)}</div>` : ""}
+    ${batchError ? `<div class="batch-alert" role="alert">${esc(batchError)}</div>` : ""}
     <div class="table-title"><h3>论文</h3>${counts.needs ? `<span class="status-pill warn">${counts.needs} 篇待处理</span>` : `<span class="status-pill">无需人工处理</span>`}</div>
     ${papers.length ? `<div class="table-wrap"><table><thead><tr><th>#</th><th>论文</th><th>题录</th><th>PDF</th><th>Zotero</th><th>状态与操作</th></tr></thead><tbody>${papers.map(paperRow).join("")}</tbody></table></div>` : `<div class="empty-state compact">批次中没有论文</div>`}`;
 
@@ -908,7 +927,9 @@ function initHelpPopovers() {
   window.addEventListener("scroll", () => positionHelp(state.helpTrigger), true);
 }
 
-$$('.tab').forEach(button => button.addEventListener("click", () => showTab(button.dataset.tab)));
+$$('.tab').forEach(button => button.addEventListener("click", () => {
+  showTab(button.dataset.tab).catch(error => toast(error.message));
+}));
 $("#refresh-batches").addEventListener("click", () => refreshBatches());
 $("#select-all-batches").addEventListener("change", event => {
   state.batches.forEach(batch => {
@@ -1115,7 +1136,9 @@ $("#delete-dialog").addEventListener("close", () => {
 });
 
 document.addEventListener("visibilitychange", () => {
-  if (!document.hidden && state.activeTab === "tasks") pollTasks();
+  if (document.hidden) return;
+  if (state.activeTab === "tasks") pollTasks();
+  if (state.activeTab === "settings") refreshSystemStatus().catch(error => toast(error.message));
 });
 
 initHelpPopovers();

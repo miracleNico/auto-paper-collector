@@ -21,24 +21,36 @@ class EndNoteError(RuntimeError):
 
 
 REF_TYPE_JOURNAL = "17"
-IMPORT_INSTRUCTIONS = """Zotero → EndNote 导入说明
+IMPORT_INSTRUCTIONS = """Zotero → EndNote 21 导入说明
 
-本目录由本机工具从 Zotero collection 导出，不要用 EndNote 桌面控件自动写入。
+不要导入 endnote-export.zip，也不要导入整个文件夹。
+不要用默认的 EndNote Import（%0/%A 标签格式）。选错滤镜时，题录会变成 Book、标题空白、出现乱码。
 
-方法 A（推荐，本机导入）
-1. 打开 EndNote，打开或新建目标库。
-2. File → Import → File。
-3. Import File 选择本目录的 records.xml。
-4. Import Option 选择 EndNote Generated XML。
-5. 点击 Import。XML 使用本机绝对路径指向 PDF 子目录中的文件。
+推荐：导入 RIS（第三方题录进 EndNote 的标准做法）
+1. 打开目标库（例如 DTN & FL）。
+2. File → Import → File...
+3. 文件类型改成 All Files (*.*)，选择本目录的 records.ris。
+4. Import Option 选 Reference Manager (RIS)。
+   若列表里没有，点 Other Filters... 再选。
+5. Text Translation 必须选 Unicode (UTF-8)。不要选 Chinese Simplified / ANSI。
+6. Duplicates 可选 Import All。
+7. 点击 Import。L1 字段指向本目录 PDF 子文件夹中的全文。
 
-方法 B（与 Clarivate 文档一致）
-1. 按方法 A 导入 records-internal.xml。
-2. 把本目录 PDF 文件夹中的全部子文件夹复制到：
+备选：导入 EndNote XML
+1. 同样用 File → Import → File...
+2. 选择本目录的 records.xml（不要选 records-internal.xml，除非按下面方法 B）。
+3. Import Option 必须选 EndNote Generated XML。
+4. Text Translation 选 Unicode (UTF-8)。
+5. 点击 Import。
+
+方法 B（internal-pdf 链接）
+1. 导入 records-internal.xml，Import Option 仍为 EndNote Generated XML。
+2. 把本目录 PDF 下的全部子文件夹复制到：
    <库名>.Data\\PDF\\
-3. 重新打开该库，让 EndNote 索引附件。
+3. 关闭并重新打开该库，让 EndNote 索引附件。
 
-不要重复导入同一批次，否则会生成重复题录。更新时请导入到新库，或只导入新增条目。
+导入后请确认 Reference Type 为 Journal Article，作者和标题为英文原文。
+若已导入一批乱码 Book，先删掉那些题录再按上面步骤重导。不要重复导入同一文件。
 """
 
 
@@ -229,12 +241,25 @@ def verified_main_attachments(
     return result
 
 
-def _xml_text(parent: ET.Element, tag: str, value: Any) -> ET.Element | None:
+def _xml_text(parent: ET.Element, tag: str, value: Any, attrib: dict[str, str] | None = None) -> ET.Element | None:
+    text = _plain(value)
+    if not text:
+        return None
+    element = ET.SubElement(parent, tag, attrib or {})
+    element.text = text
+    return element
+
+
+def _styled_text(parent: ET.Element, tag: str, value: Any) -> ET.Element | None:
     text = _plain(value)
     if not text:
         return None
     element = ET.SubElement(parent, tag)
-    element.text = text
+    style = ET.SubElement(element, "style")
+    style.set("face", "normal")
+    style.set("font", "default")
+    style.set("size", "100%")
+    style.text = text
     return element
 
 
@@ -251,54 +276,64 @@ def write_endnote_xml(
     records: Iterable[EndNoteExportRecord],
     *,
     internal_pdf: bool,
+    collection_name: str = "export",
 ) -> Path:
     root = ET.Element("xml")
     records_el = ET.SubElement(root, "records")
+    library_name = f"{_plain(collection_name) or 'export'}.enl"
     for record in records:
         metadata = record.metadata
         item = ET.SubElement(records_el, "record")
+        database = ET.SubElement(item, "database")
+        database.set("name", library_name)
+        database.text = library_name
+        source_app = ET.SubElement(item, "source-app")
+        source_app.set("name", "EndNote")
+        source_app.set("version", "21.0")
+        source_app.text = "EndNote"
         _xml_text(item, "rec-number", record.rec_number)
+        foreign = ET.SubElement(item, "foreign-keys")
+        key = ET.SubElement(foreign, "key")
+        key.set("app", "EN")
+        key.set("db-id", re.sub(r"[^A-Za-z0-9]", "", record.zotero_key or record.folder_id or "export")[:32] or "export")
+        key.text = str(record.rec_number)
         ref_type = ET.SubElement(item, "ref-type")
         ref_type.set("name", "Journal Article")
         ref_type.text = REF_TYPE_JOURNAL
-        contributors = ET.SubElement(item, "contributors")
-        authors_el = ET.SubElement(contributors, "authors")
-        authors = list(metadata.get("authors") or [])
+        authors = [_plain(author) for author in (metadata.get("authors") or []) if _plain(author)]
         if authors:
+            contributors = ET.SubElement(item, "contributors")
+            authors_el = ET.SubElement(contributors, "authors")
             for author in authors:
-                _xml_text(authors_el, "author", author)
-        else:
-            ET.SubElement(authors_el, "author")
+                _styled_text(authors_el, "author", author)
         titles = ET.SubElement(item, "titles")
-        _xml_text(titles, "title", metadata.get("title"))
+        _styled_text(titles, "title", metadata.get("title"))
         if metadata.get("journal"):
-            _xml_text(titles, "secondary-title", metadata.get("journal"))
+            _styled_text(titles, "secondary-title", metadata.get("journal"))
             periodical = ET.SubElement(item, "periodical")
-            _xml_text(periodical, "full-title", metadata.get("journal"))
+            _styled_text(periodical, "full-title", metadata.get("journal"))
+        _styled_text(item, "pages", metadata.get("pages"))
+        _styled_text(item, "volume", metadata.get("volume"))
+        _styled_text(item, "number", metadata.get("issue"))
         dates = ET.SubElement(item, "dates")
-        _xml_text(dates, "year", metadata.get("year"))
-        _xml_text(item, "volume", metadata.get("volume"))
-        _xml_text(item, "number", metadata.get("issue"))
-        _xml_text(item, "pages", metadata.get("pages"))
+        _styled_text(dates, "year", metadata.get("year"))
         doi = normalize_doi(metadata.get("doi"))
-        _xml_text(item, "electronic-resource-num", doi)
-        urls = ET.SubElement(item, "urls")
         pdf_url = _attachment_url(record, internal=internal_pdf)
-        if pdf_url:
-            pdf_urls = ET.SubElement(urls, "pdf-urls")
-            _xml_text(pdf_urls, "url", pdf_url)
         related = metadata.get("url") or (f"https://doi.org/{doi}" if doi else "")
-        if related:
-            related_urls = ET.SubElement(urls, "related-urls")
-            _xml_text(related_urls, "url", related)
-        source_app = ET.SubElement(item, "source-app")
-        source_app.set("name", "Zotero")
-        source_app.text = "Zotero"
+        if pdf_url or related:
+            urls = ET.SubElement(item, "urls")
+            if related:
+                related_urls = ET.SubElement(urls, "related-urls")
+                _styled_text(related_urls, "url", related)
+            if pdf_url:
+                pdf_urls = ET.SubElement(urls, "pdf-urls")
+                _xml_text(pdf_urls, "url", pdf_url)
+        _styled_text(item, "electronic-resource-num", doi)
     path.parent.mkdir(parents=True, exist_ok=True)
     ET.indent(root, space="  ")
     path.write_text(
-        '<?xml version="1.0" encoding="UTF-8"?>\n' + ET.tostring(root, encoding="unicode"),
-        encoding="utf-8",
+        '<?xml version="1.0" encoding="UTF-8" ?>\n' + ET.tostring(root, encoding="unicode"),
+        encoding="utf-8-sig",
         newline="\n",
     )
     return path
@@ -328,19 +363,53 @@ def copy_pdfs_into_endnote_library(pdf_root: Path, library: Path) -> Path:
         if not child.is_dir():
             continue
         target = destination / child.name
-        if target.exists():
-            shutil.rmtree(target)
-        shutil.copytree(child, target)
+        target.mkdir(parents=True, exist_ok=True)
+        for file in child.rglob("*"):
+            if not file.is_file():
+                continue
+            dest_file = target / file.relative_to(child)
+            dest_file.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(file, dest_file)
     return destination
 
 
+PACKAGE_ROOT_FILES = frozenset(
+    {
+        "records.xml",
+        "records-internal.xml",
+        "records.ris",
+        "IMPORT.txt",
+        "manifest.json",
+    }
+)
+
+
+def _reset_export_package_dir(destination: Path) -> None:
+    destination.mkdir(parents=True, exist_ok=True)
+    for name in PACKAGE_ROOT_FILES:
+        path = destination / name
+        if path.is_file():
+            path.unlink()
+    zip_inside = destination / "endnote-export.zip"
+    if zip_inside.is_file():
+        zip_inside.unlink()
+    pdf_root = destination / "PDF"
+    if pdf_root.is_dir():
+        shutil.rmtree(pdf_root)
+
+
 def zip_export_package(export_dir: Path, zip_path: Path | None = None) -> Path:
-    zip_path = zip_path or export_dir.with_suffix(".zip")
+    zip_path = zip_path or (export_dir / "endnote-export.zip")
     zip_path.parent.mkdir(parents=True, exist_ok=True)
+    zip_resolved = zip_path.resolve()
     with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
         for child in export_dir.rglob("*"):
-            if child.is_file():
-                archive.write(child, child.relative_to(export_dir))
+            if not child.is_file() or child.resolve() == zip_resolved:
+                continue
+            relative = child.relative_to(export_dir)
+            top = relative.parts[0]
+            if top == "PDF" or (len(relative.parts) == 1 and relative.name in PACKAGE_ROOT_FILES):
+                archive.write(child, relative)
     return zip_path
 
 
@@ -351,17 +420,19 @@ def build_endnote_export_package(
     collection_name: str,
     library: Path | None = None,
 ) -> dict[str, Any]:
-    if destination.exists():
-        shutil.rmtree(destination)
-    destination.mkdir(parents=True, exist_ok=True)
+    _reset_export_package_dir(destination)
     pdf_root = destination / "PDF"
     pdf_root.mkdir(parents=True, exist_ok=True)
     copied = 0
     for record in records:
         if copy_pdf_for_export(record, pdf_root):
             copied += 1
-    xml_path = write_endnote_xml(destination / "records.xml", records, internal_pdf=False)
-    internal_xml = write_endnote_xml(destination / "records-internal.xml", records, internal_pdf=True)
+    xml_path = write_endnote_xml(
+        destination / "records.xml", records, internal_pdf=False, collection_name=collection_name
+    )
+    internal_xml = write_endnote_xml(
+        destination / "records-internal.xml", records, internal_pdf=True, collection_name=collection_name
+    )
     ris_path = write_ris(destination / "records.ris", records)
     (destination / "IMPORT.txt").write_text(IMPORT_INSTRUCTIONS, encoding="utf-8", newline="\n")
     library_pdf_dir = None
@@ -414,7 +485,7 @@ def probe_endnote(endnote_exe: Path, library: Path | None = None) -> dict[str, A
         "library_exists": bool(library and Path(library).is_file()),
         "ready": True,
         "details": [
-            "EndNote 不再通过桌面控件写入。提交到 Zotero 后导出导入包，再由 EndNote 导入 XML。"
+            "EndNote 不再通过桌面控件写入。在工具页从 Zotero 导出导入包到 Downloads，再由 EndNote 导入 XML。"
         ],
     }
     if library and not Path(library).is_file():

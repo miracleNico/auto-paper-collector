@@ -60,7 +60,7 @@ def prepare_batch(
         batch_id,
         lambda value: all(
             paper["metadata_status"] in {"verified", "needs_review", "unavailable"}
-            and paper["status"] not in {"queued", "matching", "ready", "looking_for_pdf"}
+                and paper["status"] not in {"queued", "matching", "ready", "looking_for_pdf", "institution_pending"}
             for paper in value["papers"]
         ),
     )
@@ -128,7 +128,7 @@ def main() -> int:
     args = parser.parse_args()
 
     fixture_text = args.fixture.resolve().read_text(encoding="utf-8-sig")
-    with httpx.Client(base_url=args.base_url, timeout=60.0, follow_redirects=True) as client:
+    with httpx.Client(base_url=args.base_url, timeout=60.0, follow_redirects=True, trust_env=False) as client:
         client.get("/").raise_for_status()  # establishes the local CSRF/session cookie
         state = client.get("/api/state")
         state.raise_for_status()

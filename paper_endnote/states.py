@@ -17,6 +17,7 @@ class PaperStatus(StrEnum):
     NEEDS_MATCH = "needs_match"
     READY = "ready"
     LOOKING_FOR_PDF = "looking_for_pdf"
+    INSTITUTION_PENDING = "institution_pending"
     NEEDS_PDF = "needs_pdf"
     NEEDS_PDF_REVIEW = "needs_pdf_review"
     PDF_READY = "pdf_ready"

@@ -1,7 +1,7 @@
-"""Live check that a Zotero-committed batch can export an EndNote import package.
+"""Live check that a Zotero collection can export an EndNote import package.
 
 This does not drive the EndNote desktop UI. It calls the local web service, which
-reads PDFs from Zotero storage and writes XML/PDF/RIS into generated/.
+reads PDFs from Zotero storage and writes XML/PDF/RIS into Downloads\[库名].
 """
 
 from __future__ import annotations
@@ -22,14 +22,21 @@ def main() -> int:
     parser.add_argument("--output", type=Path, default=Path("outputs/endnote-export-acceptance.json"))
     args = parser.parse_args()
 
-    with httpx.Client(base_url=args.base_url, timeout=120.0, follow_redirects=True) as client:
+    with httpx.Client(base_url=args.base_url, timeout=120.0, follow_redirects=True, trust_env=False) as client:
         client.get("/").raise_for_status()
-        export = client.post(f"/api/batches/{args.batch_id}/export-endnote")
+        batch = client.get(f"/api/batches/{args.batch_id}").json()
+        export = client.post(
+            "/api/tools/export-endnote",
+            json={
+                "collection": batch["target_library"],
+                "destination": "",
+                "open_folder": False,
+            },
+        )
         export.raise_for_status()
         manifest = export.json()
-        batch = client.get(f"/api/batches/{args.batch_id}").json()
 
-    export_dir = Path(batch["endnote_export_path"])
+    export_dir = Path(manifest["destination"])
     records = parse_endnote_xml(export_dir / "records.xml")
     pdfs = [
         str(resolve_export_attachment(export_dir, attachment))

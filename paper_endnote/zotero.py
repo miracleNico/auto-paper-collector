@@ -86,7 +86,7 @@ class ZoteroAdapter:
         self.base_url = base_url.rstrip("/")
         self.api_key = api_key
         self.server_id = ""
-        self.client = httpx.AsyncClient(timeout=30.0, follow_redirects=False)
+        self.client = httpx.AsyncClient(timeout=30.0, follow_redirects=False, trust_env=False)
 
     async def close(self) -> None:
         await self.client.aclose()
@@ -388,6 +388,7 @@ class ZoteroAdapter:
         children = await self._children(item_key)
         pdf_path = None
         attachment_key = None
+        attachment_version = None
         for child in children:
             data = _data(child)
             if data.get("contentType") != "application/pdf":
@@ -397,6 +398,7 @@ class ZoteroAdapter:
             if path and path.is_file():
                 pdf_path = path
                 attachment_key = key
+                attachment_version = data.get("version", child.get("version"))
                 result = validate_pdf(
                     path, expected_doi=metadata.get("doi"), expected_title=metadata.get("title")
                 )
@@ -405,6 +407,47 @@ class ZoteroAdapter:
         return {
             "zotero_key": item_key,
             "attachment_key": attachment_key,
+            "attachment_version": attachment_version,
             "metadata": metadata,
             "pdf_path": pdf_path,
         }
+
+    async def list_collections(self) -> list[dict[str, Any]]:
+        await self._ensure_server()
+        items = (await self._request("GET", "/users/0/collections")).json()
+        result = []
+        for item in items:
+            data = _data(item)
+            result.append(
+                {
+                    "key": data.get("key") or item.get("key"),
+                    "name": data.get("name") or "",
+                    "numItems": (item.get("meta") or {}).get("numItems"),
+                }
+            )
+        return result
+
+    async def iter_collection_items(self, name: str):
+        key = await self.ensure_collection(name, create=False)
+        start = 0
+        while True:
+            response = await self._request(
+                "GET",
+                f"/users/0/collections/{key}/items/top",
+                params={"limit": 100, "start": start},
+            )
+            rows = response.json()
+            if not rows:
+                break
+            for item in rows:
+                yield item
+            if len(rows) < 100:
+                break
+            start += 100
+
+    async def rename_attachment_filename(self, attachment_key: str, filename: str, version: int | None) -> None:
+        payload: dict[str, Any] = {"filename": filename, "title": filename}
+        if version is not None:
+            payload["version"] = version
+        await self._request("PATCH", f"/users/0/items/{attachment_key}", json=payload)
+

@@ -1,8 +1,18 @@
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
+
+from .user_config import (
+    AcquisitionConfig,
+    InstitutionProfile,
+    OcrOptions,
+    default_config_path,
+    load_acquisition_config,
+    load_preset,
+    save_acquisition_config,
+)
 
 
 @dataclass
@@ -18,9 +28,16 @@ class Settings:
     endnote_library: Path | None
     crossref_mailto: str
     unpaywall_email: str
+    config_path: Path
+    acquisition_sources: tuple[str, ...] = ("open_access", "institution")
+    ocr: OcrOptions = field(default_factory=OcrOptions)
+    institution: InstitutionProfile = field(default_factory=lambda: load_preset("mcgill"))
     max_pdf_bytes: int = 100 * 1024 * 1024
     request_timeout_seconds: float = 30.0
     crossref_min_interval_seconds: float = 0.25
+    auto_institution: bool = True
+    auto_commit: bool = True
+    login_wait_seconds: int = 600
 
     @classmethod
     def load(cls) -> "Settings":
@@ -33,6 +50,8 @@ class Settings:
             )
         )
         library_value = os.environ.get("PAPER_ENDNOTE_LIBRARY", "").strip()
+        config_path = default_config_path(base)
+        acquisition = load_acquisition_config(config_path, create=True)
         settings = cls(
             app_root=app_root,
             runtime_dir=base,
@@ -45,6 +64,13 @@ class Settings:
             endnote_library=Path(library_value).expanduser() if library_value else None,
             crossref_mailto=os.environ.get("PAPER_ENDNOTE_CROSSREF_EMAIL", "").strip(),
             unpaywall_email=os.environ.get("PAPER_ENDNOTE_UNPAYWALL_EMAIL", "").strip(),
+            config_path=config_path,
+            acquisition_sources=acquisition.sources,
+            ocr=acquisition.ocr,
+            institution=acquisition.institution,
+            auto_institution=acquisition.auto_institution,
+            auto_commit=acquisition.auto_commit,
+            login_wait_seconds=acquisition.login_wait_seconds,
         )
         for directory in (
             settings.runtime_dir,
@@ -55,3 +81,23 @@ class Settings:
         ):
             directory.mkdir(parents=True, exist_ok=True)
         return settings
+
+    def acquisition_config(self) -> AcquisitionConfig:
+        return AcquisitionConfig(
+            sources=self.acquisition_sources,
+            ocr=self.ocr,
+            institution=self.institution,
+            auto_institution=self.auto_institution,
+            auto_commit=self.auto_commit,
+            login_wait_seconds=self.login_wait_seconds,
+        )
+
+    def save_acquisition_config(self) -> None:
+        save_acquisition_config(self.config_path, self.acquisition_config())
+
+    def pdf_ocr_kwargs(self) -> dict[str, bool | str | int]:
+        return {
+            "ocr_enabled": self.ocr.enabled,
+            "ocr_languages": self.ocr.languages,
+            "ocr_max_pages": self.ocr.max_pages,
+        }

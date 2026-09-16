@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import tempfile
 import unittest
+import zipfile
 from pathlib import Path
 
 from paper_endnote.endnote import (
@@ -89,6 +90,67 @@ class EndNoteTests(unittest.TestCase):
             ris = (destination / "records.ris").read_text(encoding="utf-8-sig")
             self.assertIn("DO  - 10.1000/example", ris)
             self.assertIn("L1  - ", ris)
+            self.assertTrue((destination / "endnote-export.zip").is_file())
+            raw = (destination / "records.xml").read_bytes()
+            self.assertTrue(raw.startswith(b"\xef\xbb\xbf"))
+            xml_text = (destination / "records.xml").read_text(encoding="utf-8-sig")
+            self.assertIn('<style face="normal" font="default" size="100%">Example Paper</style>', xml_text)
+            self.assertIn('<ref-type name="Journal Article">17</ref-type>', xml_text)
+            self.assertLess(xml_text.index("<database"), xml_text.index("<source-app"))
+            self.assertLess(xml_text.index("<source-app"), xml_text.index("<rec-number"))
+            self.assertLess(xml_text.index("</contributors>"), xml_text.index("<titles>"))
+            self.assertLess(xml_text.index("</urls>"), xml_text.index("electronic-resource-num"))
+
+    def test_export_package_keeps_unrelated_files(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source.pdf"
+            source.write_bytes(MINIMAL_PDF)
+            destination = root / "Downloads" / "DTN"
+            destination.mkdir(parents=True)
+            extra = destination / "Jane Doe - Example Paper.pdf"
+            extra.write_bytes(MINIMAL_PDF)
+            records = [
+                EndNoteExportRecord(
+                    rec_number=1,
+                    metadata={
+                        "title": "Example Paper",
+                        "doi": "10.1000/example",
+                        "year": 2024,
+                        "authors": ["Doe, Jane"],
+                    },
+                    source_pdf=source,
+                    folder_id="ITEM1234",
+                    filename="10.1000_example.pdf",
+                    zotero_key="ITEM1234",
+                )
+            ]
+            manifest = build_endnote_export_package(records, destination, collection_name="DTN")
+            self.assertTrue(extra.is_file())
+            self.assertTrue((destination / "records.xml").is_file())
+            with zipfile.ZipFile(manifest["zip"]) as archive:
+                names = archive.namelist()
+            self.assertFalse(any(name.endswith("Jane Doe - Example Paper.pdf") for name in names))
+            self.assertTrue(any(name.endswith("10.1000_example.pdf") for name in names))
+
+    def test_library_pdf_copy_overwrites_files_without_removing_folder(self) -> None:
+        from paper_endnote.endnote import copy_pdfs_into_endnote_library
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            library = root / "DTN.enl"
+            library.write_bytes(b"")
+            existing = library.with_suffix(".Data") / "PDF" / "ITEM1234"
+            existing.mkdir(parents=True)
+            leftover = existing / "old.pdf"
+            leftover.write_bytes(b"old")
+            source_root = root / "export-pdf"
+            item_dir = source_root / "ITEM1234"
+            item_dir.mkdir(parents=True)
+            (item_dir / "10.1000_example.pdf").write_bytes(MINIMAL_PDF)
+            copy_pdfs_into_endnote_library(source_root, library)
+            self.assertTrue((existing / "10.1000_example.pdf").is_file())
+            self.assertTrue(leftover.is_file())
 
 
 if __name__ == "__main__":

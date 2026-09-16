@@ -4,14 +4,17 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "paper-endnote"
-version = "0.4.0"
+version = "0.5.0"
 description = "Local Windows workflow: resolve papers, acquire PDFs, write Zotero, then export an EndNote import package."
 requires-python = ">=3.12"
 dependencies = [
   "fastapi==0.115.14",
   "httpx==0.28.1",
+  "keyring==25.6.0",
   "playwright==1.52.0",
   "pypdf==5.6.0",
+  "pypdfium2==4.30.0",
+  "pytesseract==0.3.13",
   "python-multipart==0.0.20",
   "uvicorn==0.34.3",
 ]
@@ -23,4 +26,4 @@ paper-endnote = "paper_endnote.app:main"
 include = ["paper_endnote*"]
 
 [tool.setuptools.package-data]
-paper_endnote = ["static/*"]
+paper_endnote = ["static/*", "presets/*.toml"]

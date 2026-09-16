@@ -28,6 +28,8 @@ main { width:min(1500px,94vw); margin:1.5rem auto 4rem; }
 .panel { background:var(--card); border:1px solid var(--line); border-radius:16px; padding:1.25rem; box-shadow:0 8px 30px rgb(31 50 45 / 6%); }
 .grid.two { display:grid; grid-template-columns:1fr 1fr; gap:1rem; }
 label { display:block; font-weight:650; font-size:.9rem; margin-bottom:1rem; }
+label.check { display:flex; align-items:center; gap:.55rem; font-weight:600; }
+label.check input { width:auto; margin:0; }
 input,select,textarea { width:100%; margin-top:.4rem; padding:.72rem .8rem; border:1px solid #c5c1b7; border-radius:9px; background:white; color:var(--ink); font:inherit; }
 textarea { resize:vertical; font-family:"Cascadia Mono",Consolas,monospace; line-height:1.5; }
 input:focus,select:focus,textarea:focus { outline:3px solid rgb(18 106 90 / 14%); border-color:var(--accent); }
@@ -75,7 +77,9 @@ td.actions button,.upload-label { font-size:.75rem; padding:.38rem .5rem; margin
 .status.failed,.status.needs_match,.status.needs_pdf_review { color:var(--danger); }
 .status.needs_pdf,.status.endnote_pending { color:var(--warn); }
 .error-text { color:var(--danger); font-size:.78rem; margin-top:.2rem; }
-.empty-state { padding:4rem 1rem; text-align:center; color:var(--muted); }
+#tab-tools form { background:#f7f5ef; border:1px solid #e5e1d7; border-radius:12px; padding:1rem; }
+#tab-tools > form { margin-top:1rem; }
+#tab-tools form h2 { margin-bottom:.35rem; }
 dialog { width:min(760px,92vw); border:1px solid var(--line); border-radius:14px; padding:1.25rem; box-shadow:0 20px 60px rgb(0 0 0 / 24%); }
 dialog::backdrop { background:rgb(24 39 37 / 45%); }
 .dialog-close { position:absolute; top:.7rem; right:.7rem; border:0; font-size:1.3rem; }

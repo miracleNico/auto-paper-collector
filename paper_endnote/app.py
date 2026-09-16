@@ -16,12 +16,32 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from .config import Settings
+from .credentials import (
+    CredentialError,
+    clear_credentials,
+    credential_status,
+    save_credentials,
+)
 from .db import Database
 from .endnote import probe_endnote
 from .inputs import parse_input
 from .inputs import normalize_doi
+from .library_files import (
+    LibraryFilesError,
+    downloads_library_dir,
+    export_batch_pdfs,
+    export_endnote_data_pdfs,
+    export_zotero_endnote_package,
+    export_zotero_pdfs,
+    rename_batch_pdfs,
+    rename_endnote_pdfs,
+    rename_zotero_pdfs,
+    resolve_export_dir,
+)
+from .ocr import ocr_status
 from .pipeline import PipelineManager
 from .reporting import batch_csv
+from .user_config import ConfigError, OcrOptions, institution_from_payload, list_presets, load_preset, normalize_sources
 
 
 settings = Settings.load()
@@ -40,7 +60,7 @@ async def lifespan(_: FastAPI):
     await pipeline.close()
 
 
-app = FastAPI(title="Paper Reference Workflow", version="0.4.0", lifespan=lifespan)
+app = FastAPI(title="Paper Reference Workflow", version="0.5.0", lifespan=lifespan)
 app.mount("/static", StaticFiles(directory=settings.app_root / "paper_endnote" / "static"), name="static")
 
 
@@ -86,10 +106,48 @@ class PDFConfirm(BaseModel):
     version: str = Field(default="published", pattern="^(published|accepted|preprint|unknown)$")
 
 
+class InstitutionUpdate(BaseModel):
+    id: str = ""
+    name: str = ""
+    ezproxy_login: str = ""
+    ezproxy_hosts: list[str] = Field(default_factory=list)
+    openurl: str = ""
+    login_url_markers: list[str] = Field(default_factory=list)
+    preset: str = ""
+
+
 class SettingsUpdate(BaseModel):
     crossref_email: str = ""
     unpaywall_email: str = ""
     endnote_library: str = ""
+    acquisition_sources: list[str] = Field(default_factory=lambda: ["open_access", "institution"])
+    ocr_enabled: bool = True
+    ocr_languages: str = "eng"
+    ocr_max_pages: int = 2
+    institution_preset: str = ""
+    institution: InstitutionUpdate | None = None
+    auto_institution: bool = True
+    auto_commit: bool = True
+    login_wait_seconds: int = 600
+
+
+class CredentialsUpdate(BaseModel):
+    username: str = ""
+    password: str = ""
+
+
+class LibraryToolRequest(BaseModel):
+    source: str = Field(pattern="^(batch|zotero|endnote)$")
+    batch_id: str = ""
+    collection: str = ""
+    destination: str = ""
+    open_folder: bool = False
+
+
+class EndNoteExportToolRequest(BaseModel):
+    collection: str = ""
+    destination: str = ""
+    open_folder: bool = False
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -100,14 +158,26 @@ async def index() -> FileResponse:
 @app.get("/api/state")
 async def state() -> dict[str, Any]:
     return {
-        "version": "0.4.0",
+        "version": "0.5.0",
         "runtime_dir": str(settings.runtime_dir),
+        "config_path": str(settings.config_path),
         "endnote": probe_endnote(settings.endnote_exe, settings.endnote_library),
         "zotero": await pipeline.zotero.probe(),
+        "ocr": ocr_status(),
+        "presets": [profile.as_dict() for profile in list_presets().values()],
+        "credentials": credential_status(settings.institution.id),
         "settings": {
             "crossref_email": settings.crossref_mailto,
             "unpaywall_email": settings.unpaywall_email,
             "endnote_library": str(settings.endnote_library) if settings.endnote_library else "",
+            "acquisition_sources": list(settings.acquisition_sources),
+            "ocr_enabled": settings.ocr.enabled,
+            "ocr_languages": settings.ocr.languages,
+            "ocr_max_pages": settings.ocr.max_pages,
+            "auto_institution": settings.auto_institution,
+            "auto_commit": settings.auto_commit,
+            "login_wait_seconds": settings.login_wait_seconds,
+            "institution": settings.institution.as_dict(),
         },
     }
 
@@ -127,6 +197,27 @@ async def authorize_zotero() -> dict[str, Any]:
 
 @app.post("/api/settings")
 async def update_settings(payload: SettingsUpdate) -> dict[str, str]:
+    try:
+        sources = normalize_sources(payload.acquisition_sources)
+        if payload.institution_preset:
+            institution = load_preset(payload.institution_preset)
+        elif payload.institution:
+            institution = institution_from_payload(payload.institution.model_dump())
+        else:
+            institution = settings.institution
+        settings.ocr = OcrOptions(
+            enabled=payload.ocr_enabled,
+            languages=payload.ocr_languages.strip() or "eng",
+            max_pages=max(1, min(int(payload.ocr_max_pages), 5)),
+        )
+        settings.acquisition_sources = sources
+        settings.institution = institution
+        settings.auto_institution = payload.auto_institution
+        settings.auto_commit = payload.auto_commit
+        settings.login_wait_seconds = max(30, min(int(payload.login_wait_seconds), 1800))
+        settings.save_acquisition_config()
+    except ConfigError as exc:
+        raise HTTPException(400, str(exc)) from exc
     settings.crossref_mailto = payload.crossref_email.strip()
     settings.unpaywall_email = payload.unpaywall_email.strip()
     library = payload.endnote_library.strip()
@@ -135,6 +226,143 @@ async def update_settings(payload: SettingsUpdate) -> dict[str, str]:
     database.set_setting("unpaywall_email", settings.unpaywall_email)
     database.set_setting("endnote_library", str(settings.endnote_library) if settings.endnote_library else "")
     return {"status": "saved"}
+
+
+@app.post("/api/credentials")
+async def update_credentials(payload: CredentialsUpdate) -> dict[str, Any]:
+    try:
+        save_credentials(settings.institution.id, payload.username, payload.password)
+    except CredentialError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    return {"status": "saved", **credential_status(settings.institution.id)}
+
+
+@app.post("/api/credentials/clear")
+async def delete_credentials() -> dict[str, Any]:
+    clear_credentials(settings.institution.id)
+    return {"status": "cleared", **credential_status(settings.institution.id)}
+
+
+@app.get("/api/tools/sources")
+async def tool_sources() -> dict[str, Any]:
+    collections: list[dict[str, Any]] = []
+    zotero_error = None
+    try:
+        collections = await pipeline.zotero.list_collections()
+    except Exception as exc:
+        zotero_error = str(exc)
+    library = settings.endnote_library
+    return {
+        "batches": [
+            {
+                "id": batch["id"],
+                "name": batch["name"],
+                "target_library": batch["target_library"],
+                "total": batch.get("total") or 0,
+            }
+            for batch in database.list_batches()
+        ],
+        "collections": collections,
+        "zotero_error": zotero_error,
+        "endnote_library": str(library) if library else "",
+        "endnote_data_dir": str(library.with_suffix(".Data") / "PDF") if library else "",
+        "downloads_dir": str(Path.home() / "Downloads"),
+    }
+
+
+@app.post("/api/tools/rename-pdfs")
+async def tool_rename_pdfs(payload: LibraryToolRequest) -> dict[str, Any]:
+    try:
+        if payload.source == "batch":
+            if not payload.batch_id.strip():
+                raise LibraryFilesError("请选择本机批次")
+            return rename_batch_pdfs(database, payload.batch_id.strip())
+        if payload.source == "zotero":
+            if not payload.collection.strip():
+                raise LibraryFilesError("请选择 Zotero collection")
+            return await rename_zotero_pdfs(pipeline.zotero, payload.collection.strip())
+        if payload.source == "endnote":
+            library = settings.endnote_library
+            if not library:
+                raise LibraryFilesError("请先在设置中填写 EndNote 库路径")
+            return rename_endnote_pdfs(library)
+        raise LibraryFilesError("未知数据区")
+    except LibraryFilesError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(409, str(exc)) from exc
+
+
+@app.post("/api/tools/export-pdfs")
+async def tool_export_pdfs(payload: LibraryToolRequest) -> dict[str, Any]:
+    try:
+        if payload.source == "batch":
+            if not payload.batch_id.strip():
+                raise LibraryFilesError("请选择本机批次")
+            batch = database.get_batch(payload.batch_id.strip())
+            if not batch:
+                raise LibraryFilesError("批次不存在")
+            lib_name = batch["target_library"]
+            destination = resolve_export_dir(payload.destination) if payload.destination.strip() else downloads_library_dir(lib_name)
+            result = export_batch_pdfs(database, payload.batch_id.strip(), destination)
+        elif payload.source == "zotero":
+            if not payload.collection.strip():
+                raise LibraryFilesError("请选择 Zotero collection")
+            destination = (
+                resolve_export_dir(payload.destination)
+                if payload.destination.strip()
+                else downloads_library_dir(payload.collection.strip())
+            )
+            result = await export_zotero_pdfs(pipeline.zotero, payload.collection.strip(), destination)
+        elif payload.source == "endnote":
+            library = settings.endnote_library
+            if not library:
+                raise LibraryFilesError("请先在设置中填写 EndNote 库路径")
+            destination = (
+                resolve_export_dir(payload.destination)
+                if payload.destination.strip()
+                else downloads_library_dir(library.stem)
+            )
+            result = export_endnote_data_pdfs(library, destination)
+        else:
+            raise LibraryFilesError("未知数据区")
+        if payload.open_folder:
+            os.startfile(destination)  # noqa: S606 - local Windows helper
+        return result
+    except LibraryFilesError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(409, str(exc)) from exc
+
+
+@app.post("/api/tools/export-endnote")
+async def tool_export_endnote(payload: EndNoteExportToolRequest) -> dict[str, Any]:
+    try:
+        collection = payload.collection.strip()
+        if not collection:
+            raise LibraryFilesError("请选择 Zotero collection")
+        destination = (
+            resolve_export_dir(payload.destination)
+            if payload.destination.strip()
+            else downloads_library_dir(collection)
+        )
+        result = await export_zotero_endnote_package(pipeline.zotero, collection, destination)
+        if payload.open_folder:
+            os.startfile(destination)  # noqa: S606 - local Windows helper
+        return result
+    except LibraryFilesError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(409, str(exc)) from exc
+
+
+@app.post("/api/institution/login")
+async def institution_login() -> dict[str, str]:
+    try:
+        url = await pipeline.open_institution_login()
+    except Exception as exc:
+        raise HTTPException(500, str(exc)) from exc
+    return {"status": "opened", "url": url}
 
 
 @app.get("/api/batches")
@@ -210,9 +438,16 @@ async def export_endnote(batch_id: str) -> dict[str, Any]:
 async def download_endnote_export(batch_id: str) -> FileResponse:
     batch = require_batch(batch_id)
     export_dir = Path(batch["endnote_export_path"]) if batch.get("endnote_export_path") else None
-    zip_path = export_dir.with_suffix(".zip") if export_dir else None
+    zip_path = None
+    if export_dir:
+        inside = export_dir / "endnote-export.zip"
+        sibling = export_dir.with_suffix(".zip")
+        if inside.is_file():
+            zip_path = inside
+        elif sibling.is_file():
+            zip_path = sibling
     if not zip_path or not zip_path.is_file():
-        raise HTTPException(404, "还没有 EndNote 导入包。请先提交到 Zotero 或点击导出。")
+        raise HTTPException(404, "还没有 EndNote 导入包。请先在工具页从 Zotero 导出。")
     return FileResponse(zip_path, filename=f"endnote-export-{batch_id[:8]}.zip", media_type="application/zip")
 
 

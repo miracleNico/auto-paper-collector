@@ -37,16 +37,17 @@ def main() -> int:
     parser.add_argument("--output", type=Path, default=Path("outputs/dtn-eight-paper-final.json"))
     args = parser.parse_args()
 
-    papers = httpx.get(f"{args.base_url}/api/batches/{args.batch_id}", timeout=30.0).raise_for_status().json()["papers"]
+    papers = httpx.Client(timeout=30.0, trust_env=False).get(
+        f"{args.base_url}/api/batches/{args.batch_id}"
+    ).raise_for_status().json()["papers"]
     results = []
     for paper in papers:
         key = paper.get("record_number")
         children = []
         if key:
-            response = httpx.get(
+            response = httpx.Client(timeout=30.0, trust_env=False).get(
                 f"http://127.0.0.1:23119/api/users/0/items/{key}/children",
                 headers={"Zotero-API-Version": "3"},
-                timeout=30.0,
             )
             response.raise_for_status()
             children = response.json()

@@ -1,0 +1,6 @@
+id = "generic-ezproxy"
+name = "Generic EZProxy"
+ezproxy_login = "https://ezproxy.example.edu/login?url={url}"
+ezproxy_hosts = ["ezproxy.example.edu"]
+openurl = ""
+login_url_markers = ["login.microsoftonline.com", "shibboleth", "saml", "ezproxy.example.edu/login"]

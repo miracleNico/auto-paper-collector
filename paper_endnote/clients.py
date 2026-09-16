@@ -5,12 +5,13 @@ import html
 import re
 from dataclasses import dataclass
 from typing import Any
-from urllib.parse import quote, urlencode
+from urllib.parse import quote
 
 import httpx
 
 from .config import Settings
 from .inputs import normalize_doi, title_similarity
+from .user_config import InstitutionProfile, institution_openurl, institution_proxy_url, load_preset
 
 
 class RemoteServiceError(RuntimeError):
@@ -148,13 +149,16 @@ def scholar_search_url(title_or_doi: str) -> str:
     return f"https://scholar.google.com/scholar?q={quote(title_or_doi)}"
 
 
+def mcgill_profile() -> InstitutionProfile:
+    return load_preset("mcgill")
+
+
 def mcgill_proxy_url(target_url: str) -> str:
-    return f"https://proxy.library.mcgill.ca/login?url={quote(target_url, safe=':/')}"
+    return institution_proxy_url(mcgill_profile(), target_url)
 
 
 def mcgill_worldcat_url(doi: str) -> str:
-    query = urlencode({"url_ver": "Z39.88-2004", "rft_id": f"info:doi/{normalize_doi(doi)}"})
-    return f"https://mcgill.on.worldcat.org/atoztitles/link?{query}"
+    return institution_openurl(mcgill_profile(), doi) or ""
 
 
 def likely_pdf_url(url: str) -> bool:

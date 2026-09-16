@@ -20,7 +20,7 @@ if (-not (Test-Path -LiteralPath $venvPython)) {
     if ($LASTEXITCODE -ne 0) { throw '无法创建 Python 虚拟环境。' }
 }
 
-& $venvPython -c "import fastapi,httpx,playwright,pypdf,uvicorn" 2>$null
+& $venvPython -c "import fastapi,httpx,keyring,playwright,pypdf,pypdfium2,pytesseract,uvicorn" 2>$null
 $needsInstall = $LASTEXITCODE -ne 0
 if ($needsInstall) {
     $installArguments = @('install', '--disable-pip-version-check')
@@ -30,6 +30,11 @@ if ($needsInstall) {
     $installArguments += @('-r', (Join-Path $projectRoot 'requirements.lock'))
     & $venvPython -m pip @installArguments
     if ($LASTEXITCODE -ne 0) { throw 'Python 依赖安装失败。' }
+}
+
+$listener = Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction SilentlyContinue
+if ($listener) {
+    throw "端口 $Port 已被占用。请关闭已有服务，或用 .\start.ps1 -Port <其他端口>。"
 }
 
 $arguments = @('-m', 'paper_endnote.app', '--port', "$Port")

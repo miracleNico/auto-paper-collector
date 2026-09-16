@@ -5,26 +5,20 @@ import shutil
 from pathlib import Path
 from typing import Any
 
-from .browser import BrowserSession
+from .browser import BrowserSession, LoginTimeoutError, PublisherBlockedError
 from .clients import (
     CrossrefClient,
     RemoteServiceError,
     UnpaywallClient,
-    mcgill_proxy_url,
-    mcgill_worldcat_url,
     scholar_search_url,
 )
 from .config import Settings
 from .db import Database
 from .downloader import download_pdf, safe_filename
-from .endnote import (
-    EndNoteError,
-    EndNoteExportRecord,
-    build_endnote_export_package,
-    export_filename,
-)
 from .inputs import normalize_doi, title_similarity
+from .library_files import downloads_library_dir, export_zotero_endnote_package
 from .pdf_validation import validate_pdf
+from .user_config import institution_openurl, institution_proxy_url
 from .zotero import ZoteroAdapter
 
 
@@ -40,6 +34,9 @@ class PipelineManager:
         self._batch_tasks: dict[str, asyncio.Task] = {}
         self._commit_tasks: dict[str, asyncio.Task] = {}
         self._commit_lock = asyncio.Lock()
+        self.institution_gap_seconds = 6.0
+        self._institution_session_ready = False
+        self._institution_login_failed = False
 
     async def close(self) -> None:
         for task in [*self._batch_tasks.values(), *self._commit_tasks.values()]:
@@ -65,6 +62,8 @@ class PipelineManager:
         self.start(batch_id)
 
     async def _run_batch(self, batch_id: str) -> None:
+        self._institution_session_ready = False
+        self._institution_login_failed = False
         try:
             while True:
                 batch = self.db.get_batch(batch_id)
@@ -72,17 +71,32 @@ class PipelineManager:
                     return
                 actionable = [
                     paper for paper in batch["papers"]
-                    if paper["status"] in {"queued", "matching", "ready", "looking_for_pdf"}
+                    if paper["status"] in {
+                        "queued", "matching", "ready", "looking_for_pdf", "institution_pending",
+                    }
                 ]
                 if not actionable:
                     self.db.update_batch(batch_id, status="completed")
                     self.db.event(batch_id, "网络与题录准备阶段已完成")
+                    if self.settings.auto_commit:
+                        current = self.db.get_batch(batch_id)
+                        if current:
+                            await self._commit_zotero_batch(current)
                     return
                 paper = actionable[0]
                 try:
-                    await self._process_paper(batch_id, paper)
+                    if paper["status"] == "institution_pending":
+                        await self._process_institution_paper(batch_id, paper)
+                        if self.institution_gap_seconds:
+                            await asyncio.sleep(self.institution_gap_seconds)
+                    else:
+                        await self._process_paper(batch_id, paper)
                 except asyncio.CancelledError:
                     raise
+                except LoginTimeoutError as exc:
+                    self._institution_login_failed = True
+                    self._downgrade_remaining_institution(batch_id, str(exc))
+                    self.db.event(batch_id, f"等待登录超时：{exc}", level="warning", paper_id=paper["id"])
                 except Exception as exc:
                     self.db.update_paper(
                         paper["id"], status="failed", needs_action="retry", error=str(exc)
@@ -163,47 +177,98 @@ class PipelineManager:
             error=None,
         )
 
+    def _validate_pdf(self, path: Path, *, expected_doi: str | None, expected_title: str | None):
+        return validate_pdf(
+            path,
+            expected_doi=expected_doi,
+            expected_title=expected_title,
+            **self.settings.pdf_ocr_kwargs(),
+        )
+
+    def _institution_entry(self, *, doi: str | None, fallback: str) -> str:
+        if doi:
+            return institution_proxy_url(self.settings.institution, f"https://doi.org/{doi}")
+        return fallback
+
     async def _find_pdf(self, batch_id: str, paper: dict[str, Any]) -> None:
         self.db.update_paper(paper["id"], status="looking_for_pdf", pdf_status="searching", error=None)
         doi = paper.get("doi")
-        location = await self.unpaywall.best_location(doi) if doi else None
-        if location and location.version == "publishedVersion" and location.pdf_url:
-            filename = safe_filename(f"{doi or paper['id']}.pdf")
-            destination = self.settings.download_dir / paper["id"] / filename
-            try:
-                await download_pdf(location.pdf_url, destination, self.settings)
-                result = validate_pdf(destination, expected_doi=doi, expected_title=paper.get("title"))
-                if result.identity == "verified" and result.role == "main":
+        sources = self.settings.acquisition_sources
+        if "open_access" in sources:
+            location = await self.unpaywall.best_location(doi) if doi else None
+            if location and location.version == "publishedVersion" and location.pdf_url:
+                filename = safe_filename(f"{doi or paper['id']}.pdf")
+                destination = self.settings.download_dir / paper["id"] / filename
+                try:
+                    await download_pdf(location.pdf_url, destination, self.settings)
+                    result = self._validate_pdf(destination, expected_doi=doi, expected_title=paper.get("title"))
+                    if result.identity == "verified" and result.role == "main":
+                        self.db.update_paper(
+                            paper["id"], pdf_status="verified", status="endnote_pending", version="published",
+                            source_url=location.url, pdf_path=str(destination), pdf_sha256=result.sha256,
+                            endnote_status="pending", needs_action="commit_endnote", error=None,
+                        )
+                        self.db.event(batch_id, "已取得并验证开放获取正式版 PDF", paper_id=paper["id"])
+                        return
                     self.db.update_paper(
-                        paper["id"], pdf_status="verified", status="endnote_pending", version="published",
+                        paper["id"], pdf_status="needs_review", status="needs_pdf_review", version="published",
                         source_url=location.url, pdf_path=str(destination), pdf_sha256=result.sha256,
-                        endnote_status="pending", needs_action="commit_endnote", error=None,
+                        needs_action="confirm_pdf", error=result.reason,
                     )
-                    self.db.event(batch_id, "已取得并验证开放获取正式版 PDF", paper_id=paper["id"])
                     return
+                except Exception as exc:
+                    self.db.event(batch_id, f"开放全文自动获取失败：{exc}", level="warning", paper_id=paper["id"])
+            elif location and "institution" not in sources:
+                version_map = {"acceptedVersion": "accepted", "submittedVersion": "preprint", "publishedVersion": "published"}
                 self.db.update_paper(
-                    paper["id"], pdf_status="needs_review", status="needs_pdf_review", version="published",
-                    source_url=location.url, pdf_path=str(destination), pdf_sha256=result.sha256,
-                    needs_action="confirm_pdf", error=result.reason,
+                    paper["id"], pdf_status="not_downloaded", status="needs_pdf",
+                    version=version_map.get(location.version, "unknown"), source_url=location.url,
+                    needs_action="manual_pdf", error="找到候选全文，请在浏览器中确认或提供 PDF",
                 )
                 return
-            except Exception as exc:
-                self.db.event(batch_id, f"开放全文自动获取失败：{exc}", level="warning", paper_id=paper["id"])
 
-        if location:
-            version_map = {"acceptedVersion": "accepted", "submittedVersion": "preprint", "publishedVersion": "published"}
+        fallback = paper.get("metadata", {}).get("url") or (
+            f"https://doi.org/{doi}" if doi else scholar_search_url(paper.get("title") or paper["input_text"])
+        )
+        if "institution" in sources:
+            source_url = self._institution_entry(doi=doi, fallback=fallback)
+            if self.settings.auto_institution:
+                if self._institution_login_failed:
+                    self.db.update_paper(
+                        paper["id"], pdf_status="not_found", status="needs_pdf",
+                        source_url=source_url,
+                        needs_action="manual_pdf",
+                        error="等待登录超时，本批剩余条目已转入人工队列",
+                        endnote_status="pending",
+                    )
+                    return
+                self.db.update_paper(
+                    paper["id"],
+                    pdf_status="not_found",
+                    status="institution_pending",
+                    source_url=source_url,
+                    needs_action=None,
+                    error=None,
+                    endnote_status="pending",
+                )
+                self.db.event(
+                    batch_id,
+                    f"开放获取未命中，转入 {self.settings.institution.name} 自动获取",
+                    paper_id=paper["id"],
+                )
+                return
             self.db.update_paper(
-                paper["id"], pdf_status="not_downloaded", status="needs_pdf",
-                version=version_map.get(location.version, "unknown"), source_url=location.url,
-                needs_action="manual_pdf", error="找到候选全文，请在浏览器中确认或提供 PDF",
+                paper["id"], pdf_status="not_found", status="needs_pdf",
+                source_url=source_url,
+                needs_action="manual_pdf",
+                error=f"未找到可自动获取的开放正式版；请通过 {self.settings.institution.name} 处理",
+                endnote_status="pending",
             )
             return
-
-        target = paper.get("metadata", {}).get("url") or (f"https://doi.org/{doi}" if doi else scholar_search_url(paper.get("title") or paper["input_text"]))
         self.db.update_paper(
             paper["id"], pdf_status="not_found", status="needs_pdf",
-            source_url=mcgill_proxy_url(target) if doi else target,
-            needs_action="manual_pdf", error="未找到可自动获取的开放正式版；请通过 McGill 或 Scholar 处理",
+            source_url=fallback,
+            needs_action="manual_pdf", error="未找到可自动获取的开放正式版",
             endnote_status="pending",
         )
 
@@ -223,7 +288,7 @@ class PipelineManager:
         destination.parent.mkdir(parents=True, exist_ok=True)
         if source.resolve() != destination.resolve():
             shutil.copy2(source, destination)
-        result = validate_pdf(destination, expected_doi=paper.get("doi"), expected_title=paper.get("title"))
+        result = self._validate_pdf(destination, expected_doi=paper.get("doi"), expected_title=paper.get("title"))
         if result.identity == "rejected":
             destination.unlink(missing_ok=True)
             raise ValueError(result.reason)
@@ -246,6 +311,48 @@ class PipelineManager:
         self.db.event(paper["batch_id"], f"已接收本地 PDF：{result.reason}", paper_id=paper_id)
         return result.as_dict()
 
+    def _downgrade_remaining_institution(self, batch_id: str, error: str) -> None:
+        batch = self.db.get_batch(batch_id)
+        if not batch:
+            return
+        message = error or "等待登录超时"
+        for paper in batch["papers"]:
+            if paper["status"] != "institution_pending":
+                continue
+            self.db.update_paper(
+                paper["id"],
+                status="needs_pdf",
+                pdf_status="not_found",
+                needs_action="manual_pdf",
+                error=message,
+            )
+
+    async def _process_institution_paper(self, batch_id: str, paper: dict[str, Any]) -> None:
+        if not self._institution_session_ready:
+            entry = paper.get("source_url") or self._institution_entry(
+                doi=paper.get("doi"),
+                fallback=scholar_search_url(paper.get("title") or paper["input_text"]),
+            )
+            await self.browser.ensure_logged_in(entry)
+            self._institution_session_ready = True
+            self.db.event(batch_id, f"{self.settings.institution.name} 会话已就绪，开始逐篇获取")
+        try:
+            await self.acquire_institution_pdf(paper["id"])
+        except LoginTimeoutError:
+            raise
+        except PublisherBlockedError as exc:
+            self.db.update_paper(
+                paper["id"], status="needs_pdf", pdf_status="not_found",
+                needs_action="manual_pdf", error=str(exc),
+            )
+            self.db.event(batch_id, f"出版社拒绝，转入人工队列：{exc}", level="warning", paper_id=paper["id"])
+        except Exception as exc:
+            self.db.update_paper(
+                paper["id"], status="needs_pdf", pdf_status="not_found",
+                needs_action="manual_pdf", error=str(exc),
+            )
+            self.db.event(batch_id, f"机构自动获取未完成：{exc}", level="warning", paper_id=paper["id"])
+
     async def acquire_institution_pdf(self, paper_id: str) -> dict[str, Any]:
         paper = self.db.get_paper(paper_id)
         if not paper:
@@ -255,8 +362,15 @@ class PipelineManager:
         target = paper.get("source_url")
         if not target:
             doi = paper.get("doi")
-            target = mcgill_proxy_url(f"https://doi.org/{doi}") if doi else scholar_search_url(paper.get("title") or paper["input_text"])
-        self.db.event(paper["batch_id"], "正在使用已登录 Chrome 会话尝试单篇机构获取", paper_id=paper_id)
+            target = self._institution_entry(
+                doi=doi,
+                fallback=scholar_search_url(paper.get("title") or paper["input_text"]),
+            )
+        self.db.event(
+            paper["batch_id"],
+            f"正在使用已登录 Chrome 会话尝试单篇 {self.settings.institution.name} 获取",
+            paper_id=paper_id,
+        )
         try:
             result = await self.browser.acquire_for_paper(paper_id, target)
             updated = self.db.get_paper(paper_id)
@@ -267,12 +381,25 @@ class PipelineManager:
             )
             self.db.event(paper["batch_id"], "机构正式版 PDF 已下载并通过身份校验", paper_id=paper_id)
             return result
+        except LoginTimeoutError as exc:
+            self.db.update_paper(
+                paper_id, status="needs_pdf", pdf_status="not_found", needs_action="manual_pdf", error=str(exc)
+            )
+            self.db.event(paper["batch_id"], f"等待登录超时：{exc}", level="warning", paper_id=paper_id)
+            raise
         except Exception as exc:
             self.db.update_paper(
                 paper_id, status="needs_pdf", pdf_status="not_found", needs_action="manual_pdf", error=str(exc)
             )
             self.db.event(paper["batch_id"], f"机构自动获取未完成：{exc}", level="warning", paper_id=paper_id)
             raise
+
+    async def open_institution_login(self) -> str:
+        url = self.settings.institution.ezproxy_login
+        if "{url}" in url:
+            url = url.replace("{url}", "https://doi.org/")
+        await self.browser.open_for_paper("institution-login", url)
+        return url
 
     async def _browser_downloaded(self, paper_id: str, path: Path) -> None:
         try:
@@ -291,8 +418,10 @@ class PipelineManager:
         if resolver:
             doi = paper.get("doi")
             if not doi:
-                raise ValueError("没有 DOI，无法打开 McGill 馆藏解析器")
-            url = mcgill_worldcat_url(doi)
+                raise ValueError("没有 DOI，无法打开机构馆藏解析器")
+            url = institution_openurl(self.settings.institution, doi)
+            if not url:
+                raise ValueError("当前机构没有配置 OpenURL/馆藏解析器")
         elif scholar:
             url = scholar_search_url(paper.get("doi") or paper.get("title") or paper["input_text"])
         else:
@@ -316,70 +445,19 @@ class PipelineManager:
         batch = self.db.get_batch(batch_id)
         if not batch:
             raise KeyError(batch_id)
-        return await self._export_endnote_from_zotero(batch)
-
-    async def _export_endnote_from_zotero(self, batch: dict[str, Any]) -> dict[str, Any]:
-        batch_id = batch["id"]
         collection_name = batch["target_library"].strip()
-        records: list[EndNoteExportRecord] = []
-        rec_number = 1
-        for paper in batch["papers"]:
-            if paper.get("metadata_status") != "verified":
-                continue
-            metadata = dict(paper.get("metadata") or {})
-            metadata.update({
-                "doi": paper.get("doi"), "title": paper.get("title"), "year": paper.get("year"),
-                "authors": paper.get("authors") or [], "journal": paper.get("journal") or "",
-            })
-            source_pdf = None
-            folder_id = (paper.get("record_number") or paper["id"])[:16]
-            zotero_key = paper.get("record_number")
-            if zotero_key:
-                try:
-                    row = await self.zotero.export_row(zotero_key, metadata)
-                    metadata = row["metadata"] or metadata
-                    source_pdf = row.get("pdf_path")
-                    folder_id = row.get("attachment_key") or zotero_key
-                except Exception as exc:
-                    self.db.event(batch_id, f"从 Zotero 读取附件失败，改用本机文件：{exc}", level="warning", paper_id=paper["id"])
-            if source_pdf is None and paper.get("pdf_path") and paper.get("pdf_status") in {"verified", "accepted"}:
-                source_pdf = Path(paper["pdf_path"])
-            records.append(
-                EndNoteExportRecord(
-                    rec_number=rec_number,
-                    metadata=metadata,
-                    source_pdf=Path(source_pdf) if source_pdf else None,
-                    folder_id=folder_id,
-                    filename=export_filename(metadata, paper["id"]),
-                    zotero_key=zotero_key,
-                )
-            )
-            rec_number += 1
-        if not records:
-            raise EndNoteError("没有已确认题录可导出到 EndNote")
-        destination = self.settings.generated_dir / batch_id / "endnote-export"
-        library = self.settings.endnote_library
-        if self.db.get_setting("endnote_library"):
-            library = Path(self.db.get_setting("endnote_library"))
+        destination = downloads_library_dir(collection_name)
         try:
-            manifest = await asyncio.to_thread(
-                build_endnote_export_package,
-                records,
-                destination,
-                collection_name=collection_name,
-                library=library,
-            )
+            manifest = await export_zotero_endnote_package(self.zotero, collection_name, destination)
         except Exception as exc:
             self.db.event(batch_id, f"EndNote 导出失败：{exc}", level="error")
             raise
         self.db.update_batch(batch_id, endnote_export_path=str(destination))
         copied = manifest.get("pdf_count", 0)
-        message = f"已从 Zotero 导出 EndNote 导入包：{destination}（{len(records)} 篇，{copied} 个 PDF）"
-        if manifest.get("library_pdf_dir"):
-            message += f"；已复制附件到 {manifest['library_pdf_dir']}"
-        if manifest.get("library_copy_error"):
-            message += f"；未写入 EndNote 库目录：{manifest['library_copy_error']}"
-        self.db.event(batch_id, message)
+        self.db.event(
+            batch_id,
+            f"已从 Zotero 导出 EndNote 导入包：{destination}（{manifest.get('record_count', 0)} 篇，{copied} 个 PDF）",
+        )
         return manifest
 
     async def _commit_zotero_batch(self, batch: dict[str, Any]) -> None:
@@ -416,14 +494,15 @@ class PipelineManager:
             try:
                 result = await self.zotero.commit_paper(collection_key, metadata, pdf_path)
                 has_full_text = bool(pdf_path or result.get("existing_full_text"))
-                self.db.update_paper(
-                    paper["id"],
-                    endnote_status="verified",
-                    status="complete" if has_full_text else "needs_pdf",
-                    record_number=result.get("record_number"),
-                    needs_action=None if has_full_text else "manual_pdf",
-                    error=None,
-                )
+                fields = {
+                    "endnote_status": "verified",
+                    "status": "complete" if has_full_text else "needs_pdf",
+                    "record_number": result.get("record_number"),
+                    "needs_action": None if has_full_text else "manual_pdf",
+                }
+                if has_full_text:
+                    fields["error"] = None
+                self.db.update_paper(paper["id"], **fields)
                 self.db.finish_operation(operation_id, "verified", result)
                 self.db.event(batch_id, "Zotero 写入及对账完成", paper_id=paper["id"])
             except Exception as exc:
@@ -435,7 +514,3 @@ class PipelineManager:
                 self.db.event(batch_id, f"Zotero 提交状态不确定：{exc}", level="error", paper_id=paper["id"])
         self.db.update_batch(batch_id, status="completed")
         self.db.event(batch_id, "Zotero 提交阶段结束")
-        try:
-            await self._export_endnote_from_zotero(self.db.get_batch(batch_id) or batch)
-        except Exception as exc:
-            self.db.event(batch_id, f"Zotero 已写入，但 EndNote 导出未完成：{exc}", level="warning")

@@ -283,21 +283,25 @@ label.check.compact { align-items: center; margin: 0; font-size: .75rem; }
 .task-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 1rem; margin-bottom: .8rem; }
 .task-head h2 { max-width: 42rem; margin-bottom: .28rem; font-size: clamp(1.25rem, 2vw, 1.55rem); overflow-wrap: anywhere; }
 .task-subtitle { display: flex; align-items: center; gap: .45rem; margin: 0; color: var(--muted); font-size: .8rem; }
-.task-actions { display: flex; flex: 0 0 auto; align-items: center; justify-content: flex-end; gap: .35rem; flex-wrap: wrap; }
+.task-actions { display: flex; flex: 0 0 auto; align-items: center; justify-content: flex-end; gap: .28rem; flex-wrap: wrap; }
 .task-actions > button,
 .task-actions > .more-actions > summary {
-  min-width: 88px;
+  width: 82px;
+  min-width: 82px;
   min-height: 34px;
   justify-content: center;
   border-radius: 10px;
-  padding: .45rem .65rem;
-  font-size: .76rem;
+  padding: .42rem .4rem;
+  font-size: .72rem;
+  white-space: nowrap;
 }
+.task-actions > [data-action="export-endnote"] { font-size: .67rem; letter-spacing: -.015em; }
 .more-actions { position: relative; }
 .more-actions > summary { display: inline-flex; align-items: center; border: 1px solid var(--line-strong); background: white; color: var(--ink-soft); font-weight: 720; cursor: pointer; list-style: none; }
 .more-actions > summary::-webkit-details-marker { display: none; }
 .more-actions[open] > summary { border-color: var(--blue-400); color: var(--blue-600); }
-.more-menu { position: absolute; z-index: 15; top: calc(100% + .4rem); right: 0; display: grid; width: 215px; gap: .25rem; padding: .4rem; border: 1px solid var(--line); border-radius: 15px; background: white; box-shadow: 0 15px 35px rgba(48, 73, 104, .18); }
+.more-actions[open]::after { position: absolute; z-index: 14; top: 100%; right: 0; width: max(100%, 215px); height: .45rem; content: ""; }
+.more-menu { position: absolute; z-index: 15; top: calc(100% + .35rem); right: 0; display: grid; width: 215px; gap: .25rem; padding: .5rem; border: 1px solid var(--line); border-radius: 15px; background: white; box-shadow: 0 15px 35px rgba(48, 73, 104, .18); }
 .more-menu button, .more-menu .button-link { justify-content: flex-start; width: 100%; min-height: 36px; border: 0; padding: .55rem .65rem; background: transparent; box-shadow: none; }
 .more-menu .danger { color: var(--danger); }
 .progress-meta { display: flex; align-items: center; justify-content: space-between; gap: .8rem; margin: 1rem 0 .4rem; color: var(--muted); font-size: .75rem; }
@@ -457,7 +461,7 @@ dialog::backdrop { background: rgba(35, 47, 66, .46); backdrop-filter: blur(3px)
   .task-actions > button, .task-actions > .primary { flex: 1; }
   .more-actions { flex: 1; }
   .more-actions > summary { width: 100%; justify-content: center; }
-  .more-menu { right: auto; left: 0; width: min(250px, calc(100vw - 3rem)); }
+  .more-menu { right: 0; left: auto; width: min(250px, calc(100vw - 3rem)); }
   .summary-grid { gap: .45rem; }
   .summary-card { padding: .65rem; }
   .table-wrap { border: 0; overflow: visible; background: transparent; }

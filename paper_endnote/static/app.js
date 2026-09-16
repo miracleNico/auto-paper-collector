@@ -392,6 +392,10 @@ async function renderBatch(batchId = state.selectedBatch, {silent = false} = {})
 }
 
 function renderBatchDetail(batch) {
+  const currentMoreActions = $("#task-detail .more-actions");
+  const keepMoreActionsOpen = Boolean(
+    currentMoreActions?.open && currentMoreActions.dataset.batchId === batch.id
+  );
   const papers = batch.papers || [];
   const counts = {complete: 0, needs: 0, pdf: 0, zotero: 0};
   papers.forEach(paper => {
@@ -412,11 +416,11 @@ function renderBatchDetail(batch) {
       <div class="task-actions">
         <button type="button" data-action="${paused ? "resume" : "pause"}">${paused ? "继续任务" : "暂停"}</button>
         <button class="primary" type="button" data-action="commit">提交 Zotero</button>
-        <details class="more-actions"><summary>更多操作 ···</summary><div class="more-menu">
-          <button type="button" data-action="institution-login">机构登录</button>
+        <button type="button" data-action="institution-login">机构登录</button>
+        <button type="button" data-action="export-endnote">导出 EndNote</button>
+        <details class="more-actions" data-batch-id="${esc(batch.id)}" ${keepMoreActionsOpen ? "open" : ""}><summary>更多操作 ···</summary><div class="more-menu">
           <button type="button" data-action="rename-pdfs">重命名 PDF</button>
           <button type="button" data-action="export-pdfs">导出 PDF</button>
-          <button type="button" data-action="export-endnote">导出 EndNote 包</button>
           ${exportPath ? `<a class="button-link" href="/api/batches/${encodeURIComponent(batch.id)}/endnote-export.zip">下载 EndNote ZIP</a><button type="button" data-action="open-endnote-export">打开导出文件夹</button>` : ""}
           <a class="button-link" href="/api/batches/${encodeURIComponent(batch.id)}/report.csv">下载 CSV 报告</a>
           <button class="danger" type="button" data-action="delete">删除批次</button>
@@ -438,6 +442,10 @@ function renderBatchDetail(batch) {
   $("[data-action='pause']")?.addEventListener("click", () => batchAction("pause"));
   $("[data-action='resume']")?.addEventListener("click", () => batchAction("resume"));
   $("[data-action='commit']")?.addEventListener("click", () => batchAction("commit"));
+  $("#task-detail .more-actions")?.addEventListener("toggle", event => {
+    if (event.currentTarget.open || state.activeTab !== "tasks" || state.selectedBatch !== batch.id) return;
+    renderBatch(batch.id, {silent: true});
+  });
   $("[data-action='open-endnote-export']")?.addEventListener("click", () => batchAction("open-endnote-export"));
   $("[data-action='delete']")?.addEventListener("click", () => openDeleteDialog([batch.id]));
   $("[data-action='institution-login']")?.addEventListener("click", openInstitutionLogin);
@@ -625,7 +633,9 @@ async function pollTasks() {
   state.pollCount += 1;
   try {
     const batchId = state.selectedBatch;
-    if (batchId) await renderBatch(batchId, {silent: true});
+    if (batchId && !$("#task-detail .more-actions[open]")) {
+      await renderBatch(batchId, {silent: true});
+    }
     if (state.pollCount % 2 === 0) await refreshBatches({renderDetail: false, silent: true});
   } finally {
     state.pollBusy = false;

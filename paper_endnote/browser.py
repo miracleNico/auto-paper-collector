@@ -75,6 +75,11 @@ class BrowserSession:
         self._acquire_lock = asyncio.Lock()
         self._active_paper_id: str | None = None
         self._download_callback: DownloadCallback | None = None
+        self._blocked_papers: set[str] = set()
+        self._bound_pages: set[int] = set()
+        self._page_papers: dict[int, str | None] = {}
+        self._pages_by_paper: dict[str, dict[int, Any]] = {}
+        self._download_tasks: dict[str, set[asyncio.Task]] = {}
 
     def set_download_callback(self, callback: DownloadCallback) -> None:
         self._download_callback = callback
@@ -106,23 +111,67 @@ class BrowserSession:
                 raise BrowserError(f"无法启动专用 Chrome：{exc}") from exc
 
     def _bind_page(self, page, paper_id: str | None) -> None:
-        page.on("download", lambda download: asyncio.create_task(self._save_download(download, paper_id)))
+        page_key = id(page)
+        previous = self._page_papers.get(page_key)
+        if previous and previous in self._pages_by_paper:
+            self._pages_by_paper[previous].pop(page_key, None)
+        self._page_papers[page_key] = paper_id
+        if paper_id:
+            self._pages_by_paper.setdefault(paper_id, {})[page_key] = page
+        if page_key in self._bound_pages:
+            return
+        self._bound_pages.add(page_key)
+        page.on(
+            "download",
+            lambda download: self._schedule_download(
+                download, self._page_papers.get(page_key)
+            ),
+        )
+        page.on("close", lambda *_: self._forget_page(page_key))
+
+    def _forget_page(self, page_key: int) -> None:
+        self._bound_pages.discard(page_key)
+        paper_id = self._page_papers.pop(page_key, None)
+        if paper_id and paper_id in self._pages_by_paper:
+            self._pages_by_paper[paper_id].pop(page_key, None)
+            if not self._pages_by_paper[paper_id]:
+                self._pages_by_paper.pop(paper_id, None)
+
+    def _schedule_download(self, download, paper_id: str | None) -> None:
+        if not paper_id or paper_id in self._blocked_papers:
+            return
+        task = asyncio.create_task(self._save_download(download, paper_id))
+        self._download_tasks.setdefault(paper_id, set()).add(task)
+        task.add_done_callback(lambda done: self._forget_download(paper_id, done))
+
+    def _forget_download(self, paper_id: str, task: asyncio.Task) -> None:
+        tasks = self._download_tasks.get(paper_id)
+        if tasks is not None:
+            tasks.discard(task)
+            if not tasks:
+                self._download_tasks.pop(paper_id, None)
 
     async def _save_download(self, download, paper_id: str | None) -> None:
-        if not paper_id:
+        if not paper_id or paper_id in self._blocked_papers:
             return
         name = safe_filename(download.suggested_filename or "paper.pdf")
         destination = self.settings.download_dir / paper_id / f"manual-{name}"
         destination.parent.mkdir(parents=True, exist_ok=True)
         await download.save_as(str(destination))
+        if paper_id in self._blocked_papers:
+            destination.unlink(missing_ok=True)
+            return
         if self._download_callback:
             await self._download_callback(paper_id, destination)
 
     async def open_for_paper(self, paper_id: str, url: str) -> None:
+        if paper_id in self._blocked_papers:
+            raise BrowserError("论文所属批次正在删除")
         await self.start()
         self._active_paper_id = paper_id
         assert self._context is not None
         page = await self._context.new_page()
+        self._bind_page(page, paper_id)
         await page.goto(url, wait_until="domcontentloaded", timeout=45_000)
         await self._reveal(page)
 
@@ -221,6 +270,7 @@ class BrowserSession:
         async with self._acquire_lock:
             assert self._context is not None
             page = await self._context.new_page()
+            self._bind_page(page, None)
             try:
                 await self._open_institution_entry(page, entry_url)
                 await self._reveal(page)
@@ -323,7 +373,9 @@ class BrowserSession:
                 result.append(absolute)
         return result
 
-    async def _fetch_pdf(self, candidates: list[dict[str, str]], destination: Path) -> dict[str, Any]:
+    async def _fetch_pdf(
+        self, paper_id: str, candidates: list[dict[str, str]], destination: Path
+    ) -> dict[str, Any]:
         assert self._context is not None
         queue = sorted(candidates, key=self._rank_candidate, reverse=True)
         visited: set[str] = set()
@@ -349,6 +401,8 @@ class BrowserSession:
                         f"出版社拒绝：HTTP {response.status} {content_type} {url}"
                     )
                 if response.status == 200 and body.startswith(b"%PDF-"):
+                    if paper_id in self._blocked_papers:
+                        raise BrowserError("论文所属批次正在删除")
                     destination.parent.mkdir(parents=True, exist_ok=True)
                     destination.write_bytes(body)
                     return {
@@ -404,6 +458,8 @@ class BrowserSession:
 
     async def acquire_for_paper(self, paper_id: str, url: str) -> dict[str, Any]:
         """Retrieve one PDF through an already user-authenticated Chrome session."""
+        if paper_id in self._blocked_papers:
+            raise BrowserError("论文所属批次正在删除")
         await self.start()
         async with self._acquire_lock:
             self._active_paper_id = paper_id
@@ -436,7 +492,7 @@ class BrowserSession:
                     raise BrowserError(f"出版社页面没有可识别的 PDF 入口：{page.url}")
                 destination = self.settings.download_dir / paper_id / "institution-main.pdf"
                 try:
-                    result = await self._fetch_pdf(candidates, destination)
+                    result = await self._fetch_pdf(paper_id, candidates, destination)
                 except PublisherBlockedError:
                     raise
                 except BrowserError as publisher_error:
@@ -457,8 +513,11 @@ class BrowserSession:
                             f"{name} 馆藏解析器没有提供 PDF 入口：{page.url}; "
                             f"出版社尝试为 {publisher_error}"
                         )
-                    result = await self._fetch_pdf(resolver_candidates, destination)
+                    result = await self._fetch_pdf(paper_id, resolver_candidates, destination)
                 result.update({"entry_url": entry_url, "publisher_url": page.url, "publisher_title": await page.title()})
+                if paper_id in self._blocked_papers:
+                    destination.unlink(missing_ok=True)
+                    raise BrowserError("论文所属批次正在删除")
                 if self._download_callback:
                     await self._download_callback(paper_id, destination)
                 return result
@@ -466,15 +525,47 @@ class BrowserSession:
                 with suppress(Exception):
                     await page.close()
 
+    async def stop_papers(self, paper_ids: list[str]) -> None:
+        paper_set = set(paper_ids)
+        self._blocked_papers.update(paper_set)
+        if self._active_paper_id in paper_set:
+            self._active_paper_id = None
+        pages = [
+            page
+            for paper_id in paper_set
+            for page in self._pages_by_paper.get(paper_id, {}).values()
+        ]
+        if pages:
+            await asyncio.gather(
+                *(page.close() for page in pages), return_exceptions=True
+            )
+        downloads = [
+            task
+            for paper_id in paper_set
+            for task in self._download_tasks.get(paper_id, set())
+            if not task.done()
+        ]
+        if downloads:
+            await asyncio.gather(*downloads, return_exceptions=True)
+
     async def close(self) -> None:
+        downloads = [
+            task for tasks in self._download_tasks.values() for task in tasks
+            if not task.done()
+        ]
         if self._context is not None:
             try:
                 with suppress(Exception):
                     await self._context.close()
             finally:
                 self._context = None
+        if downloads:
+            await asyncio.gather(*downloads, return_exceptions=True)
         if self._playwright is not None:
             try:
                 await self._playwright.stop()
             finally:
                 self._playwright = None
+        self._page_papers.clear()
+        self._pages_by_paper.clear()
+        self._bound_pages.clear()

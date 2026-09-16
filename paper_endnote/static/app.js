@@ -1,38 +1,244 @@
-const state = { batches: [], selectedBatch: null, pollTimer: null, currentPaper: null, system: null };
-const $ = (selector) => document.querySelector(selector);
-const esc = (value) => String(value ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+const state = {
+  batches: [],
+  selectedBatch: null,
+  selectedBatchIds: new Set(),
+  deletingBatchIds: new Set(),
+  currentPaper: null,
+  system: null,
+  toolSources: null,
+  activeTab: "new",
+  pollTimer: null,
+  pollBusy: false,
+  pollCount: 0,
+  systemRequestToken: 0,
+  listRequestToken: 0,
+  detailRequestToken: 0,
+  detailController: null,
+  deletePreviewToken: 0,
+  pendingDeleteIds: [],
+  deleteOperationId: null,
+  deletionActive: false,
+  deletionTerminal: false,
+  deletePollTimer: null,
+  deletePollFailures: 0,
+  helpTrigger: null,
+  helpPinned: false,
+};
+
+const $ = selector => document.querySelector(selector);
+const $$ = selector => [...document.querySelectorAll(selector)];
+const esc = value => String(value ?? "").replace(/[&<>"']/g, character => ({
+  "&": "&amp;",
+  "<": "&lt;",
+  ">": "&gt;",
+  '"': "&quot;",
+  "'": "&#39;",
+})[character]);
 
 async function api(path, options = {}) {
-  const response = await fetch(path, { credentials: "same-origin", ...options, headers: { ...(options.body instanceof FormData ? {} : {"Content-Type":"application/json"}), ...(options.headers || {}) } });
+  const response = await fetch(path, {
+    credentials: "same-origin",
+    ...options,
+    headers: {
+      ...(options.body instanceof FormData ? {} : {"Content-Type": "application/json"}),
+      ...(options.headers || {}),
+    },
+  });
   if (!response.ok) {
     let message = await response.text();
-    try { message = JSON.parse(message).detail || message; } catch (_) {}
-    throw new Error(message || `HTTP ${response.status}`);
+    try {
+      const payload = JSON.parse(message);
+      message = typeof payload.detail === "string" ? payload.detail : JSON.stringify(payload.detail || payload);
+    } catch (_) {}
+    const error = new Error(message || `请求失败（${response.status}）`);
+    error.status = response.status;
+    throw error;
   }
   return response.headers.get("content-type")?.includes("json") ? response.json() : response.text();
 }
 
 function toast(message) {
-  const node = $("#toast"); node.textContent = message; node.classList.add("show");
-  clearTimeout(node.timer); node.timer = setTimeout(() => node.classList.remove("show"), 3500);
+  const node = $("#toast");
+  node.textContent = message;
+  node.classList.add("show");
+  clearTimeout(node.timer);
+  node.timer = setTimeout(() => node.classList.remove("show"), 3800);
 }
 
-function showTab(name) {
-  document.querySelectorAll(".tab,.tab-panel").forEach(n => n.classList.remove("active"));
-  document.querySelector(`.tab[data-tab="${name}"]`).classList.add("active");
-  $(`#tab-${name}`).classList.add("active");
-  if (name === "tasks") refreshBatches();
-  if (name === "tools") return loadToolSources();
+const STATUS_LABELS = {
+  draft: "未开始",
+  running: "处理中",
+  paused: "已暂停",
+  completed: "阶段完成",
+  partial_failed: "部分失败",
+  failed: "失败",
+  queued: "排队中",
+  matching: "匹配题录中",
+  needs_match: "待确认题录",
+  ready: "题录就绪",
+  looking_for_pdf: "查找全文中",
+  institution_pending: "机构获取中",
+  needs_pdf: "待补全文",
+  needs_pdf_review: "待确认 PDF",
+  pdf_ready: "PDF 就绪",
+  endnote_pending: "待写入 Zotero",
+  complete: "已完成",
+  skipped: "已跳过",
+  pending: "等待中",
+  stopping: "正在停止",
+  deleting: "正在清理",
+  missing: "已不存在",
+};
+
+const METADATA_LABELS = {
+  pending: "等待匹配",
+  matching: "匹配中",
+  needs_review: "待确认",
+  unavailable: "未找到",
+  verified: "已确认",
+};
+
+const PDF_LABELS = {
+  pending: "等待获取",
+  searching: "查找中",
+  verified: "已验证",
+  accepted: "已接受",
+  needs_review: "待确认",
+  not_downloaded: "待下载",
+  not_found: "未找到",
+  rejected: "已拒绝",
+};
+
+const ZOTERO_LABELS = {
+  pending: "等待提交",
+  pending_commit: "提交中",
+  verified: "已核验",
+  uncertain: "待对账",
+};
+
+const VERSION_LABELS = {
+  published: "正式发表版本",
+  accepted: "作者接受稿",
+  preprint: "预印本",
+  unknown: "版本不明",
+  publishedVersion: "正式发表版本",
+  acceptedVersion: "作者接受稿",
+  submittedVersion: "预印本",
+};
+
+const DELETION_LABELS = {
+  pending: "等待清理",
+  stopping: "正在停止",
+  deleting: "正在清理",
+  completed: "已清理",
+  failed: "清理失败",
+  missing: "已不存在",
+};
+
+function translated(value, labels, fallback = "未知") {
+  return labels[value] || fallback;
+}
+
+function statusLabel(value) {
+  return translated(value, STATUS_LABELS, "未知状态");
+}
+
+function statusTone(value) {
+  if (["failed", "partial_failed", "needs_match", "needs_pdf_review", "uncertain", "rejected"].includes(value)) return "error";
+  if (["paused", "needs_pdf", "institution_pending", "stopping", "deleting", "pending", "not_found", "not_downloaded"].includes(value)) return "warn";
+  if (["draft", "queued", "skipped", "missing"].includes(value)) return "muted";
+  return "";
+}
+
+function statusChip(value, label = statusLabel(value)) {
+  return `<span class="status-chip ${statusTone(value)}">${esc(label)}</span>`;
+}
+
+function formatBytes(value) {
+  let bytes = Number(value || 0);
+  if (!Number.isFinite(bytes) || bytes < 0) bytes = 0;
+  const units = ["B", "KB", "MB", "GB", "TB"];
+  let unit = 0;
+  while (bytes >= 1024 && unit < units.length - 1) {
+    bytes /= 1024;
+    unit += 1;
+  }
+  const precision = unit === 0 || bytes >= 100 ? 0 : bytes >= 10 ? 1 : 2;
+  return `${bytes.toFixed(precision)} ${units[unit]}`;
+}
+
+function setButtonBusy(button, busy, busyText) {
+  if (!button) return;
+  if (busy) {
+    button.dataset.originalText = button.textContent;
+    button.textContent = busyText;
+    button.disabled = true;
+    button.setAttribute("aria-busy", "true");
+  } else {
+    button.textContent = button.dataset.originalText || button.textContent;
+    button.disabled = false;
+    button.removeAttribute("aria-busy");
+  }
+}
+
+function emptyTaskDetail(title = "选择一个批次", text = "进度与待处理论文会显示在这里") {
+  $("#task-detail").classList.remove("loading");
+  $("#task-detail").innerHTML = `<div class="empty-state"><span class="empty-icon" aria-hidden="true">⌁</span><strong>${esc(title)}</strong><span>${esc(text)}</span></div>`;
+}
+
+function invalidateDetailRequest() {
+  state.detailRequestToken += 1;
+  state.detailController?.abort();
+  state.detailController = null;
+}
+
+async function showTab(name) {
+  state.activeTab = name;
+  $$(".tab").forEach(button => {
+    const active = button.dataset.tab === name;
+    button.classList.toggle("active", active);
+    button.setAttribute("aria-selected", String(active));
+  });
+  $$(".tab-panel").forEach(panel => panel.classList.toggle("active", panel.id === `tab-${name}`));
+  closeHelp();
+  if (name === "tasks") {
+    await refreshBatches();
+    startPolling();
+  } else {
+    stopPolling();
+  }
+  if (name === "tools") await loadToolSources();
+  if (name === "settings") await refreshSystemStatus();
+}
+
+function renderSystemStatus() {
+  const probe = state.system?.zotero || {};
+  const badge = $("#system-badge");
+  badge.textContent = probe.ready ? "Zotero 已连接" : (probe.enabled ? "Zotero 待授权" : "Zotero 未连接");
+  badge.className = `badge ${probe.ready ? "" : probe.enabled ? "warn" : "error"}`;
+  $("#system-info").textContent = JSON.stringify(state.system, null, 2);
+
+  const ocr = state.system?.ocr || {};
+  const ocrStatus = $("#ocr-status");
+  ocrStatus.textContent = ocr.ready ? `Tesseract ${ocr.tesseract_version || "可用"}` : "Tesseract 未就绪";
+  ocrStatus.className = `status-pill ${ocr.ready ? "" : "warn"}`;
+  renderEnvironmentStatus();
+}
+
+async function refreshSystemStatus() {
+  const token = ++state.systemRequestToken;
+  const system = await api("/api/state");
+  if (token !== state.systemRequestToken) return null;
+  state.system = system;
+  renderSystemStatus();
+  return system;
 }
 
 async function loadSystem() {
-  state.system = await api("/api/state");
-  const probe = state.system.zotero;
-  const badge = $("#system-badge");
-  badge.textContent = probe.ready ? "Zotero API 可写" : (probe.enabled ? "Zotero 待授权" : "Zotero API 未启用");
-  badge.className = `badge ${probe.ready ? "" : "warn"}`;
-  $("#system-info").textContent = JSON.stringify(state.system, null, 2);
-  const cfg = state.system.settings;
+  const system = await refreshSystemStatus();
+  if (!system) return;
+
+  const cfg = system.settings || {};
   $("#crossref-email").value = cfg.crossref_email || "";
   $("#unpaywall-email").value = cfg.unpaywall_email || "";
   $("#endnote-library").value = cfg.endnote_library || "";
@@ -44,17 +250,30 @@ async function loadSystem() {
   $("#ocr-enabled").checked = !!cfg.ocr_enabled;
   $("#ocr-languages").value = cfg.ocr_languages || "eng";
   $("#ocr-max-pages").value = cfg.ocr_max_pages || 2;
-  const ocr = state.system.ocr || {};
-  $("#ocr-status").textContent = ocr.ready
-    ? `Tesseract ${ocr.tesseract_version} 可用，扫描件可用 OCR 匹配题名。`
-    : "未检测到 Tesseract。扫描件仍会进入人工确认；安装 Tesseract 后可自动匹配题名。";
-  fillInstitution(cfg.institution || {}, state.system.presets || []);
-  const cred = state.system.credentials || {};
-  $("#institution-username").value = cred.username || "";
+
+  fillInstitution(cfg.institution || {}, system.presets || []);
+
+  const credentials = system.credentials || {};
+  $("#institution-username").value = credentials.username || "";
   $("#institution-password").value = "";
-  $("#credentials-status").textContent = cred.password_saved
-    ? `已在 Windows 凭据管理器保存 ${cfg.institution?.name || "机构"} 账号 ${cred.username}。`
-    : "尚未保存机构密码。";
+  $("#credentials-status").textContent = credentials.password_saved
+    ? `已保存 ${cfg.institution?.name || "机构"}账号${credentials.username ? ` · ${credentials.username}` : ""}`
+    : "尚未保存密码";
+}
+
+function renderEnvironmentStatus() {
+  const zotero = state.system?.zotero || {};
+  const ocr = state.system?.ocr || {};
+  const endnote = state.system?.endnote || {};
+  const zoteroText = zotero.ready ? `可写入${zotero.version ? ` · ${zotero.version}` : ""}` : zotero.enabled ? "等待授权" : zotero.running ? "本地 API 未启用" : "未运行";
+  const endnoteText = endnote.library ? (endnote.library_exists ? "库路径有效" : "库路径无效") : "可导出导入包";
+  $("#environment-status").innerHTML = `
+    <div class="status-card ${zotero.ready ? "ready" : "warn"}"><strong>Zotero</strong><span>${esc(zoteroText)}</span></div>
+    <div class="status-card ${ocr.ready ? "ready" : "warn"}"><strong>OCR</strong><span>${ocr.ready ? "可用" : "未就绪"}</span></div>
+    <div class="status-card ${endnote.library && !endnote.library_exists ? "warn" : "ready"}"><strong>EndNote</strong><span>${esc(endnoteText)}</span></div>`;
+  const authorize = $("#authorize-zotero");
+  authorize.textContent = zotero.ready ? "Zotero 已授权" : "授权 Zotero";
+  authorize.disabled = !!zotero.ready;
 }
 
 function fillInstitution(institution, presets) {
@@ -72,241 +291,515 @@ function fillInstitution(institution, presets) {
   $("#institution-login-markers").value = (institution.login_url_markers || []).join(", ");
 }
 
-async function refreshBatches() {
-  state.batches = await api("/api/batches");
-  $("#batch-list").innerHTML = state.batches.length ? state.batches.map(batch => `
-    <button class="batch-item ${state.selectedBatch === batch.id ? "active" : ""}" data-batch="${batch.id}">
-      <strong>${esc(batch.name)}</strong><span>${batch.completed || 0}/${batch.total || 0} 完成 · ${statusLabel(batch.status)}</span>
-    </button>`).join("") : `<p class="muted">尚无任务</p>`;
-  document.querySelectorAll("[data-batch]").forEach(button => button.onclick = () => selectBatch(button.dataset.batch));
-  if (state.selectedBatch) await renderBatch();
+function renderBatchList() {
+  const list = $("#batch-list");
+  if (!state.batches.length) {
+    list.innerHTML = `<div class="empty-state compact"><span aria-hidden="true">♡</span> 尚无任务</div>`;
+    updateBatchSelectionBar();
+    return;
+  }
+  list.innerHTML = state.batches.map(batch => {
+    const deleting = state.deletingBatchIds.has(batch.id) || ["pending", "stopping", "deleting"].includes(batch.deletion_status);
+    const checked = state.selectedBatchIds.has(batch.id);
+    const label = deleting ? statusLabel(batch.deletion_status || "deleting") : statusLabel(batch.status);
+    return `<div class="batch-row ${state.selectedBatch === batch.id ? "active" : ""} ${deleting ? "deleting" : ""}">
+      <label class="batch-select" aria-label="选择 ${esc(batch.name)}"><input type="checkbox" data-batch-select="${esc(batch.id)}" ${checked ? "checked" : ""} ${deleting ? "disabled" : ""}></label>
+      <button class="batch-item" type="button" data-batch-open="${esc(batch.id)}" ${deleting ? "disabled" : ""}>
+        <strong>${esc(batch.name)}</strong>
+        <span class="batch-meta"><span>${batch.completed || 0}/${batch.total || 0}</span><span class="mini-dot"></span><span>${esc(label)}</span></span>
+      </button>
+    </div>`;
+  }).join("");
+  $$('[data-batch-open]').forEach(button => button.addEventListener("click", () => selectBatch(button.dataset.batchOpen)));
+  $$('[data-batch-select]').forEach(input => input.addEventListener("change", () => {
+    if (input.checked) state.selectedBatchIds.add(input.dataset.batchSelect);
+    else state.selectedBatchIds.delete(input.dataset.batchSelect);
+    updateBatchSelectionBar();
+  }));
+  updateBatchSelectionBar();
+}
+
+function updateBatchSelectionBar() {
+  const available = state.batches.filter(batch => !state.deletingBatchIds.has(batch.id) && !["pending", "stopping", "deleting"].includes(batch.deletion_status));
+  const selectedCount = available.filter(batch => state.selectedBatchIds.has(batch.id)).length;
+  const selectAll = $("#select-all-batches");
+  selectAll.disabled = available.length === 0;
+  selectAll.checked = available.length > 0 && selectedCount === available.length;
+  selectAll.indeterminate = selectedCount > 0 && selectedCount < available.length;
+  $("#selected-batch-count").textContent = `已选 ${selectedCount}`;
+  $("#delete-selected-batches").disabled = selectedCount === 0 || state.deletionActive;
+}
+
+async function refreshBatches({renderDetail = true, silent = false} = {}) {
+  const requestToken = ++state.listRequestToken;
+  if (!silent && !state.batches.length) {
+    $("#batch-list").innerHTML = `<div class="loading-state"><span class="spinner" aria-hidden="true"></span> 正在加载批次…</div>`;
+  }
+  try {
+    const batches = await api("/api/batches");
+    if (requestToken !== state.listRequestToken) return;
+    state.batches = batches;
+    const existingIds = new Set(batches.map(batch => batch.id));
+    state.selectedBatchIds = new Set([...state.selectedBatchIds].filter(id => existingIds.has(id)));
+    if (state.selectedBatch && !existingIds.has(state.selectedBatch)) {
+      state.selectedBatch = null;
+      invalidateDetailRequest();
+      emptyTaskDetail("批次已清理", "请选择其他批次");
+    }
+    renderBatchList();
+    if (renderDetail && state.selectedBatch) await renderBatch(state.selectedBatch, {silent});
+  } catch (error) {
+    if (requestToken !== state.listRequestToken || silent) return;
+    $("#batch-list").innerHTML = `<div class="empty-state compact"><strong>加载失败</strong><span>${esc(error.message)}</span><button type="button" data-retry-batches>重试</button></div>`;
+    $("[data-retry-batches]")?.addEventListener("click", () => refreshBatches());
+  }
 }
 
 async function selectBatch(id) {
+  if (!id || state.deletingBatchIds.has(id)) return;
   state.selectedBatch = id;
-  await refreshBatches();
-  startPolling();
+  renderBatchList();
+  $("#task-detail").classList.add("loading");
+  $("#task-detail").innerHTML = `<div class="loading-state"><span class="spinner" aria-hidden="true"></span> 正在加载详情…</div>`;
+  await renderBatch(id);
 }
 
-function statusLabel(value) {
-  return ({draft:"未开始",running:"处理中",paused:"已暂停",completed:"阶段完成",failed:"失败",queued:"排队",matching:"匹配中",needs_match:"待确认题录",ready:"题录就绪",looking_for_pdf:"查找全文",institution_pending:"机构获取中",needs_pdf:"待补全文",needs_pdf_review:"待确认PDF",endnote_pending:"待写入文献库",complete:"已完成",skipped:"已跳过"})[value] || value || "未知";
+async function renderBatch(batchId = state.selectedBatch, {silent = false} = {}) {
+  if (!batchId || batchId !== state.selectedBatch || state.deletingBatchIds.has(batchId)) return;
+  const requestToken = ++state.detailRequestToken;
+  state.detailController?.abort();
+  const controller = new AbortController();
+  state.detailController = controller;
+  try {
+    const batch = await api(`/api/batches/${encodeURIComponent(batchId)}`, {signal: controller.signal});
+    if (requestToken !== state.detailRequestToken || state.selectedBatch !== batchId || state.deletingBatchIds.has(batchId)) return;
+    renderBatchDetail(batch);
+  } catch (error) {
+    if (error.name === "AbortError" || requestToken !== state.detailRequestToken || state.selectedBatch !== batchId) return;
+    if (error.status === 404) {
+      state.selectedBatch = null;
+      emptyTaskDetail("批次已不存在", "列表将自动刷新");
+      await refreshBatches({renderDetail: false, silent: true});
+      return;
+    }
+    if (!silent) emptyTaskDetail("详情加载失败", error.message);
+  } finally {
+    if (requestToken === state.detailRequestToken) {
+      state.detailController = null;
+      $("#task-detail").classList.remove("loading");
+    }
+  }
 }
 
-async function renderBatch() {
-  const batch = await api(`/api/batches/${state.selectedBatch}`);
-  const counts = {complete:0, needs:0, pdf:0, endnote:0};
-  batch.papers.forEach(p => { if (p.status === "complete") counts.complete++; if (p.needs_action) counts.needs++; if (["verified","accepted"].includes(p.pdf_status)) counts.pdf++; if (p.endnote_status === "verified") counts.endnote++; });
-  const pct = batch.papers.length ? Math.round(counts.complete / batch.papers.length * 100) : 0;
+function renderBatchDetail(batch) {
+  const currentMoreActions = $("#task-detail .more-actions");
+  const keepMoreActionsOpen = Boolean(
+    currentMoreActions?.open && currentMoreActions.dataset.batchId === batch.id
+  );
+  const papers = batch.papers || [];
+  const counts = {complete: 0, needs: 0, pdf: 0, zotero: 0};
+  papers.forEach(paper => {
+    if (paper.status === "complete") counts.complete += 1;
+    if (paper.needs_action) counts.needs += 1;
+    if (["verified", "accepted"].includes(paper.pdf_status)) counts.pdf += 1;
+    if (paper.endnote_status === "verified") counts.zotero += 1;
+  });
+  const pct = papers.length ? Math.round(counts.complete / papers.length * 100) : 0;
+  const paused = batch.status !== "running";
   const exportPath = batch.endnote_export_path;
+  const batchError = batch.error === "Zotero 本地 API 未启用" && state.system?.zotero?.ready
+    ? "上次提交时 Zotero 本地 API 未启用；当前已连接，可重新提交。"
+    : batch.error;
   $("#task-detail").innerHTML = `
-    <div class="task-head"><div><h2>${esc(batch.name)}</h2><p class="muted">Zotero · ${esc(batch.target_library)}</p></div>
+    <div class="task-head">
+      <div><h2>${esc(batch.name)}</h2><p class="task-subtitle">${statusChip(batch.status)}<span>Zotero · ${esc(batch.target_library || "未命名")}</span></p></div>
       <div class="task-actions">
-        ${batch.status === "running" ? `<button data-action="pause">暂停</button>` : `<button data-action="resume">继续匹配/获取</button>`}
-        <button data-action="institution-login">机构登录</button>
-        <button data-action="rename-pdfs">按题录重命名 PDF</button>
-        <button data-action="export-pdfs">导出 PDF</button>
-        <button class="primary" data-action="commit">提交到 Zotero</button>
-        <button data-action="export-endnote">导出 EndNote 导入包</button>
-        ${exportPath ? `<a href="/api/batches/${batch.id}/endnote-export.zip"><button>下载 ZIP</button></a><button data-action="open-endnote-export">打开文件夹</button>` : ""}
-        <a href="/api/batches/${batch.id}/report.csv"><button>下载报告</button></a>
-      </div></div>
-    <div class="progress"><span style="width:${pct}%"></span></div>
-    <div class="summary-grid">
-      <div class="summary-card"><b>${batch.papers.length}</b><span>论文</span></div>
-      <div class="summary-card"><b>${counts.pdf}</b><span>PDF 已验证</span></div>
-      <div class="summary-card"><b>${counts.endnote}</b><span>Zotero 已核验</span></div>
-      <div class="summary-card"><b>${counts.needs}</b><span>需要处理</span></div>
+        <button type="button" data-action="${paused ? "resume" : "pause"}">${paused ? "继续任务" : "暂停"}</button>
+        <button class="primary" type="button" data-action="commit">提交 Zotero</button>
+        <button type="button" data-action="institution-login">机构登录</button>
+        <button type="button" data-action="export-endnote">导出 EndNote</button>
+        <details class="more-actions" data-batch-id="${esc(batch.id)}" ${keepMoreActionsOpen ? "open" : ""}><summary>更多操作 ···</summary><div class="more-menu">
+          <button type="button" data-action="rename-pdfs">重命名 PDF</button>
+          <button type="button" data-action="export-pdfs">导出 PDF</button>
+          ${exportPath ? `<a class="button-link" href="/api/batches/${encodeURIComponent(batch.id)}/endnote-export.zip">下载 EndNote ZIP</a><button type="button" data-action="open-endnote-export">打开导出文件夹</button>` : ""}
+          <a class="button-link" href="/api/batches/${encodeURIComponent(batch.id)}/report.csv">下载 CSV 报告</a>
+          <button class="danger" type="button" data-action="delete">删除批次</button>
+        </div></details>
+      </div>
     </div>
-    ${exportPath ? `<p class="muted">EndNote 导入包：${esc(exportPath)}。推荐导入 records.ris：File → Import → File，Import Option 选 Reference Manager (RIS)，Text Translation 选 Unicode (UTF-8)。不要导入 ZIP。</p>` : `<p class="muted">登录一次后，批次会自动走机构获取；完成后可自动提交 Zotero。EndNote 导入包请到「工具」页手动导出，默认写入 Downloads\\[库名]。2FA、验证码和出版社 403 仍需人工。</p>`}
-    ${batch.error ? `<p class="error-text">${esc(batch.error)}</p>` : ""}
-    <div class="table-wrap"><table><thead><tr><th>#</th><th>论文</th><th>题录</th><th>PDF</th><th>Zotero</th><th>状态/操作</th></tr></thead>
-    <tbody>${batch.papers.map(paperRow).join("")}</tbody></table></div>`;
+    <div class="progress-meta"><span>已完成 ${counts.complete} / ${papers.length}</span><strong>${pct}%</strong></div>
+    <div class="progress" role="progressbar" aria-label="批次完成进度" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${pct}"><span style="width:${pct}%"></span></div>
+    <div class="summary-grid">
+      <div class="summary-card"><b>${papers.length}</b><span>论文总数</span></div>
+      <div class="summary-card"><b>${counts.pdf}</b><span>PDF 已验证</span></div>
+      <div class="summary-card"><b>${counts.zotero}</b><span>Zotero 已核验</span></div>
+      <div class="summary-card"><b>${counts.needs}</b><span>等待处理</span></div>
+    </div>
+    ${batchError ? `<div class="batch-alert" role="alert">${esc(batchError)}</div>` : ""}
+    <div class="table-title"><h3>论文</h3>${counts.needs ? `<span class="status-pill warn">${counts.needs} 篇待处理</span>` : `<span class="status-pill">无需人工处理</span>`}</div>
+    ${papers.length ? `<div class="table-wrap"><table><thead><tr><th>#</th><th>论文</th><th>题录</th><th>PDF</th><th>Zotero</th><th>状态与操作</th></tr></thead><tbody>${papers.map(paperRow).join("")}</tbody></table></div>` : `<div class="empty-state compact">批次中没有论文</div>`}`;
+
   $("[data-action='pause']")?.addEventListener("click", () => batchAction("pause"));
   $("[data-action='resume']")?.addEventListener("click", () => batchAction("resume"));
-  $("[data-action='institution-login']")?.addEventListener("click", async () => {
-    try { await api("/api/institution/login", {method:"POST",body:"{}"}); toast("已打开机构登录页，请在 Chrome 中完成登录或 2FA"); }
-    catch (error) { toast(error.message); }
+  $("[data-action='commit']")?.addEventListener("click", () => batchAction("commit"));
+  $("#task-detail .more-actions")?.addEventListener("toggle", event => {
+    if (event.currentTarget.open || state.activeTab !== "tasks" || state.selectedBatch !== batch.id) return;
+    renderBatch(batch.id, {silent: true});
   });
-  $("[data-action='rename-pdfs']")?.addEventListener("click", async () => {
+  $("[data-action='open-endnote-export']")?.addEventListener("click", () => batchAction("open-endnote-export"));
+  $("[data-action='delete']")?.addEventListener("click", () => openDeleteDialog([batch.id]));
+  $("[data-action='institution-login']")?.addEventListener("click", openInstitutionLogin);
+  $("[data-action='rename-pdfs']")?.addEventListener("click", async event => {
+    const button = event.currentTarget;
+    setButtonBusy(button, true, "重命名中…");
     try {
-      const result = await api("/api/tools/rename-pdfs", {method:"POST",body:JSON.stringify({source:"batch",batch_id:batch.id})});
-      toast(`已按题录重命名 ${result.renamed} 个 PDF，跳过 ${result.skipped} 篇`);
-      await renderBatch();
-    } catch (error) { toast(error.message); }
+      const result = await api("/api/tools/rename-pdfs", {method: "POST", body: JSON.stringify({source: "batch", batch_id: batch.id})});
+      toast(`已重命名 ${result.renamed} 个 PDF，跳过 ${result.skipped} 个`);
+      await renderBatch(batch.id);
+    } catch (error) {
+      toast(error.message);
+      setButtonBusy(button, false);
+    }
   });
   $("[data-action='export-pdfs']")?.addEventListener("click", async () => {
     await showTab("tools");
-    await loadToolSources();
     $("#export-source").value = "batch";
     syncToolSource("export");
     $("#export-batch").value = batch.id;
-    toast("填写目标文件夹后点击导出");
+    fillExportDestination();
+    $("#export-destination").focus();
   });
-  $("[data-action='commit']")?.addEventListener("click", () => batchAction("commit"));
   $("[data-action='export-endnote']")?.addEventListener("click", async () => {
     await showTab("tools");
-    await loadToolSources();
     if (batch.target_library) $("#endnote-collection").value = batch.target_library;
     fillEndnoteDestination();
-    toast("确认目标文件夹后点击导出导入包，默认写入 Downloads\\[库名]");
+    $("#endnote-destination").focus();
   });
-  $("[data-action='open-endnote-export']")?.addEventListener("click", () => batchAction("open-endnote-export"));
-  bindPaperActions(batch.papers);
+  bindPaperActions(papers);
 }
 
-function paperRow(p) {
-  const paperTitle = p.title || p.input_title || p.input_text;
+function paperRow(paper) {
+  const title = paper.title || paper.input_title || paper.input_text || "未命名论文";
+  const metadata = translated(paper.metadata_status, METADATA_LABELS);
+  const pdf = translated(paper.pdf_status, PDF_LABELS);
+  const zotero = translated(paper.endnote_status, ZOTERO_LABELS);
+  const version = paper.version ? translated(paper.version, VERSION_LABELS, "版本不明") : "";
   return `<tr>
-    <td>${p.position}</td>
-    <td class="title"><strong>${esc(paperTitle)}</strong><br><small>${esc(p.doi || "无 DOI")} ${p.year ? `· ${p.year}` : ""}</small>${p.error ? `<div class="error-text">${esc(p.error)}</div>` : ""}</td>
-    <td>${esc(p.metadata_status)}</td><td>${esc(p.pdf_status)}${p.version ? `<br><small>${esc(p.version)}</small>` : ""}</td><td>${esc(p.endnote_status)}</td>
-    <td class="actions"><span class="status ${esc(p.status)}">${statusLabel(p.status)}</span><br>
-      ${paperActions(p)}</td></tr>`;
+    <td data-label="序号">${paper.position}</td>
+    <td class="title" data-label="论文"><strong>${esc(title)}</strong><span class="paper-meta">${esc(paper.doi || "无 DOI")}${paper.year ? ` · ${esc(paper.year)}` : ""}</span>${paper.error ? `<div class="error-text">${esc(paper.error)}</div>` : ""}</td>
+    <td data-label="题录">${statusChip(paper.metadata_status, metadata)}</td>
+    <td data-label="PDF">${statusChip(paper.pdf_status, pdf)}${version ? `<span class="paper-meta">${esc(version)}</span>` : ""}</td>
+    <td data-label="Zotero">${statusChip(paper.endnote_status, zotero)}</td>
+    <td class="actions" data-label="状态与操作">${statusChip(paper.status)}${paperActions(paper)}</td>
+  </tr>`;
 }
 
-function paperActions(p) {
-  const parts = [];
-  if (p.needs_action === "confirm_metadata") parts.push(`<button data-paper-action="metadata" data-paper="${p.id}">确认题录</button>`);
-  if (["manual_pdf","confirm_pdf"].includes(p.needs_action) || p.status === "institution_pending") {
-    parts.push(`<button data-paper-action="open" data-paper="${p.id}">打开获取页</button>`);
-    parts.push(`<button data-paper-action="institution" data-paper="${p.id}">机构自动获取</button>`);
-    if (state.system?.settings?.institution?.openurl) {
-      parts.push(`<button data-paper-action="resolver" data-paper="${p.id}">机构馆藏</button>`);
-    }
-    parts.push(`<button data-paper-action="scholar" data-paper="${p.id}">Scholar</button>`);
-    parts.push(`<label class="upload-label file-button">提供 PDF<input type="file" accept="application/pdf,.pdf" data-paper-upload="${p.id}"></label>`);
+function paperActions(paper) {
+  const primary = [];
+  const secondary = [];
+  if (paper.needs_action === "confirm_metadata") primary.push(`<button type="button" data-paper-action="metadata" data-paper="${esc(paper.id)}">确认题录</button>`);
+  const needsPdf = ["manual_pdf", "confirm_pdf"].includes(paper.needs_action) || paper.status === "institution_pending";
+  if (needsPdf) {
+    primary.push(`<button type="button" data-paper-action="open" data-paper="${esc(paper.id)}">获取 PDF</button>`);
+    secondary.push(`<button type="button" data-paper-action="institution" data-paper="${esc(paper.id)}">机构自动获取</button>`);
+    if (state.system?.settings?.institution?.openurl) secondary.push(`<button type="button" data-paper-action="resolver" data-paper="${esc(paper.id)}">机构馆藏</button>`);
+    secondary.push(`<button type="button" data-paper-action="scholar" data-paper="${esc(paper.id)}">Google Scholar</button>`);
+    secondary.push(`<label class="upload-label file-button">上传 PDF<input type="file" accept="application/pdf,.pdf" data-paper-upload="${esc(paper.id)}"></label>`);
   }
-  if (p.needs_action === "confirm_pdf") parts.push(`<button data-paper-action="pdf" data-paper="${p.id}">确认 PDF</button>`);
-  if (["retry","reconcile_endnote"].includes(p.needs_action)) parts.push(`<button data-paper-action="retry" data-paper="${p.id}">重试/对账</button>`);
-  if (p.status !== "complete" && p.status !== "skipped") parts.push(`<button data-paper-action="skip" data-paper="${p.id}">跳过</button>`);
-  return parts.join("");
+  if (paper.needs_action === "confirm_pdf") primary.push(`<button type="button" data-paper-action="pdf" data-paper="${esc(paper.id)}">确认 PDF</button>`);
+  if (["retry", "reconcile_endnote"].includes(paper.needs_action)) primary.push(`<button type="button" data-paper-action="retry" data-paper="${esc(paper.id)}">重试 / 对账</button>`);
+  if (!['complete', 'skipped'].includes(paper.status)) secondary.push(`<button class="danger" type="button" data-paper-action="skip" data-paper="${esc(paper.id)}">跳过</button>`);
+  if (!primary.length && !secondary.length) return "";
+  return `<div class="paper-actions">${primary.join("")}${secondary.length ? `<details><summary>更多操作</summary><div>${secondary.join("")}</div></details>` : ""}</div>`;
 }
 
 function bindPaperActions(papers) {
-  document.querySelectorAll("[data-paper-action]").forEach(button => button.onclick = async () => {
-    const paper = papers.find(p => p.id === button.dataset.paper); const action = button.dataset.paperAction;
+  $$('[data-paper-action]').forEach(button => button.addEventListener("click", async () => {
+    const paper = papers.find(item => item.id === button.dataset.paper);
+    const action = button.dataset.paperAction;
+    if (!paper) return;
     try {
       if (action === "metadata") return showCandidates(paper);
       if (action === "pdf") return showPdfReview(paper);
-      if (["open", "scholar", "resolver"].includes(action)) await api(`/api/papers/${paper.id}/open?scholar=${action === "scholar"}&resolver=${action === "resolver"}`, {method:"POST",body:"{}"});
-      if (action === "institution") { toast("正在通过已登录的 Chrome 会话获取单篇 PDF…"); await api(`/api/papers/${paper.id}/acquire-institution`, {method:"POST",body:"{}"}); toast("机构 PDF 已下载并验证"); }
-      if (action === "retry" || action === "skip") await api(`/api/papers/${paper.id}/${action}`, {method:"POST",body:"{}"});
+      setButtonBusy(button, true, action === "institution" ? "获取中…" : "处理中…");
+      if (["open", "scholar", "resolver"].includes(action)) {
+        await api(`/api/papers/${encodeURIComponent(paper.id)}/open?scholar=${action === "scholar"}&resolver=${action === "resolver"}`, {method: "POST", body: "{}"});
+        toast("已打开获取页面");
+      }
+      if (action === "institution") {
+        await api(`/api/papers/${encodeURIComponent(paper.id)}/acquire-institution`, {method: "POST", body: "{}"});
+        toast("机构 PDF 已下载并验证");
+      }
+      if (["retry", "skip"].includes(action)) await api(`/api/papers/${encodeURIComponent(paper.id)}/${action}`, {method: "POST", body: "{}"});
       await renderBatch();
-    } catch (error) { toast(error.message); }
-  });
-  document.querySelectorAll("[data-paper-upload]").forEach(input => input.onchange = async () => {
-    if (!input.files[0]) return; const data = new FormData(); data.append("file", input.files[0]);
-    try { await api(`/api/papers/${input.dataset.paperUpload}/upload-pdf`, {method:"POST",body:data}); toast("PDF 已接收"); await renderBatch(); }
-    catch (error) { toast(error.message); }
-  });
+    } catch (error) {
+      toast(error.message);
+      setButtonBusy(button, false);
+    }
+  }));
+  $$('[data-paper-upload]').forEach(input => input.addEventListener("change", async () => {
+    if (!input.files?.[0]) return;
+    const data = new FormData();
+    data.append("file", input.files[0]);
+    input.disabled = true;
+    try {
+      await api(`/api/papers/${encodeURIComponent(input.dataset.paperUpload)}/upload-pdf`, {method: "POST", body: data});
+      toast("PDF 已接收");
+      await renderBatch();
+    } catch (error) {
+      input.disabled = false;
+      toast(error.message);
+    }
+  }));
 }
 
 async function showCandidates(paper) {
-  const candidates = await api(`/api/papers/${paper.id}/candidates`); state.currentPaper = paper;
+  state.currentPaper = paper;
+  const dialog = $("#candidate-dialog");
   $("#candidate-source").textContent = `输入：${paper.input_text}`;
   $("#manual-doi").value = paper.input_doi || paper.doi || "";
-  $("#candidate-list").innerHTML = candidates.length ? candidates.map(c => `<div class="candidate"><h3>${esc(c.metadata.title)}</h3><p>${esc((c.metadata.authors || []).join("; "))}</p><p>${esc(c.metadata.journal)} · ${esc(c.metadata.year || "年份未知")} · ${esc(c.metadata.doi || "无 DOI")}</p><button class="primary" data-candidate="${c.id}">采用此题录</button></div>`).join("") : `<p>Crossref 没有返回候选。请在 Scholar 核对后重试，或先跳过。</p>`;
-  document.querySelectorAll("[data-candidate]").forEach(button => button.onclick = async () => {
-    try { await api(`/api/papers/${paper.id}/confirm-metadata`, {method:"POST",body:JSON.stringify({candidate_id:button.dataset.candidate})}); $("#candidate-dialog").close(); await renderBatch(); }
-    catch (error) { toast(error.message); }
-  });
-  $("#candidate-dialog").showModal();
+  $("#candidate-list").innerHTML = `<div class="loading-state"><span class="spinner" aria-hidden="true"></span> 正在查找候选…</div>`;
+  dialog.showModal();
+  try {
+    const candidates = await api(`/api/papers/${encodeURIComponent(paper.id)}/candidates`);
+    if (state.currentPaper?.id !== paper.id || !dialog.open) return;
+    $("#candidate-list").innerHTML = candidates.length ? candidates.map(candidate => `<div class="candidate"><h3>${esc(candidate.metadata.title)}</h3><p>${esc((candidate.metadata.authors || []).join("；") || "作者未知")}</p><p>${esc(candidate.metadata.journal || "期刊未知")} · ${esc(candidate.metadata.year || "年份未知")} · ${esc(candidate.metadata.doi || "无 DOI")}</p><button class="primary" type="button" data-candidate="${esc(candidate.id)}">采用此题录</button></div>`).join("") : `<div class="empty-state compact"><strong>没有候选题录</strong><span>可补充 DOI 后重新解析</span></div>`;
+    $$('[data-candidate]').forEach(button => button.addEventListener("click", async () => {
+      setButtonBusy(button, true, "保存中…");
+      try {
+        await api(`/api/papers/${encodeURIComponent(paper.id)}/confirm-metadata`, {method: "POST", body: JSON.stringify({candidate_id: button.dataset.candidate})});
+        dialog.close();
+        await renderBatch();
+      } catch (error) {
+        setButtonBusy(button, false);
+        toast(error.message);
+      }
+    }));
+  } catch (error) {
+    $("#candidate-list").innerHTML = `<div class="empty-state compact"><strong>候选加载失败</strong><span>${esc(error.message)}</span></div>`;
+  }
 }
 
-$("#resolve-doi").onclick = async () => {
-  try {
-    await api(`/api/papers/${state.currentPaper.id}/resolve-doi`, {method:"POST", body:JSON.stringify({doi:$("#manual-doi").value})});
-    $("#candidate-dialog").close(); toast("已按 DOI 重新解析"); await renderBatch();
-  } catch (error) { toast(error.message); }
-};
-
-function showPdfReview(paper) { state.currentPaper = paper; $("#pdf-review-text").textContent = paper.error || "请确认此文件是论文主文，并选择版本。"; $("#pdf-dialog").showModal(); }
+function showPdfReview(paper) {
+  state.currentPaper = paper;
+  $("#pdf-review-text").textContent = paper.error || "请确认文件是论文主文，并选择版本。";
+  $("#pdf-version").value = VERSION_LABELS[paper.version] ? paper.version : "published";
+  $("#pdf-dialog").showModal();
+}
 
 async function batchAction(action) {
-  const messages = {
-    commit: "已启动 Zotero 提交",
-    "open-endnote-export": "已打开导出文件夹",
-  };
+  const batchId = state.selectedBatch;
+  const button = $(`[data-action='${action}']`);
+  if (!batchId || state.deletingBatchIds.has(batchId)) return;
+  const messages = {commit: "已启动 Zotero 提交", pause: "批次已暂停", resume: "批次已继续", "open-endnote-export": "已打开导出文件夹"};
+  setButtonBusy(button, true, "处理中…");
   try {
-    await api(`/api/batches/${state.selectedBatch}/${action}`, {method:"POST",body:"{}"});
+    await api(`/api/batches/${encodeURIComponent(batchId)}/${action}`, {method: "POST", body: "{}"});
     toast(messages[action] || "状态已更新");
-    await renderBatch();
-  } catch (error) { toast(error.message); }
+    if (state.selectedBatch === batchId) await renderBatch(batchId);
+    await refreshBatches({renderDetail: false, silent: true});
+  } catch (error) {
+    setButtonBusy(button, false);
+    toast(error.message);
+  }
 }
 
-function startPolling() { clearInterval(state.pollTimer); state.pollTimer = setInterval(() => { if (state.selectedBatch && !document.hidden) renderBatch().catch(()=>{}); }, 2500); }
+async function openInstitutionLogin(event) {
+  const button = event?.currentTarget;
+  setButtonBusy(button, true, "打开中…");
+  try {
+    await api("/api/institution/login", {method: "POST", body: "{}"});
+    toast("已打开机构登录页");
+  } catch (error) {
+    toast(error.message);
+  } finally {
+    setButtonBusy(button, false);
+  }
+}
 
-document.querySelectorAll(".tab").forEach(button => button.onclick = () => showTab(button.dataset.tab));
-$("#refresh-batches").onclick = refreshBatches;
-$("#list-file").onchange = async event => { const file = event.target.files[0]; if (file) { $("#items-text").value = await file.text(); $("#parse-summary").textContent = `已读取 ${file.name}`; } };
-$("#batch-form").onsubmit = async event => {
-  event.preventDefault();
+function startPolling() {
+  stopPolling();
+  state.pollTimer = setInterval(pollTasks, 2600);
+}
+
+function stopPolling() {
+  clearInterval(state.pollTimer);
+  state.pollTimer = null;
+}
+
+async function pollTasks() {
+  if (state.pollBusy || document.hidden || state.activeTab !== "tasks") return;
+  state.pollBusy = true;
+  state.pollCount += 1;
   try {
-    const result = await api("/api/batches", {method:"POST",body:JSON.stringify({name:$("#batch-name").value,items_text:$("#items-text").value,target_library:$("#target-library").value,library_mode:$("#library-mode").value,reference_manager:"zotero",start_immediately:true})});
-    state.selectedBatch = result.id; showTab("tasks"); toast("批次已创建");
-  } catch (error) { toast(error.message); }
-};
-$("#settings-form").onsubmit = async event => {
-  event.preventDefault();
-  const sources = [];
-  if ($("#source-open-access").checked) sources.push("open_access");
-  if ($("#source-institution").checked) sources.push("institution");
-  const split = value => value.split(",").map(item => item.trim()).filter(Boolean);
+    const batchId = state.selectedBatch;
+    if (batchId && !$("#task-detail .more-actions[open]")) {
+      await renderBatch(batchId, {silent: true});
+    }
+    if (state.pollCount % 2 === 0) await refreshBatches({renderDetail: false, silent: true});
+  } finally {
+    state.pollBusy = false;
+  }
+}
+
+async function openDeleteDialog(batchIds) {
+  const ids = [...new Set(batchIds.filter(Boolean))];
+  if (!ids.length || state.deletionActive) return;
+  state.pendingDeleteIds = ids;
+  state.deletionTerminal = false;
+  const token = ++state.deletePreviewToken;
+  const dialog = $("#delete-dialog");
+  $("#delete-summary").innerHTML = `<div class="loading-state"><span class="spinner" aria-hidden="true"></span> 正在计算可清理内容…</div>`;
+  $("#delete-items").innerHTML = "";
+  $("#delete-progress").hidden = true;
+  $("#delete-progress").innerHTML = "";
+  $("#confirm-delete").hidden = false;
+  $("#confirm-delete").disabled = true;
+  $("#confirm-delete").textContent = "确认删除";
+  $("#cancel-delete").textContent = "取消";
+  if (!dialog.open) dialog.showModal();
   try {
-    await api("/api/settings", {method:"POST",body:JSON.stringify({
-      crossref_email:$("#crossref-email").value,
-      unpaywall_email:$("#unpaywall-email").value,
-      endnote_library:$("#endnote-library").value,
-      acquisition_sources: sources,
-      ocr_enabled: $("#ocr-enabled").checked,
-      ocr_languages: $("#ocr-languages").value,
-      ocr_max_pages: Number($("#ocr-max-pages").value || 2),
-      auto_institution: $("#auto-institution").checked,
-      auto_commit: $("#auto-commit").checked,
-      login_wait_seconds: Number($("#login-wait-seconds").value || 600),
-      institution: {
-        preset: $("#institution-preset").value,
-        id: $("#institution-id").value,
-        name: $("#institution-name").value,
-        ezproxy_login: $("#institution-login").value,
-        ezproxy_hosts: split($("#institution-hosts").value),
-        openurl: $("#institution-openurl").value,
-        login_url_markers: split($("#institution-login-markers").value),
-      }
-    })});
-    toast("设置已保存");
-    await loadSystem();
-  } catch (error) { toast(error.message); }
-};
-$("#institution-preset").onchange = () => {
-  const selected = $("#institution-preset").value;
-  const preset = (state.system?.presets || []).find(item => (item.preset || item.id) === selected);
-  if (preset) fillInstitution(preset, state.system.presets || []);
-};
-$("#credentials-form").onsubmit = async event => {
-  event.preventDefault();
+    const preview = await api("/api/batches/delete-preview", {method: "POST", body: JSON.stringify({batch_ids: ids})});
+    if (token !== state.deletePreviewToken || !dialog.open) return;
+    renderDeletePreview(preview);
+  } catch (error) {
+    if (token !== state.deletePreviewToken) return;
+    $("#delete-summary").innerHTML = `<div class="batch-alert" role="alert">${esc(error.message)}</div>`;
+    $("#delete-items").innerHTML = "";
+    $("#confirm-delete").disabled = true;
+  }
+}
+
+function renderDeletePreview(preview) {
+  const batches = preview.batches || [];
+  const totals = preview.totals || {
+    batch_count: batches.length,
+    paper_count: batches.reduce((sum, item) => sum + Number(item.paper_count || 0), 0),
+    bytes: batches.reduce((sum, item) => sum + Number(item.bytes || 0), 0),
+  };
+  const runningCount = batches.filter(item => item.running).length;
+  $("#delete-summary").innerHTML = `
+    <div class="delete-metric"><b>${Number(totals.batch_count || batches.length)}</b><span>批次</span></div>
+    <div class="delete-metric"><b>${Number(totals.paper_count || 0)}</b><span>论文</span></div>
+    <div class="delete-metric"><b>${esc(formatBytes(totals.bytes))}</b><span>可清理文件</span></div>`;
+  $("#delete-items").innerHTML = batches.map(item => `<div class="delete-item"><span>${esc(item.name || item.id)}</span><span class="delete-item-meta">${item.missing ? "已不存在" : `${Number(item.paper_count || 0)} 篇 · ${formatBytes(item.bytes)}`}${item.running ? " · 运行中" : ""}</span></div>`).join("");
+  const confirm = $("#confirm-delete");
+  confirm.disabled = batches.length === 0;
+  confirm.textContent = runningCount ? `停止并删除 ${batches.length} 个批次` : `删除 ${batches.length} 个批次`;
+}
+
+async function beginDeletion() {
+  if (state.deletionTerminal) {
+    $("#delete-dialog").close();
+    return;
+  }
+  if (state.deletionActive || !state.pendingDeleteIds.length) return;
+  const ids = [...state.pendingDeleteIds];
+  state.deletionActive = true;
+  state.deletePollFailures = 0;
+  $("#confirm-delete").disabled = true;
+  $("#confirm-delete").textContent = "正在启动…";
+  $("#cancel-delete").disabled = true;
+  $("#delete-dialog .dialog-close").disabled = true;
+  $("#delete-progress").hidden = false;
+  $("#delete-progress").innerHTML = `<div class="loading-state"><span class="spinner" aria-hidden="true"></span> 正在停止任务并准备清理…</div>`;
   try {
-    await api("/api/credentials", {method:"POST",body:JSON.stringify({
-      username: $("#institution-username").value,
-      password: $("#institution-password").value,
-    })});
-    toast("凭据已保存到 Windows 凭据管理器");
-    await loadSystem();
-  } catch (error) { toast(error.message); }
-};
-$("#clear-credentials").onclick = async () => {
+    const operation = await api("/api/batches/delete", {method: "POST", body: JSON.stringify({batch_ids: ids})});
+    state.deleteOperationId = operation.operation_id;
+    const operationBatchIds = (operation.batches || []).map(item => item.batch_id || item.id).filter(Boolean);
+    (operationBatchIds.length ? operationBatchIds : ids).forEach(id => state.deletingBatchIds.add(id));
+    ids.forEach(id => state.selectedBatchIds.delete(id));
+    if (state.selectedBatch && ids.includes(state.selectedBatch)) {
+      state.selectedBatch = null;
+      invalidateDetailRequest();
+      emptyTaskDetail("正在删除批次", "清理进度显示在确认窗口中");
+    }
+    renderBatchList();
+    renderDeletionProgress({id: operation.operation_id, status: operation.status || "pending", batches: operation.batches || []});
+    if (!operation.operation_id) throw new Error("删除操作未返回操作编号");
+    scheduleDeletionPoll(300);
+  } catch (error) {
+    state.deletionActive = false;
+    $("#delete-progress").innerHTML = `<div class="batch-alert" role="alert">${esc(error.message)}</div>`;
+    $("#confirm-delete").disabled = false;
+    $("#confirm-delete").textContent = "重试删除";
+    $("#cancel-delete").disabled = false;
+    $("#delete-dialog .dialog-close").disabled = false;
+  }
+}
+
+function scheduleDeletionPoll(delay = 1200) {
+  clearTimeout(state.deletePollTimer);
+  state.deletePollTimer = setTimeout(pollDeletion, delay);
+}
+
+async function pollDeletion() {
+  if (!state.deleteOperationId) return;
   try {
-    await api("/api/credentials/clear", {method:"POST",body:"{}"});
-    toast("已清除机构凭据");
-    await loadSystem();
-  } catch (error) { toast(error.message); }
-};
-$("#open-institution-login").onclick = async () => {
-  try {
-    await api("/api/institution/login", {method:"POST",body:"{}"});
-    toast("已打开机构登录页，请在 Chrome 中完成登录或 2FA");
-  } catch (error) { toast(error.message); }
-};
+    const operation = await api(`/api/batch-deletions/${encodeURIComponent(state.deleteOperationId)}`);
+    state.deletePollFailures = 0;
+    renderDeletionProgress(operation);
+    if (["completed", "partial_failed", "failed"].includes(operation.status)) {
+      await finishDeletion(operation);
+    } else {
+      scheduleDeletionPoll(1200);
+    }
+  } catch (error) {
+    state.deletePollFailures += 1;
+    $("#delete-progress").innerHTML = `<div class="batch-alert" role="alert">暂时无法读取清理进度：${esc(error.message)}。后台操作仍会继续。</div>`;
+    scheduleDeletionPoll(Math.min(5000, 1000 * state.deletePollFailures));
+  }
+}
+
+function renderDeletionProgress(operation) {
+  const batches = operation.batches || [];
+  const active = !["completed", "partial_failed", "failed"].includes(operation.status);
+  $("#delete-progress").hidden = false;
+  $("#delete-progress").innerHTML = `<div class="deletion-status-list">${batches.map(item => {
+    const id = item.batch_id || item.id;
+    const amount = item.status === "completed" || item.status === "missing"
+      ? formatBytes(item.deleted_bytes)
+      : formatBytes(item.estimated_bytes ?? item.bytes);
+    return `<div class="deletion-row"><strong>${esc(item.name || id || "批次")}</strong>${statusChip(item.status, translated(item.status, DELETION_LABELS, "未知状态"))}<span class="paper-meta">${Number(item.paper_count || 0)} 篇 · ${esc(amount)}</span>${item.error ? `<small>${esc(item.error)}</small>` : ""}</div>`;
+  }).join("") || `<div class="loading-state"><span class="spinner" aria-hidden="true"></span> ${active ? "等待清理状态…" : "清理已结束"}</div>`}</div>`;
+}
+
+async function finishDeletion(operation) {
+  state.deletionActive = false;
+  state.deletionTerminal = true;
+  clearTimeout(state.deletePollTimer);
+  const failed = (operation.batches || []).filter(item => !["completed", "missing"].includes(item.status));
+  const removed = (operation.batches || []).filter(item => ["completed", "missing"].includes(item.status));
+  (operation.batches || []).forEach(item => state.deletingBatchIds.delete(item.batch_id || item.id));
+  removed.forEach(item => state.selectedBatchIds.delete(item.batch_id || item.id));
+  $("#cancel-delete").disabled = false;
+  $("#cancel-delete").textContent = "关闭";
+  $("#delete-dialog .dialog-close").disabled = false;
+  const confirm = $("#confirm-delete");
+  if (failed.length) {
+    state.pendingDeleteIds = failed.map(item => item.batch_id || item.id).filter(Boolean);
+    state.deletionTerminal = false;
+    confirm.hidden = false;
+    confirm.disabled = false;
+    confirm.textContent = `重试失败项（${failed.length}）`;
+    toast(`已清理 ${removed.length} 个批次，${failed.length} 个需要重试`);
+  } else {
+    confirm.hidden = true;
+    toast(`已清理 ${removed.length} 个批次`);
+  }
+  state.deleteOperationId = null;
+  await refreshBatches({renderDetail: false, silent: true});
+}
+
+function closeDeleteDialog() {
+  if (state.deletionActive) return;
+  clearTimeout(state.deletePollTimer);
+  state.deleteOperationId = null;
+  state.pendingDeleteIds = [];
+  state.deletionTerminal = false;
+  $("#cancel-delete").disabled = false;
+  $("#delete-dialog").close();
+}
 
 function optionList(items, valueKey, labelFn) {
   if (!items.length) return `<option value="">无可用项</option>`;
@@ -334,12 +827,10 @@ function fillExportDestination() {
   }
   if (source === "endnote" && sources.endnote_library) {
     const parts = String(sources.endnote_library).split(/[/\\]/);
-    name = (parts[parts.length - 1] || "").replace(/\.enl$/i, "");
+    name = (parts.at(-1) || "").replace(/\.enl$/i, "");
   }
   if (downloads && name) $("#export-destination").placeholder = `${downloads}\\${name}`;
-  if (downloads && name && !$("#export-destination").dataset.custom) {
-    $("#export-destination").value = `${downloads}\\${name}`;
-  }
+  if (downloads && name && !$("#export-destination").dataset.custom) $("#export-destination").value = `${downloads}\\${name}`;
 }
 
 function fillEndnoteDestination() {
@@ -353,86 +844,316 @@ function fillEndnoteDestination() {
 }
 
 async function loadToolSources() {
-  const sources = await api("/api/tools/sources");
-  state.toolSources = sources;
-  const batches = sources.batches || [];
-  const collections = sources.collections || [];
-  const batchHtml = optionList(batches, "id", item => `${item.name} · ${item.total || 0} 篇`);
-  const collectionHtml = optionList(collections, "name", item => item.numItems == null ? item.name : `${item.name} · ${item.numItems}`);
-  $("#rename-batch").innerHTML = batchHtml;
-  $("#export-batch").innerHTML = batchHtml;
-  $("#rename-collection").innerHTML = collectionHtml;
-  $("#export-collection").innerHTML = collectionHtml;
-  $("#endnote-collection").innerHTML = collectionHtml;
-  if ($("#rename-endnote-library")) $("#rename-endnote-library").value = sources.endnote_library || "";
-  syncToolSource("rename");
-  syncToolSource("export");
-  fillExportDestination();
-  fillEndnoteDestination();
+  try {
+    const sources = await api("/api/tools/sources");
+    state.toolSources = sources;
+    const batches = sources.batches || [];
+    const collections = sources.collections || [];
+    const batchHtml = optionList(batches, "id", item => `${item.name} · ${item.total || 0} 篇`);
+    const collectionHtml = optionList(collections, "name", item => item.numItems == null ? item.name : `${item.name} · ${item.numItems}`);
+    $("#rename-batch").innerHTML = batchHtml;
+    $("#export-batch").innerHTML = batchHtml;
+    $("#rename-collection").innerHTML = collectionHtml;
+    $("#export-collection").innerHTML = collectionHtml;
+    $("#endnote-collection").innerHTML = collectionHtml;
+    $("#rename-endnote-library").value = sources.endnote_library || "";
+    syncToolSource("rename");
+    syncToolSource("export");
+    fillExportDestination();
+    fillEndnoteDestination();
+    if (sources.zotero_error) toast(`Zotero：${sources.zotero_error}`);
+  } catch (error) {
+    toast(error.message);
+  }
 }
 
-$("#rename-source").onchange = () => syncToolSource("rename");
-$("#export-source").onchange = () => syncToolSource("export");
-$("#export-collection").onchange = fillExportDestination;
-$("#export-batch").onchange = fillExportDestination;
-$("#export-destination").oninput = () => { $("#export-destination").dataset.custom = "1"; };
-$("#endnote-collection").onchange = fillEndnoteDestination;
-$("#endnote-destination").oninput = () => { $("#endnote-destination").dataset.custom = "1"; };
+async function submitToolForm(form, resultNode, busyText, request, successText) {
+  const button = form.querySelector("button[type='submit']");
+  resultNode.textContent = busyText;
+  setButtonBusy(button, true, busyText);
+  try {
+    const result = await request();
+    resultNode.textContent = successText(result);
+    toast(resultNode.textContent);
+  } catch (error) {
+    resultNode.textContent = error.message;
+    toast(error.message);
+  } finally {
+    setButtonBusy(button, false);
+  }
+}
 
-$("#rename-pdfs-form").onsubmit = async event => {
-  event.preventDefault();
-  $("#rename-result").textContent = "正在重命名…";
-  try {
-    const source = $("#rename-source").value;
-    const result = await api("/api/tools/rename-pdfs", {method:"POST",body:JSON.stringify({
-      source,
-      batch_id: $("#rename-batch").value,
-      collection: $("#rename-collection").value,
-    })});
-    $("#rename-result").textContent = `完成：重命名 ${result.renamed} 个，跳过 ${result.skipped} 个。`;
-    toast($("#rename-result").textContent);
-  } catch (error) {
-    $("#rename-result").textContent = error.message;
-    toast(error.message);
-  }
-};
-$("#export-pdfs-form").onsubmit = async event => {
-  event.preventDefault();
-  $("#export-result").textContent = "正在导出…";
-  try {
-    const source = $("#export-source").value;
-    const result = await api("/api/tools/export-pdfs", {method:"POST",body:JSON.stringify({
-      source,
-      batch_id: $("#export-batch").value,
-      collection: $("#export-collection").value,
-      destination: $("#export-destination").value,
-      open_folder: $("#export-open-folder").checked,
-    })});
-    $("#export-result").textContent = `完成：复制 ${result.copied} 个 PDF 到 ${result.destination}。`;
-    toast($("#export-result").textContent);
-  } catch (error) {
-    $("#export-result").textContent = error.message;
-    toast(error.message);
-  }
-};
-$("#export-endnote-form").onsubmit = async event => {
-  event.preventDefault();
-  $("#endnote-export-result").textContent = "正在导出 EndNote 导入包…";
-  try {
-    const result = await api("/api/tools/export-endnote", {method:"POST",body:JSON.stringify({
-      collection: $("#endnote-collection").value,
-      destination: $("#endnote-destination").value,
-      open_folder: $("#endnote-open-folder").checked,
-    })});
-    $("#endnote-export-result").textContent = `完成：${result.record_count} 篇题录、${result.pdf_count} 个 PDF，写入 ${result.destination}。`;
-    toast($("#endnote-export-result").textContent);
-  } catch (error) {
-    $("#endnote-export-result").textContent = error.message;
-    toast(error.message);
-  }
-};
-$("#authorize-zotero").onclick = async () => { try { toast("请在 Zotero 弹窗中选择 Always Allow"); await api("/api/zotero/authorize", {method:"POST",body:"{}"}); toast("Zotero 已授权"); await loadSystem(); } catch (error) { toast(error.message); } };
-$("#accept-pdf").onclick = async () => { try { await api(`/api/papers/${state.currentPaper.id}/confirm-pdf`, {method:"POST",body:JSON.stringify({accept:true,version:$("#pdf-version").value})}); $("#pdf-dialog").close(); await renderBatch(); } catch (error) { toast(error.message); } };
-$("#reject-pdf").onclick = async () => { try { await api(`/api/papers/${state.currentPaper.id}/confirm-pdf`, {method:"POST",body:JSON.stringify({accept:false,version:"unknown"})}); $("#pdf-dialog").close(); await renderBatch(); } catch (error) { toast(error.message); } };
+function positionHelp(trigger) {
+  const popover = $("#help-popover");
+  if (!trigger || popover.hidden) return;
+  const rect = trigger.getBoundingClientRect();
+  const popoverRect = popover.getBoundingClientRect();
+  let left = rect.left + rect.width / 2 - popoverRect.width / 2;
+  left = Math.max(12, Math.min(left, window.innerWidth - popoverRect.width - 12));
+  let top = rect.bottom + 8;
+  if (top + popoverRect.height > window.innerHeight - 12) top = rect.top - popoverRect.height - 8;
+  popover.style.left = `${left}px`;
+  popover.style.top = `${Math.max(12, top)}px`;
+}
 
-loadSystem().then(refreshBatches).catch(error => toast(error.message));
+function showHelp(trigger, pinned = false) {
+  if (!trigger) return;
+  if (state.helpTrigger && state.helpTrigger !== trigger) state.helpTrigger.setAttribute("aria-expanded", "false");
+  state.helpTrigger = trigger;
+  state.helpPinned = pinned;
+  const popover = $("#help-popover");
+  popover.textContent = trigger.dataset.help;
+  popover.hidden = false;
+  trigger.setAttribute("aria-expanded", "true");
+  requestAnimationFrame(() => positionHelp(trigger));
+}
+
+function closeHelp() {
+  state.helpTrigger?.setAttribute("aria-expanded", "false");
+  state.helpTrigger = null;
+  state.helpPinned = false;
+  $("#help-popover").hidden = true;
+}
+
+function initHelpPopovers() {
+  $$('.help-button').forEach(button => {
+    button.setAttribute("aria-expanded", "false");
+    button.setAttribute("aria-describedby", "help-popover");
+    button.addEventListener("mouseenter", () => showHelp(button, false));
+    button.addEventListener("mouseleave", () => { if (!state.helpPinned) closeHelp(); });
+    button.addEventListener("focus", () => showHelp(button, false));
+    button.addEventListener("blur", () => { if (!state.helpPinned) closeHelp(); });
+    button.addEventListener("click", event => {
+      event.stopPropagation();
+      if (state.helpTrigger === button && state.helpPinned) closeHelp();
+      else showHelp(button, true);
+    });
+  });
+  document.addEventListener("click", event => {
+    if (state.helpPinned && !event.target.closest(".help-button") && !event.target.closest("#help-popover")) closeHelp();
+  });
+  document.addEventListener("keydown", event => { if (event.key === "Escape" && state.helpTrigger) closeHelp(); });
+  window.addEventListener("resize", () => positionHelp(state.helpTrigger));
+  window.addEventListener("scroll", () => positionHelp(state.helpTrigger), true);
+}
+
+$$('.tab').forEach(button => button.addEventListener("click", () => {
+  showTab(button.dataset.tab).catch(error => toast(error.message));
+}));
+$("#refresh-batches").addEventListener("click", () => refreshBatches());
+$("#select-all-batches").addEventListener("change", event => {
+  state.batches.forEach(batch => {
+    if (state.deletingBatchIds.has(batch.id) || ["pending", "stopping", "deleting"].includes(batch.deletion_status)) return;
+    if (event.target.checked) state.selectedBatchIds.add(batch.id);
+    else state.selectedBatchIds.delete(batch.id);
+  });
+  renderBatchList();
+});
+$("#delete-selected-batches").addEventListener("click", () => openDeleteDialog([...state.selectedBatchIds]));
+
+$("#list-file").addEventListener("change", async event => {
+  const file = event.target.files?.[0];
+  if (!file) return;
+  $("#items-text").value = await file.text();
+  const count = $("#items-text").value.split(/\r?\n/).filter(line => line.trim()).length;
+  $("#parse-summary").textContent = `已读取 ${file.name} · ${count} 行`;
+});
+
+$("#batch-form").addEventListener("submit", async event => {
+  event.preventDefault();
+  const button = event.currentTarget.querySelector("button[type='submit']");
+  setButtonBusy(button, true, "创建中…");
+  try {
+    const result = await api("/api/batches", {method: "POST", body: JSON.stringify({
+      name: $("#batch-name").value,
+      items_text: $("#items-text").value,
+      target_library: $("#target-library").value,
+      library_mode: $("#library-mode").value,
+      reference_manager: "zotero",
+      start_immediately: true,
+    })});
+    state.selectedBatch = result.id;
+    toast("批次已创建");
+    await showTab("tasks");
+  } catch (error) {
+    toast(error.message);
+  } finally {
+    setButtonBusy(button, false);
+  }
+});
+
+$("#settings-form").addEventListener("submit", async event => {
+  event.preventDefault();
+  const button = event.currentTarget.querySelector("button[type='submit']");
+  const sources = [];
+  if ($("#source-open-access").checked) sources.push("open_access");
+  if ($("#source-institution").checked) sources.push("institution");
+  const split = value => value.split(",").map(item => item.trim()).filter(Boolean);
+  setButtonBusy(button, true, "保存中…");
+  try {
+    await api("/api/settings", {method: "POST", body: JSON.stringify({
+      crossref_email: $("#crossref-email").value,
+      unpaywall_email: $("#unpaywall-email").value,
+      endnote_library: $("#endnote-library").value,
+      acquisition_sources: sources,
+      ocr_enabled: $("#ocr-enabled").checked,
+      ocr_languages: $("#ocr-languages").value,
+      ocr_max_pages: Number($("#ocr-max-pages").value || 2),
+      auto_institution: $("#auto-institution").checked,
+      auto_commit: $("#auto-commit").checked,
+      login_wait_seconds: Number($("#login-wait-seconds").value || 600),
+      institution: {
+        preset: $("#institution-preset").value,
+        id: $("#institution-id").value,
+        name: $("#institution-name").value,
+        ezproxy_login: $("#institution-login").value,
+        ezproxy_hosts: split($("#institution-hosts").value),
+        openurl: $("#institution-openurl").value,
+        login_url_markers: split($("#institution-login-markers").value),
+      },
+    })});
+    toast("设置已保存");
+    await loadSystem();
+  } catch (error) {
+    toast(error.message);
+  } finally {
+    setButtonBusy(button, false);
+  }
+});
+
+$("#institution-preset").addEventListener("change", () => {
+  const selected = $("#institution-preset").value;
+  const preset = (state.system?.presets || []).find(item => (item.preset || item.id) === selected);
+  if (preset) fillInstitution(preset, state.system.presets || []);
+});
+
+$("#credentials-form").addEventListener("submit", async event => {
+  event.preventDefault();
+  const button = event.currentTarget.querySelector("button[type='submit']");
+  setButtonBusy(button, true, "保存中…");
+  try {
+    await api("/api/credentials", {method: "POST", body: JSON.stringify({username: $("#institution-username").value, password: $("#institution-password").value})});
+    toast("凭据已保存");
+    await loadSystem();
+  } catch (error) {
+    toast(error.message);
+  } finally {
+    setButtonBusy(button, false);
+  }
+});
+
+$("#clear-credentials").addEventListener("click", async event => {
+  setButtonBusy(event.currentTarget, true, "清除中…");
+  try {
+    await api("/api/credentials/clear", {method: "POST", body: "{}"});
+    toast("已清除机构凭据");
+    await loadSystem();
+  } catch (error) {
+    toast(error.message);
+  } finally {
+    setButtonBusy(event.currentTarget, false);
+  }
+});
+
+$("#open-institution-login").addEventListener("click", openInstitutionLogin);
+$("#rename-source").addEventListener("change", () => syncToolSource("rename"));
+$("#export-source").addEventListener("change", () => syncToolSource("export"));
+$("#export-collection").addEventListener("change", fillExportDestination);
+$("#export-batch").addEventListener("change", fillExportDestination);
+$("#export-destination").addEventListener("input", () => { $("#export-destination").dataset.custom = "1"; });
+$("#endnote-collection").addEventListener("change", fillEndnoteDestination);
+$("#endnote-destination").addEventListener("input", () => { $("#endnote-destination").dataset.custom = "1"; });
+
+$("#rename-pdfs-form").addEventListener("submit", event => {
+  event.preventDefault();
+  submitToolForm(event.currentTarget, $("#rename-result"), "正在重命名…", () => api("/api/tools/rename-pdfs", {method: "POST", body: JSON.stringify({source: $("#rename-source").value, batch_id: $("#rename-batch").value, collection: $("#rename-collection").value})}), result => `已重命名 ${result.renamed} 个，跳过 ${result.skipped} 个`);
+});
+
+$("#export-pdfs-form").addEventListener("submit", event => {
+  event.preventDefault();
+  submitToolForm(event.currentTarget, $("#export-result"), "正在导出…", () => api("/api/tools/export-pdfs", {method: "POST", body: JSON.stringify({source: $("#export-source").value, batch_id: $("#export-batch").value, collection: $("#export-collection").value, destination: $("#export-destination").value, open_folder: $("#export-open-folder").checked})}), result => `已复制 ${result.copied} 个 PDF · ${result.destination}`);
+});
+
+$("#export-endnote-form").addEventListener("submit", event => {
+  event.preventDefault();
+  submitToolForm(event.currentTarget, $("#endnote-export-result"), "正在导出…", () => api("/api/tools/export-endnote", {method: "POST", body: JSON.stringify({collection: $("#endnote-collection").value, destination: $("#endnote-destination").value, open_folder: $("#endnote-open-folder").checked})}), result => `已导出 ${result.record_count} 篇题录、${result.pdf_count} 个 PDF`);
+});
+
+$("#authorize-zotero").addEventListener("click", async event => {
+  setButtonBusy(event.currentTarget, true, "等待授权…");
+  try {
+    await api("/api/zotero/authorize", {method: "POST", body: "{}"});
+    toast("Zotero 已授权");
+    await loadSystem();
+  } catch (error) {
+    toast(error.message);
+    setButtonBusy(event.currentTarget, false);
+  }
+});
+
+$("#resolve-doi").addEventListener("click", async event => {
+  if (!state.currentPaper) return;
+  setButtonBusy(event.currentTarget, true, "解析中…");
+  try {
+    await api(`/api/papers/${encodeURIComponent(state.currentPaper.id)}/resolve-doi`, {method: "POST", body: JSON.stringify({doi: $("#manual-doi").value})});
+    $("#candidate-dialog").close();
+    toast("已按 DOI 重新解析");
+    await renderBatch();
+  } catch (error) {
+    toast(error.message);
+  } finally {
+    setButtonBusy(event.currentTarget, false);
+  }
+});
+
+$("#accept-pdf").addEventListener("click", async event => {
+  if (!state.currentPaper) return;
+  setButtonBusy(event.currentTarget, true, "保存中…");
+  try {
+    await api(`/api/papers/${encodeURIComponent(state.currentPaper.id)}/confirm-pdf`, {method: "POST", body: JSON.stringify({accept: true, version: $("#pdf-version").value})});
+    $("#pdf-dialog").close();
+    await renderBatch();
+  } catch (error) {
+    toast(error.message);
+    setButtonBusy(event.currentTarget, false);
+  }
+});
+
+$("#reject-pdf").addEventListener("click", async event => {
+  if (!state.currentPaper) return;
+  setButtonBusy(event.currentTarget, true, "保存中…");
+  try {
+    await api(`/api/papers/${encodeURIComponent(state.currentPaper.id)}/confirm-pdf`, {method: "POST", body: JSON.stringify({accept: false, version: "unknown"})});
+    $("#pdf-dialog").close();
+    await renderBatch();
+  } catch (error) {
+    toast(error.message);
+    setButtonBusy(event.currentTarget, false);
+  }
+});
+
+$("#confirm-delete").addEventListener("click", beginDeletion);
+$("#cancel-delete").addEventListener("click", closeDeleteDialog);
+$("#delete-dialog").addEventListener("cancel", event => {
+  event.preventDefault();
+  if (!state.deletionActive) closeDeleteDialog();
+});
+$("#delete-dialog").addEventListener("close", () => {
+  if (!state.deletionActive) {
+    clearTimeout(state.deletePollTimer);
+    state.deleteOperationId = null;
+  }
+});
+
+document.addEventListener("visibilitychange", () => {
+  if (document.hidden) return;
+  if (state.activeTab === "tasks") pollTasks();
+  if (state.activeTab === "settings") refreshSystemStatus().catch(error => toast(error.message));
+});
+
+initHelpPopovers();
+loadSystem().then(() => refreshBatches({renderDetail: false})).catch(error => {
+  toast(error.message);
+  $("#system-badge").textContent = "环境检查失败";
+  $("#system-badge").className = "badge error";
+});

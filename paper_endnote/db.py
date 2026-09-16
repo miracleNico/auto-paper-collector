@@ -5,9 +5,19 @@ import sqlite3
 import threading
 import uuid
 from contextlib import contextmanager
+from contextvars import ContextVar
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable, Iterator
+
+
+class BatchDeletingError(RuntimeError):
+    """Raised when a write targets a batch whose deletion has started."""
+
+
+_allow_deleting_writes: ContextVar[bool] = ContextVar(
+    "paper_endnote_allow_deleting_writes", default=False
+)
 
 
 def utc_now() -> str:
@@ -54,7 +64,10 @@ class Database:
             endnote_export_path TEXT,
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL,
-            error TEXT
+            error TEXT,
+            deletion_status TEXT NOT NULL DEFAULT 'active',
+            deletion_operation_id TEXT,
+            deletion_error TEXT
         );
         CREATE TABLE IF NOT EXISTS papers (
             id TEXT PRIMARY KEY,
@@ -120,6 +133,28 @@ class Database:
             value TEXT NOT NULL,
             updated_at TEXT NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS deletion_operations (
+            id TEXT PRIMARY KEY,
+            status TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            finished_at TEXT
+        );
+        CREATE TABLE IF NOT EXISTS deletion_batches (
+            operation_id TEXT NOT NULL REFERENCES deletion_operations(id) ON DELETE CASCADE,
+            batch_id TEXT NOT NULL,
+            name TEXT NOT NULL,
+            status TEXT NOT NULL,
+            paper_count INTEGER NOT NULL DEFAULT 0,
+            estimated_bytes INTEGER NOT NULL DEFAULT 0,
+            deleted_bytes INTEGER NOT NULL DEFAULT 0,
+            error TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY(operation_id, batch_id)
+        );
+        CREATE INDEX IF NOT EXISTS ix_deletion_batches_batch
+            ON deletion_batches(batch_id, created_at);
         """
         with self._lock, self.connect() as connection:
             connection.executescript(schema)
@@ -130,6 +165,69 @@ class Database:
                 )
             if "endnote_export_path" not in columns:
                 connection.execute("ALTER TABLE batches ADD COLUMN endnote_export_path TEXT")
+            if "deletion_status" not in columns:
+                connection.execute(
+                    "ALTER TABLE batches ADD COLUMN deletion_status TEXT NOT NULL DEFAULT 'active'"
+                )
+            if "deletion_operation_id" not in columns:
+                connection.execute("ALTER TABLE batches ADD COLUMN deletion_operation_id TEXT")
+            if "deletion_error" not in columns:
+                connection.execute("ALTER TABLE batches ADD COLUMN deletion_error TEXT")
+
+    @contextmanager
+    def allow_deleting_writes(self) -> Iterator[None]:
+        """Allow a task that was already in flight to finish its bookkeeping."""
+        token = _allow_deleting_writes.set(True)
+        try:
+            yield
+        finally:
+            _allow_deleting_writes.reset(token)
+
+    @staticmethod
+    def _assert_batch_writable(connection: sqlite3.Connection, batch_id: str) -> None:
+        if _allow_deleting_writes.get():
+            return
+        row = connection.execute(
+            "SELECT deletion_status FROM batches WHERE id=?", (batch_id,)
+        ).fetchone()
+        if row is not None and row[0] != "active":
+            raise BatchDeletingError("批次正在删除，不能再修改")
+
+    @classmethod
+    def _assert_paper_writable(cls, connection: sqlite3.Connection, paper_id: str) -> None:
+        if _allow_deleting_writes.get():
+            return
+        row = connection.execute(
+            """SELECT b.deletion_status
+            FROM papers p JOIN batches b ON b.id=p.batch_id WHERE p.id=?""",
+            (paper_id,),
+        ).fetchone()
+        if row is not None and row[0] != "active":
+            raise BatchDeletingError("批次正在删除，不能再修改")
+
+    def assert_batch_writable(self, batch_id: str) -> None:
+        with self.connect() as connection:
+            self._assert_batch_writable(connection, batch_id)
+
+    def assert_paper_writable(self, paper_id: str) -> None:
+        with self.connect() as connection:
+            self._assert_paper_writable(connection, paper_id)
+
+    def is_batch_deleting(self, batch_id: str) -> bool:
+        with self.connect() as connection:
+            row = connection.execute(
+                "SELECT deletion_status FROM batches WHERE id=?", (batch_id,)
+            ).fetchone()
+        return bool(row and row[0] != "active")
+
+    def is_batch_deleting_for_paper(self, paper_id: str) -> bool:
+        with self.connect() as connection:
+            row = connection.execute(
+                """SELECT b.deletion_status FROM papers p
+                JOIN batches b ON b.id=p.batch_id WHERE p.id=?""",
+                (paper_id,),
+            ).fetchone()
+        return bool(row and row[0] != "active")
 
     def create_batch(
         self,
@@ -225,6 +323,7 @@ class Database:
     def replace_candidates(self, paper_id: str, candidates: list[dict[str, Any]]) -> None:
         now = utc_now()
         with self._lock, self.connect() as connection:
+            self._assert_paper_writable(connection, paper_id)
             connection.execute("DELETE FROM candidates WHERE paper_id=?", (paper_id,))
             for rank, candidate in enumerate(candidates, start=1):
                 connection.execute(
@@ -253,6 +352,7 @@ class Database:
         fields["updated_at"] = utc_now()
         assignments = ",".join(f"{key}=?" for key in fields)
         with self._lock, self.connect() as connection:
+            self._assert_paper_writable(connection, paper_id)
             connection.execute(
                 f"UPDATE papers SET {assignments} WHERE id=?",
                 (*fields.values(), paper_id),
@@ -269,10 +369,12 @@ class Database:
         fields["updated_at"] = utc_now()
         assignments = ",".join(f"{key}=?" for key in fields)
         with self._lock, self.connect() as connection:
+            self._assert_batch_writable(connection, batch_id)
             connection.execute(f"UPDATE batches SET {assignments} WHERE id=?", (*fields.values(), batch_id))
 
     def event(self, batch_id: str, message: str, *, level: str = "info", paper_id: str | None = None) -> None:
         with self._lock, self.connect() as connection:
+            self._assert_batch_writable(connection, batch_id)
             connection.execute(
                 "INSERT INTO events(batch_id,paper_id,level,message,created_at) VALUES(?,?,?,?,?)",
                 (batch_id, paper_id, level, message, utc_now()),
@@ -288,6 +390,7 @@ class Database:
     def start_operation(self, paper_id: str, step: str, details: dict[str, Any] | None = None) -> str:
         operation_id = str(uuid.uuid4())
         with self._lock, self.connect() as connection:
+            self._assert_paper_writable(connection, paper_id)
             connection.execute(
                 "INSERT INTO operations(id,paper_id,step,status,details_json,started_at) VALUES(?,?,?,?,?,?)",
                 (operation_id, paper_id, step, "pending", json.dumps(details or {}, ensure_ascii=False), utc_now()),
@@ -296,6 +399,13 @@ class Database:
 
     def finish_operation(self, operation_id: str, status: str, details: dict[str, Any] | None = None) -> None:
         with self._lock, self.connect() as connection:
+            row = connection.execute(
+                """SELECT p.id FROM operations o
+                JOIN papers p ON p.id=o.paper_id WHERE o.id=?""",
+                (operation_id,),
+            ).fetchone()
+            if row is not None:
+                self._assert_paper_writable(connection, row[0])
             connection.execute(
                 "UPDATE operations SET status=?, details_json=?, finished_at=? WHERE id=?",
                 (status, json.dumps(details or {}, ensure_ascii=False), utc_now(), operation_id),
@@ -323,3 +433,193 @@ class Database:
         with self.connect() as connection:
             row = connection.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
         return row[0] if row else default
+
+    def find_active_deletion_operation(self, batch_ids: list[str]) -> dict[str, Any] | None:
+        unique_ids = list(dict.fromkeys(batch_ids))
+        if not unique_ids:
+            return None
+        placeholders = ",".join("?" for _ in unique_ids)
+        with self.connect() as connection:
+            rows = connection.execute(
+                f"""SELECT deletion_operation_id, deletion_status
+                FROM batches WHERE id IN ({placeholders})""",
+                unique_ids,
+            ).fetchall()
+            operation_ids = {
+                row["deletion_operation_id"]
+                for row in rows
+                if row["deletion_operation_id"] and row["deletion_status"] != "active"
+            }
+            if len(rows) != len(unique_ids) or len(operation_ids) != 1:
+                return None
+            operation_id = next(iter(operation_ids))
+            operation = connection.execute(
+                "SELECT status FROM deletion_operations WHERE id=?", (operation_id,)
+            ).fetchone()
+            if not operation or operation["status"] not in {"pending", "running"}:
+                return None
+        return self.get_deletion_operation(operation_id)
+
+    def create_deletion_operation(self, batches: list[dict[str, Any]]) -> str:
+        operation_id = str(uuid.uuid4())
+        now = utc_now()
+        with self._lock, self.connect() as connection:
+            connection.execute(
+                """INSERT INTO deletion_operations(id,status,created_at,updated_at)
+                VALUES(?,?,?,?)""",
+                (operation_id, "pending", now, now),
+            )
+            for item in batches:
+                batch_id = str(item["id"])
+                row = connection.execute(
+                    """SELECT name,deletion_status,deletion_operation_id
+                    FROM batches WHERE id=?""",
+                    (batch_id,),
+                ).fetchone()
+                item_error = item.get("error")
+                if row is None:
+                    item_status = "missing"
+                    name = str(item.get("name") or batch_id[:8])
+                elif row["deletion_status"] in {"stopping", "deleting"}:
+                    item_status = "failed"
+                    name = str(row["name"])
+                    item_error = f"批次已由删除操作 {row['deletion_operation_id']} 处理"
+                else:
+                    item_status = "pending"
+                    name = str(row["name"])
+                    connection.execute(
+                        """UPDATE batches
+                        SET deletion_status='stopping', deletion_operation_id=?,
+                            deletion_error=NULL, updated_at=?
+                        WHERE id=?""",
+                        (operation_id, now, batch_id),
+                    )
+                connection.execute(
+                    """INSERT INTO deletion_batches(
+                    operation_id,batch_id,name,status,paper_count,estimated_bytes,
+                    deleted_bytes,error,created_at,updated_at
+                    ) VALUES(?,?,?,?,?,?,?,?,?,?)""",
+                    (
+                        operation_id,
+                        batch_id,
+                        name,
+                        item_status,
+                        int(item.get("paper_count") or 0),
+                        int(item.get("bytes") or 0),
+                        0,
+                        item_error,
+                        now,
+                        now,
+                    ),
+                )
+        return operation_id
+
+    def get_deletion_operation(self, operation_id: str) -> dict[str, Any] | None:
+        with self.connect() as connection:
+            operation = _row(
+                connection.execute(
+                    "SELECT * FROM deletion_operations WHERE id=?", (operation_id,)
+                ).fetchone()
+            )
+            if operation is None:
+                return None
+            items = connection.execute(
+                """SELECT batch_id,name,status,paper_count,estimated_bytes,
+                deleted_bytes,error,created_at,updated_at
+                FROM deletion_batches WHERE operation_id=? ORDER BY created_at,batch_id""",
+                (operation_id,),
+            ).fetchall()
+        operation["batches"] = [dict(item) for item in items]
+        return operation
+
+    def list_recoverable_deletions(self) -> list[dict[str, Any]]:
+        with self.connect() as connection:
+            rows = connection.execute(
+                """SELECT id FROM deletion_operations
+                WHERE status IN ('pending','running') ORDER BY created_at"""
+            ).fetchall()
+        return [item for row in rows if (item := self.get_deletion_operation(row["id"]))]
+
+    def set_deletion_operation_status(self, operation_id: str, status: str) -> None:
+        now = utc_now()
+        finished_at = now if status in {"completed", "partial_failed"} else None
+        with self._lock, self.connect() as connection:
+            connection.execute(
+                """UPDATE deletion_operations
+                SET status=?,updated_at=?,finished_at=? WHERE id=?""",
+                (status, now, finished_at, operation_id),
+            )
+
+    def set_deletion_batch_status(
+        self,
+        operation_id: str,
+        batch_id: str,
+        status: str,
+        *,
+        deleted_bytes: int | None = None,
+        error: str | None = None,
+    ) -> None:
+        now = utc_now()
+        with self._lock, self.connect() as connection:
+            values: list[Any] = [status, error, now]
+            deleted_sql = ""
+            if deleted_bytes is not None:
+                deleted_sql = ",deleted_bytes=?"
+                values.append(max(0, int(deleted_bytes)))
+            values.extend((operation_id, batch_id))
+            connection.execute(
+                f"""UPDATE deletion_batches SET status=?,error=?,updated_at=?{deleted_sql}
+                WHERE operation_id=? AND batch_id=?""",
+                values,
+            )
+            batch_state = {
+                "pending": "stopping",
+                "stopping": "stopping",
+                "deleting": "deleting",
+                "failed": "failed",
+            }.get(status)
+            if batch_state:
+                connection.execute(
+                    """UPDATE batches SET deletion_status=?,deletion_operation_id=?,
+                    deletion_error=?,updated_at=? WHERE id=?""",
+                    (batch_state, operation_id, error, now, batch_id),
+                )
+
+    def finalize_deletion_operation(self, operation_id: str) -> str:
+        with self.connect() as connection:
+            statuses = [
+                row[0]
+                for row in connection.execute(
+                    "SELECT status FROM deletion_batches WHERE operation_id=?", (operation_id,)
+                ).fetchall()
+            ]
+        status = (
+            "partial_failed"
+            if any(item == "failed" for item in statuses)
+            else "completed"
+            if all(item in {"completed", "missing"} for item in statuses)
+            else "running"
+        )
+        self.set_deletion_operation_status(operation_id, status)
+        return status
+
+    def list_batch_paper_ids(self, batch_id: str) -> list[str]:
+        with self.connect() as connection:
+            rows = connection.execute(
+                "SELECT id FROM papers WHERE batch_id=? ORDER BY position", (batch_id,)
+            ).fetchall()
+        return [row[0] for row in rows]
+
+    def delete_batch_transaction(
+        self, operation_id: str, batch_id: str, *, deleted_bytes: int
+    ) -> None:
+        """Delete the batch and mark its deletion item complete in one transaction."""
+        now = utc_now()
+        with self._lock, self.connect() as connection:
+            connection.execute("DELETE FROM batches WHERE id=?", (batch_id,))
+            connection.execute(
+                """UPDATE deletion_batches
+                SET status='completed',deleted_bytes=?,error=NULL,updated_at=?
+                WHERE operation_id=? AND batch_id=?""",
+                (max(0, int(deleted_bytes)), now, operation_id, batch_id),
+            )

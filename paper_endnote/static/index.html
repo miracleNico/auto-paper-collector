@@ -3,211 +3,191 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
-  <title>论文 PDF → Zotero → EndNote</title>
+  <meta name="theme-color" content="#eff7ff">
+  <title>论文收藏夹</title>
   <link rel="stylesheet" href="/static/style.css">
 </head>
 <body>
-  <header>
-    <div>
-      <p class="eyebrow">LOCAL RESEARCH WORKFLOW</p>
-      <h1>论文 PDF → Zotero → EndNote</h1>
-      <p class="lede">整理 DOI 或题名，获取可用全文，写入 Zotero，再导出 EndNote 可导入的 XML/PDF 包。</p>
+  <a class="skip-link" href="#main-content">跳到主要内容</a>
+  <header class="app-header">
+    <div class="brand">
+      <span class="brand-mark" aria-hidden="true">✦</span>
+      <div><h1>论文收藏夹</h1><p>PDF · Zotero · EndNote</p></div>
     </div>
-    <span id="system-badge" class="badge muted">检查环境…</span>
+    <span id="system-badge" class="badge muted" aria-live="polite">检查环境…</span>
   </header>
 
-  <main>
+  <main id="main-content">
     <nav class="tabs" aria-label="主导航">
-      <button class="tab active" data-tab="new">新建任务</button>
-      <button class="tab" data-tab="tasks">任务</button>
-      <button class="tab" data-tab="tools">工具</button>
-      <button class="tab" data-tab="settings">设置</button>
+      <button class="tab active" data-tab="new" aria-controls="tab-new" aria-selected="true"><span aria-hidden="true">＋</span> 新建任务</button>
+      <button class="tab" data-tab="tasks" aria-controls="tab-tasks" aria-selected="false"><span aria-hidden="true">☷</span> 任务</button>
+      <button class="tab" data-tab="tools" aria-controls="tab-tools" aria-selected="false"><span aria-hidden="true">◇</span> 工具</button>
+      <button class="tab" data-tab="settings" aria-controls="tab-settings" aria-selected="false"><span aria-hidden="true">⚙</span> 设置</button>
     </nav>
 
-    <section id="tab-new" class="panel tab-panel active">
+    <section id="tab-new" class="panel tab-panel active" aria-label="新建任务">
+      <div class="panel-heading">
+        <div><span class="kicker">NEW COLLECTION</span><h2>收集一批论文</h2></div>
+        <span class="decor-dot" aria-hidden="true"></span>
+      </div>
       <form id="batch-form">
         <div class="grid two">
-          <label>批次名称<input id="batch-name" required maxlength="120" placeholder="例如：膜蛋白综述 2026-09"></label>
-          <label>目标模式<select id="library-mode"><option value="new">新建 Zotero collection</option><option value="existing">使用已有 collection</option></select></label>
+          <label><span class="field-label">批次名称</span><input id="batch-name" required maxlength="120" placeholder="例如：膜蛋白综述 2026-09"></label>
+          <label><span class="field-label">目标模式 <button class="help-button" type="button" data-help="新建会创建 Zotero collection；已有模式会写入同名 collection。" aria-label="目标模式帮助">?</button></span><select id="library-mode"><option value="new">新建 Zotero collection</option><option value="existing">使用已有 collection</option></select></label>
         </div>
-        <label>Zotero collection 名称
-          <input id="target-library" required value="DTN" placeholder="DTN">
-          <small>题录和 PDF 先写入这个 Zotero collection，再导出给 EndNote。</small>
-        </label>
-        <label>论文清单
-          <textarea id="items-text" rows="11" required placeholder="每行一个 DOI 或完整题名；也可粘贴含 doi,title,year,author 列的 CSV。"></textarea>
-        </label>
-        <div class="inline-actions">
-          <label class="file-button">读取 TXT/CSV<input id="list-file" type="file" accept=".txt,.csv,text/plain,text/csv"></label>
-          <span id="parse-summary" class="muted"></span>
-          <button class="primary" type="submit">创建并开始</button>
+        <label><span class="field-label">Zotero collection 名称 <button class="help-button" type="button" data-help="题录和通过验证的 PDF 会写入这里。" aria-label="Zotero collection 名称帮助">?</button></span><input id="target-library" required value="DTN" placeholder="DTN"></label>
+        <label><span class="field-label">论文清单 <button class="help-button" type="button" data-help="每行填写一个 DOI 或完整题名，也可以读取含 doi、title、year、author 列的 CSV。" aria-label="论文清单格式帮助">?</button></span><textarea id="items-text" rows="11" required placeholder="每行一个 DOI 或完整题名"></textarea></label>
+        <div class="form-footer">
+          <label class="file-button">读取 TXT / CSV<input id="list-file" type="file" accept=".txt,.csv,text/plain,text/csv"></label>
+          <span id="parse-summary" class="result-text" aria-live="polite"></span>
+          <button class="primary" type="submit">创建并开始 <span aria-hidden="true">→</span></button>
         </div>
       </form>
     </section>
 
-    <section id="tab-tasks" class="tab-panel">
+    <section id="tab-tasks" class="tab-panel" aria-label="任务">
       <div class="task-layout">
         <aside class="panel task-list-panel">
-          <div class="section-title"><h2>批次</h2><button id="refresh-batches" class="quiet">刷新</button></div>
-          <div id="batch-list" class="batch-list"><p class="muted">尚无任务</p></div>
+          <div class="section-title">
+            <div><span class="kicker">BATCHES</span><h2>批次</h2></div>
+            <button id="refresh-batches" class="icon-button" type="button" aria-label="刷新批次">↻</button>
+          </div>
+          <div class="batch-selection-bar">
+            <label class="check compact"><input id="select-all-batches" type="checkbox"> 全选</label>
+            <span id="selected-batch-count" aria-live="polite">已选 0</span>
+            <button id="delete-selected-batches" class="danger compact-button" type="button" disabled>删除</button>
+          </div>
+          <div id="batch-list" class="batch-list" aria-live="polite"><div class="empty-state compact"><span aria-hidden="true">♡</span> 尚无任务</div></div>
         </aside>
-        <article id="task-detail" class="panel task-detail">
-          <div class="empty-state">选择一个批次查看论文状态。</div>
+        <article id="task-detail" class="panel task-detail" aria-live="polite">
+          <div class="empty-state"><span class="empty-icon" aria-hidden="true">⌁</span><strong>选择一个批次</strong><span>进度与待处理论文会显示在这里</span></div>
         </article>
       </div>
     </section>
 
-    <section id="tab-tools" class="panel tab-panel">
-      <h2>独立文件工具</h2>
-      <p class="muted">不依赖正在运行的批次循环。默认重命名格式为「一作姓名 - 标题.pdf」。PDF 与 EndNote 导入包默认写入 Downloads\[库名]。EndNote 库内重命名会同步更新 .Data\sdb 中的附件路径，请先完全退出 EndNote。</p>
-      <div class="grid two">
-        <form id="rename-pdfs-form">
-          <h2>按题录重命名 PDF</h2>
-          <label>数据区
-            <select id="rename-source">
-              <option value="zotero">Zotero collection</option>
-              <option value="batch">本机批次下载目录</option>
-              <option value="endnote">EndNote 库数据区（.Data\PDF）</option>
-            </select>
-          </label>
-          <label id="rename-collection-wrap">Zotero collection
-            <select id="rename-collection"></select>
-          </label>
-          <label id="rename-batch-wrap" hidden>本机批次
-            <select id="rename-batch"></select>
-          </label>
-          <label id="rename-endnote-wrap" hidden>EndNote 库
-            <input id="rename-endnote-library" readonly placeholder="请先在设置中填写 .enl 路径">
-            <small>请先完全退出 EndNote，再重命名。工具会改 PDF 文件名并更新库内附件路径。</small>
-          </label>
-          <button class="primary" type="submit">重命名</button>
-          <p id="rename-result" class="muted"></p>
+    <section id="tab-tools" class="tab-panel" aria-label="工具">
+      <div class="page-heading"><div><span class="kicker">FILE TOOLS</span><h2>整理与导出</h2></div></div>
+      <div class="tool-grid">
+        <form id="rename-pdfs-form" class="panel tool-card">
+          <div class="card-icon pink" aria-hidden="true">Aa</div>
+          <div class="card-heading"><h2>重命名 PDF</h2><button class="help-button" type="button" data-help="默认格式为“一作姓名 - 标题.pdf”。选择 EndNote 时请先完全退出 EndNote。" aria-label="重命名帮助">?</button></div>
+          <label><span class="field-label">数据区</span><select id="rename-source"><option value="zotero">Zotero collection</option><option value="batch">本机批次下载目录</option><option value="endnote">EndNote 库数据区</option></select></label>
+          <label id="rename-collection-wrap"><span class="field-label">Zotero collection</span><select id="rename-collection"></select></label>
+          <label id="rename-batch-wrap" hidden><span class="field-label">本机批次</span><select id="rename-batch"></select></label>
+          <label id="rename-endnote-wrap" hidden><span class="field-label">EndNote 库</span><input id="rename-endnote-library" readonly placeholder="请先在设置中填写 .enl 路径"></label>
+          <div class="card-footer"><p id="rename-result" class="result-text" role="status"></p><button class="primary" type="submit">开始重命名</button></div>
         </form>
-        <form id="export-pdfs-form">
-          <h2>导出 PDF 到文件夹</h2>
-          <label>数据区
-            <select id="export-source">
-              <option value="zotero">Zotero collection</option>
-              <option value="batch">本机批次</option>
-              <option value="endnote">EndNote 库数据区（.Data\PDF）</option>
-            </select>
-          </label>
-          <label id="export-collection-wrap">Zotero collection
-            <select id="export-collection"></select>
-          </label>
-          <label id="export-batch-wrap" hidden>本机批次
-            <select id="export-batch"></select>
-          </label>
-          <label>目标文件夹（默认 Downloads\[库名]）
-            <input id="export-destination" placeholder="C:\Users\...\Downloads\DTN">
-          </label>
+
+        <form id="export-pdfs-form" class="panel tool-card">
+          <div class="card-icon blue" aria-hidden="true">PDF</div>
+          <div class="card-heading"><h2>导出 PDF</h2><button class="help-button" type="button" data-help="目标文件夹留空时，使用 Downloads 下以库名命名的文件夹。" aria-label="PDF 导出帮助">?</button></div>
+          <label><span class="field-label">数据区</span><select id="export-source"><option value="zotero">Zotero collection</option><option value="batch">本机批次</option><option value="endnote">EndNote 库数据区</option></select></label>
+          <label id="export-collection-wrap"><span class="field-label">Zotero collection</span><select id="export-collection"></select></label>
+          <label id="export-batch-wrap" hidden><span class="field-label">本机批次</span><select id="export-batch"></select></label>
+          <label><span class="field-label">目标文件夹</span><input id="export-destination" placeholder="C:\Users\...\Downloads\DTN"></label>
           <label class="check"><input id="export-open-folder" type="checkbox" checked> 完成后打开文件夹</label>
-          <button class="primary" type="submit">导出</button>
-          <p id="export-result" class="muted"></p>
+          <div class="card-footer"><p id="export-result" class="result-text" role="status"></p><button class="primary" type="submit">导出 PDF</button></div>
+        </form>
+
+        <form id="export-endnote-form" class="panel tool-card">
+          <div class="card-icon lilac" aria-hidden="true">EN</div>
+          <div class="card-heading"><h2>EndNote 导入包</h2><button class="help-button" type="button" data-help="生成 records.xml、records.ris 和 PDF 文件夹。EndNote 中建议以 Reference Manager (RIS)、Unicode (UTF-8) 导入 records.ris。" aria-label="EndNote 导出帮助">?</button></div>
+          <label><span class="field-label">Zotero collection</span><select id="endnote-collection"></select></label>
+          <label><span class="field-label">目标文件夹</span><input id="endnote-destination" placeholder="C:\Users\...\Downloads\DTN"></label>
+          <label class="check"><input id="endnote-open-folder" type="checkbox" checked> 完成后打开文件夹</label>
+          <div class="card-footer"><p id="endnote-export-result" class="result-text" role="status"></p><button class="primary" type="submit">导出导入包</button></div>
         </form>
       </div>
-      <form id="export-endnote-form">
-        <h2>从 Zotero 导出 EndNote 导入包</h2>
-        <p class="muted">读取所选 collection 的题录和 PDF，生成 records.xml / records.ris / PDF 子目录。默认写入 Downloads\[库名]。推荐在 EndNote 中导入 records.ris：File → Import → File，Import Option 选 Reference Manager (RIS)，Text Translation 选 Unicode (UTF-8)。不要导入 ZIP，也不要用默认的 EndNote Import。</p>
-        <label>Zotero collection
-          <select id="endnote-collection"></select>
-        </label>
-        <label>目标文件夹（默认 Downloads\[库名]）
-          <input id="endnote-destination" placeholder="C:\Users\...\Downloads\DTN">
-        </label>
-        <label class="check"><input id="endnote-open-folder" type="checkbox" checked> 完成后打开文件夹</label>
-        <button class="primary" type="submit">导出导入包</button>
-        <p id="endnote-export-result" class="muted"></p>
-      </form>
     </section>
 
-    <section id="tab-settings" class="panel tab-panel">
-      <form id="settings-form">
-        <h2>服务设置</h2>
-        <p class="muted">Unpaywall 要求请求中提供电子邮箱；Crossref 邮箱用于 polite pool。设置写入本机 SQLite 与 <code>runtime/config.toml</code>。不支持 Sci-Hub。</p>
-        <label>Crossref 联系邮箱<input id="crossref-email" type="email" autocomplete="email"></label>
-        <label>Unpaywall 联系邮箱<input id="unpaywall-email" type="email" autocomplete="email"></label>
-        <label>EndNote 库路径（可选）
-          <input id="endnote-library" placeholder="C:\Users\...\DTN &amp; FL.enl">
-          <small>填写 .enl 后，可用工具页从该库导出 PDF，或在关闭 EndNote 后按题录重命名库内附件。导入包仍从 Zotero 导出到 Downloads。</small>
-        </label>
-        <h2>获取来源</h2>
-        <p class="muted">仅开放获取与已登录的机构订阅。来源顺序固定为先开放获取，再机构入口。</p>
-        <label class="check"><input id="source-open-access" type="checkbox" checked> 开放获取（Unpaywall）</label>
-        <label class="check"><input id="source-institution" type="checkbox" checked> 机构订阅（EZProxy / OpenURL）</label>
-        <label class="check"><input id="auto-institution" type="checkbox" checked> 批次自动走机构获取（登录一次后逐篇尝试）</label>
-        <label class="check"><input id="auto-commit" type="checkbox" checked> 获取阶段结束后自动提交 Zotero</label>
-        <label>登录等待秒数<input id="login-wait-seconds" type="number" min="30" max="1800" value="600"></label>
-        <h2>OCR</h2>
-        <p id="ocr-status" class="muted">正在检查 Tesseract…</p>
-        <label class="check"><input id="ocr-enabled" type="checkbox" checked> 扫描件使用 OCR 辅助题名匹配</label>
-        <div class="grid two">
-          <label>语言<input id="ocr-languages" value="eng" placeholder="eng 或 eng+chi_sim"></label>
-          <label>页数<input id="ocr-max-pages" type="number" min="1" max="5" value="2"></label>
-        </div>
-        <h2>机构档案</h2>
-        <label>预设
-          <select id="institution-preset"></select>
-          <small>选择预设会覆盖下方字段。Generic EZProxy 需要改成你的校园代理地址。</small>
-        </label>
-        <div class="grid two">
-          <label>机构 ID<input id="institution-id" required></label>
-          <label>显示名称<input id="institution-name" required></label>
-        </div>
-        <label>EZProxy 登录模板
-          <input id="institution-login" placeholder="https://ezproxy.example.edu/login?url={url}">
-        </label>
-        <label>EZProxy 主机（逗号分隔）
-          <input id="institution-hosts" placeholder="ezproxy.example.edu">
-        </label>
-        <label>OpenURL / 馆藏解析（可选，使用 {doi}）
-          <input id="institution-openurl" placeholder="https://...link?rft_id=info:doi/{doi}">
-        </label>
-        <label>登录页标记（逗号分隔）
-          <input id="institution-login-markers" placeholder="login.microsoftonline.com, shibboleth, saml">
-        </label>
-        <button class="primary" type="submit">保存设置</button>
+    <section id="tab-settings" class="tab-panel" aria-label="设置">
+      <div class="page-heading"><div><span class="kicker">PREFERENCES</span><h2>设置</h2></div></div>
+      <form id="settings-form" class="settings-grid">
+        <section class="panel settings-card">
+          <div class="settings-title"><span class="settings-icon" aria-hidden="true">＠</span><h2>服务</h2></div>
+          <label><span class="field-label">Crossref 联系邮箱 <button class="help-button" type="button" data-help="用于 Crossref polite pool。" aria-label="Crossref 邮箱帮助">?</button></span><input id="crossref-email" type="email" autocomplete="email"></label>
+          <label><span class="field-label">Unpaywall 联系邮箱 <button class="help-button" type="button" data-help="Unpaywall 请求需要提供联系邮箱。" aria-label="Unpaywall 邮箱帮助">?</button></span><input id="unpaywall-email" type="email" autocomplete="email"></label>
+          <label><span class="field-label">EndNote 库路径（可选） <button class="help-button" type="button" data-help="填写 .enl 文件后，可在工具页导出或重命名库内附件。" aria-label="EndNote 库路径帮助">?</button></span><input id="endnote-library" placeholder="C:\Users\...\Library.enl"></label>
+        </section>
+
+        <section class="panel settings-card">
+          <div class="settings-title"><span class="settings-icon" aria-hidden="true">⇣</span><h2>获取来源</h2></div>
+          <label class="check"><input id="source-open-access" type="checkbox" checked><span>开放获取（Unpaywall）</span></label>
+          <label class="check"><input id="source-institution" type="checkbox" checked><span>机构订阅（EZProxy / OpenURL）</span></label>
+          <label class="check"><input id="auto-institution" type="checkbox" checked><span>自动尝试机构获取</span></label>
+          <label class="check"><input id="auto-commit" type="checkbox" checked><span>获取后自动提交 Zotero</span></label>
+          <label><span class="field-label">登录等待秒数 <button class="help-button" type="button" data-help="为机构登录、验证码或双重验证预留的等待时间。" aria-label="登录等待帮助">?</button></span><input id="login-wait-seconds" type="number" min="30" max="1800" value="600"></label>
+        </section>
+
+        <section class="panel settings-card">
+          <div class="settings-title-row"><div class="settings-title"><span class="settings-icon" aria-hidden="true">◌</span><h2>OCR</h2></div><span id="ocr-status" class="status-pill muted">检查中…</span></div>
+          <label class="check"><input id="ocr-enabled" type="checkbox" checked><span>扫描件使用 OCR 匹配题名</span></label>
+          <div class="grid two compact-grid">
+            <label><span class="field-label">语言 <button class="help-button" type="button" data-help="多个语言用 + 连接，例如 eng+chi_sim。" aria-label="OCR 语言帮助">?</button></span><input id="ocr-languages" value="eng" placeholder="eng"></label>
+            <label><span class="field-label">页数</span><input id="ocr-max-pages" type="number" min="1" max="5" value="2"></label>
+          </div>
+        </section>
+
+        <section class="panel settings-card wide">
+          <div class="settings-title"><span class="settings-icon" aria-hidden="true">⌂</span><h2>机构</h2></div>
+          <label><span class="field-label">预设 <button class="help-button" type="button" data-help="选择预设会填入下方字段；Generic EZProxy 需要替换为校园代理地址。" aria-label="机构预设帮助">?</button></span><select id="institution-preset"></select></label>
+          <div class="grid two"><label><span class="field-label">机构 ID</span><input id="institution-id" required></label><label><span class="field-label">显示名称</span><input id="institution-name" required></label></div>
+          <details class="subtle-details"><summary>高级连接设置</summary><div class="details-body">
+            <label><span class="field-label">EZProxy 登录模板</span><input id="institution-login" placeholder="https://ezproxy.example.edu/login?url={url}"></label>
+            <label><span class="field-label">EZProxy 主机（逗号分隔）</span><input id="institution-hosts" placeholder="ezproxy.example.edu"></label>
+            <label><span class="field-label">OpenURL / 馆藏解析</span><input id="institution-openurl" placeholder="https://...link?rft_id=info:doi/{doi}"></label>
+            <label><span class="field-label">登录页标记（逗号分隔）</span><input id="institution-login-markers" placeholder="login.microsoftonline.com, shibboleth, saml"></label>
+          </div></details>
+        </section>
+        <div class="settings-save"><button class="primary" type="submit">保存设置</button></div>
       </form>
-      <hr>
-      <form id="credentials-form">
-        <h2>机构登录凭据</h2>
-        <p class="muted">用户名和密码保存在 Windows 凭据管理器，不会写入 config.toml、SQLite 或 Git。工具只会在可见 Chrome 登录页填入账号，不会提交表单或绕过 2FA。</p>
-        <p id="credentials-status" class="muted"></p>
-        <label>用户名<input id="institution-username" autocomplete="username"></label>
-        <label>密码<input id="institution-password" type="password" autocomplete="current-password" placeholder="不会回显已保存的密码"></label>
-        <div class="inline-actions">
-          <button class="primary" type="submit">保存凭据</button>
-          <button id="clear-credentials" type="button" class="danger">清除凭据</button>
-          <button id="open-institution-login" type="button">打开机构登录页</button>
-        </div>
-      </form>
-      <hr>
-      <h2>本机环境</h2>
-      <p class="muted">Zotero 10+ 需在 Settings → Advanced 启用本地 API，然后授权本工具写入。EndNote 只接收导出的 XML/PDF 包，不再模拟菜单或鼠标。</p>
-      <button id="authorize-zotero" type="button">授权 Zotero 本地写入</button>
-      <pre id="system-info">加载中…</pre>
+
+      <div class="settings-grid lower-settings">
+        <form id="credentials-form" class="panel settings-card">
+          <div class="settings-title-row"><div class="settings-title"><span class="settings-icon" aria-hidden="true">⌘</span><h2>机构凭据</h2></div><button class="help-button" type="button" data-help="凭据保存在 Windows 凭据管理器；浏览器只会填入账号，不会代替你提交或处理双重验证。" aria-label="机构凭据帮助">?</button></div>
+          <p id="credentials-status" class="result-text" aria-live="polite"></p>
+          <label><span class="field-label">用户名</span><input id="institution-username" autocomplete="username"></label>
+          <label><span class="field-label">密码</span><input id="institution-password" type="password" autocomplete="current-password" placeholder="已保存密码不会回显"></label>
+          <div class="inline-actions"><button class="primary" type="submit">保存凭据</button><button id="clear-credentials" type="button" class="danger">清除</button><button id="open-institution-login" type="button">打开登录页</button></div>
+        </form>
+
+        <section class="panel settings-card environment-card">
+          <div class="settings-title"><span class="settings-icon" aria-hidden="true">✓</span><h2>本机环境</h2></div>
+          <div id="environment-status" class="environment-grid" aria-live="polite"><div class="status-card loading">正在检查…</div></div>
+          <button id="authorize-zotero" type="button">授权 Zotero</button>
+          <details class="diagnostics"><summary>查看诊断信息</summary><pre id="system-info">加载中…</pre></details>
+        </section>
+      </div>
     </section>
   </main>
 
-  <dialog id="candidate-dialog">
+  <dialog id="candidate-dialog" aria-labelledby="candidate-title">
     <form method="dialog"><button class="dialog-close" value="cancel" aria-label="关闭">×</button></form>
-    <h2>确认题录</h2>
-    <p id="candidate-source" class="muted"></p>
-    <div class="inline-actions">
-      <input id="manual-doi" type="text" placeholder="补充 DOI，例如 10.1000/example">
-      <button id="resolve-doi" type="button">按 DOI 重新解析</button>
-    </div>
+    <span class="dialog-icon" aria-hidden="true">✦</span><h2 id="candidate-title">确认题录</h2>
+    <p id="candidate-source" class="dialog-context"></p>
+    <div class="inline-actions candidate-resolve"><input id="manual-doi" type="text" placeholder="补充 DOI，例如 10.1000/example"><button id="resolve-doi" type="button">按 DOI 解析</button></div>
     <div id="candidate-list"></div>
   </dialog>
 
-  <dialog id="pdf-dialog">
+  <dialog id="pdf-dialog" aria-labelledby="pdf-dialog-title">
     <form method="dialog"><button class="dialog-close" value="cancel" aria-label="关闭">×</button></form>
-    <h2>确认 PDF</h2>
-    <p id="pdf-review-text"></p>
-    <label>版本<select id="pdf-version"><option value="published">正式发表版本</option><option value="accepted">作者接受稿</option><option value="preprint">预印本</option><option value="unknown">不确定</option></select></label>
-    <div class="inline-actions"><button id="reject-pdf" class="danger">拒绝</button><button id="accept-pdf" class="primary">接受 PDF</button></div>
+    <span class="dialog-icon" aria-hidden="true">PDF</span><h2 id="pdf-dialog-title">确认 PDF</h2>
+    <p id="pdf-review-text" class="dialog-context"></p>
+    <label><span class="field-label">版本</span><select id="pdf-version"><option value="published">正式发表版本</option><option value="accepted">作者接受稿</option><option value="preprint">预印本</option><option value="unknown">不确定</option></select></label>
+    <div class="dialog-actions"><button id="reject-pdf" class="danger" type="button">拒绝</button><button id="accept-pdf" class="primary" type="button">接受 PDF</button></div>
   </dialog>
 
+  <dialog id="delete-dialog" class="delete-dialog" aria-labelledby="delete-dialog-title">
+    <form method="dialog"><button class="dialog-close" value="cancel" aria-label="关闭">×</button></form>
+    <span class="dialog-icon danger-icon" aria-hidden="true">⌫</span><h2 id="delete-dialog-title">删除批次</h2>
+    <div id="delete-summary" class="delete-summary" aria-live="polite"><div class="loading-state"><span class="spinner" aria-hidden="true"></span> 正在计算可清理内容…</div></div>
+    <div id="delete-items" class="delete-items"></div>
+    <div id="delete-progress" class="delete-progress" hidden aria-live="polite"></div>
+    <p class="delete-note">删除后无法恢复。本机导出文件、Zotero collection 和 EndNote 文献库会保留。</p>
+    <div class="dialog-actions"><button id="cancel-delete" type="button">取消</button><button id="confirm-delete" class="danger solid" type="button" disabled>确认删除</button></div>
+  </dialog>
+
+  <div id="help-popover" class="help-popover" role="tooltip" hidden></div>
   <div id="toast" role="status" aria-live="polite"></div>
   <script src="/static/app.js"></script>
 </body>

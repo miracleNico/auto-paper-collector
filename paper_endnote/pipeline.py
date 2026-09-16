@@ -2,8 +2,9 @@ from __future__ import annotations
 
 import asyncio
 import shutil
+from contextlib import asynccontextmanager, suppress
 from pathlib import Path
-from typing import Any
+from typing import Any, AsyncIterator
 
 from .browser import BrowserSession, LoginTimeoutError, PublisherBlockedError
 from .clients import (
@@ -13,7 +14,7 @@ from .clients import (
     scholar_search_url,
 )
 from .config import Settings
-from .db import Database
+from .db import BatchDeletingError, Database
 from .downloader import download_pdf, safe_filename
 from .inputs import normalize_doi, title_similarity
 from .library_files import downloads_library_dir, export_zotero_endnote_package
@@ -33,21 +34,32 @@ class PipelineManager:
         self.zotero = ZoteroAdapter(database.get_setting("zotero_api_key", ""))
         self._batch_tasks: dict[str, asyncio.Task] = {}
         self._commit_tasks: dict[str, asyncio.Task] = {}
+        self._cancellable_work: dict[str, set[asyncio.Task]] = {}
+        self._drain_work: dict[str, set[asyncio.Task]] = {}
+        self._deleting_batches: set[str] = set()
         self._commit_lock = asyncio.Lock()
         self.institution_gap_seconds = 6.0
         self._institution_session_ready = False
         self._institution_login_failed = False
 
     async def close(self) -> None:
-        for task in [*self._batch_tasks.values(), *self._commit_tasks.values()]:
+        tasks = [
+            *self._batch_tasks.values(),
+            *self._commit_tasks.values(),
+            *(task for tasks in self._cancellable_work.values() for task in tasks),
+        ]
+        for task in tasks:
             if not task.done():
                 task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
         await self.crossref.close()
         await self.unpaywall.close()
         await self.browser.close()
         await self.zotero.close()
 
     def start(self, batch_id: str) -> None:
+        self.db.assert_batch_writable(batch_id)
         current = self._batch_tasks.get(batch_id)
         if current and not current.done():
             return
@@ -55,11 +67,72 @@ class PipelineManager:
         self._batch_tasks[batch_id] = asyncio.create_task(self._run_batch(batch_id))
 
     def pause(self, batch_id: str) -> None:
+        self.db.assert_batch_writable(batch_id)
         self.db.update_batch(batch_id, status="paused", paused=1)
         self.db.event(batch_id, "批次已暂停")
 
     def resume(self, batch_id: str) -> None:
         self.start(batch_id)
+
+    def is_batch_running(self, batch_id: str) -> bool:
+        tasks = [self._batch_tasks.get(batch_id), self._commit_tasks.get(batch_id)]
+        return any(task is not None and not task.done() for task in tasks) or any(
+            not task.done()
+            for task in (
+                self._cancellable_work.get(batch_id, set())
+                | self._drain_work.get(batch_id, set())
+            )
+        )
+
+    @asynccontextmanager
+    async def track_batch_work(
+        self, batch_id: str, *, cancellable: bool
+    ) -> AsyncIterator[None]:
+        self.db.assert_batch_writable(batch_id)
+        if batch_id in self._deleting_batches:
+            raise BatchDeletingError("批次正在删除，不能再修改")
+        task = asyncio.current_task()
+        if task is None:
+            yield
+            return
+        work = self._cancellable_work if cancellable else self._drain_work
+        work.setdefault(batch_id, set()).add(task)
+        try:
+            yield
+        finally:
+            tasks = work.get(batch_id)
+            if tasks is not None:
+                tasks.discard(task)
+                if not tasks:
+                    work.pop(batch_id, None)
+
+    async def prepare_batch_deletion(self, batch_id: str, paper_ids: list[str]) -> None:
+        """Stop acquisition, drain file/external writes, and tombstone browser callbacks."""
+        self._deleting_batches.add(batch_id)
+        await self.browser.stop_papers(paper_ids)
+
+        current = asyncio.current_task()
+        cancellable = set(self._cancellable_work.get(batch_id, set()))
+        batch_task = self._batch_tasks.get(batch_id)
+        if batch_task is not None:
+            cancellable.add(batch_task)
+        cancellable.discard(current)
+        for task in cancellable:
+            if not task.done():
+                task.cancel()
+        if cancellable:
+            await asyncio.gather(*cancellable, return_exceptions=True)
+
+        commit_task = self._commit_tasks.get(batch_id)
+        if commit_task is not None and not commit_task.done():
+            await asyncio.shield(commit_task)
+        draining = {
+            task for task in self._drain_work.get(batch_id, set())
+            if task is not current and not task.done()
+        }
+        if draining:
+            await asyncio.gather(*(asyncio.shield(task) for task in draining))
+        await self.browser.stop_papers(paper_ids)
 
     async def _run_batch(self, batch_id: str) -> None:
         self._institution_session_ready = False
@@ -79,9 +152,8 @@ class PipelineManager:
                     self.db.update_batch(batch_id, status="completed")
                     self.db.event(batch_id, "网络与题录准备阶段已完成")
                     if self.settings.auto_commit:
-                        current = self.db.get_batch(batch_id)
-                        if current:
-                            await self._commit_zotero_batch(current)
+                        self.commit(batch_id)
+                        await asyncio.shield(self._commit_tasks[batch_id])
                     return
                 paper = actionable[0]
                 try:
@@ -103,6 +175,8 @@ class PipelineManager:
                     )
                     self.db.event(batch_id, f"处理失败：{exc}", level="error", paper_id=paper["id"])
         except asyncio.CancelledError:
+            return
+        except BatchDeletingError:
             return
         except Exception as exc:
             self.db.update_batch(batch_id, status="failed", error=str(exc))
@@ -273,6 +347,7 @@ class PipelineManager:
         )
 
     def confirm_metadata(self, paper_id: str, metadata: dict[str, Any]) -> None:
+        self.db.assert_paper_writable(paper_id)
         paper = self.db.get_paper(paper_id)
         if not paper:
             raise KeyError(paper_id)
@@ -281,6 +356,7 @@ class PipelineManager:
         self.start(paper["batch_id"])
 
     async def accept_local_pdf(self, paper_id: str, source: Path, *, accepted_by_user: bool = False) -> dict[str, Any]:
+        self.db.assert_paper_writable(paper_id)
         paper = self.db.get_paper(paper_id)
         if not paper:
             raise KeyError(paper_id)
@@ -354,6 +430,7 @@ class PipelineManager:
             self.db.event(batch_id, f"机构自动获取未完成：{exc}", level="warning", paper_id=paper["id"])
 
     async def acquire_institution_pdf(self, paper_id: str) -> dict[str, Any]:
+        self.db.assert_paper_writable(paper_id)
         paper = self.db.get_paper(paper_id)
         if not paper:
             raise KeyError(paper_id)
@@ -402,16 +479,20 @@ class PipelineManager:
         return url
 
     async def _browser_downloaded(self, paper_id: str, path: Path) -> None:
+        if self.db.is_batch_deleting_for_paper(paper_id):
+            return
         try:
             await self.accept_local_pdf(paper_id, path)
         except Exception as exc:
             paper = self.db.get_paper(paper_id)
             if paper:
-                self.db.event(paper["batch_id"], f"浏览器下载文件未通过校验：{exc}", level="error", paper_id=paper_id)
+                with suppress(BatchDeletingError):
+                    self.db.event(paper["batch_id"], f"浏览器下载文件未通过校验：{exc}", level="error", paper_id=paper_id)
 
     async def open_paper_url(
         self, paper_id: str, *, scholar: bool = False, resolver: bool = False
     ) -> None:
+        self.db.assert_paper_writable(paper_id)
         paper = self.db.get_paper(paper_id)
         if not paper:
             raise KeyError(paper_id)
@@ -429,19 +510,22 @@ class PipelineManager:
         await self.browser.open_for_paper(paper_id, url)
 
     def commit(self, batch_id: str) -> None:
+        self.db.assert_batch_writable(batch_id)
         current = self._commit_tasks.get(batch_id)
         if current and not current.done():
             return
         self._commit_tasks[batch_id] = asyncio.create_task(self._commit_batch(batch_id))
 
     async def _commit_batch(self, batch_id: str) -> None:
-        async with self._commit_lock:
-            batch = self.db.get_batch(batch_id)
-            if not batch:
-                return
-            await self._commit_zotero_batch(batch)
+        with self.db.allow_deleting_writes():
+            async with self._commit_lock:
+                batch = self.db.get_batch(batch_id)
+                if not batch:
+                    return
+                await self._commit_zotero_batch(batch)
 
     async def export_endnote(self, batch_id: str) -> dict[str, Any]:
+        self.db.assert_batch_writable(batch_id)
         batch = self.db.get_batch(batch_id)
         if not batch:
             raise KeyError(batch_id)

@@ -11,7 +11,7 @@ from typing import Any
 
 import uvicorn
 from fastapi import FastAPI, File, HTTPException, Request, UploadFile
-from fastapi.responses import FileResponse, HTMLResponse, PlainTextResponse, Response
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, PlainTextResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
@@ -22,7 +22,8 @@ from .credentials import (
     credential_status,
     save_credentials,
 )
-from .db import Database
+from .db import BatchDeletingError, Database
+from .deletion import BatchDeletionManager
 from .endnote import probe_endnote
 from .inputs import parse_input
 from .inputs import normalize_doi
@@ -51,17 +52,25 @@ settings.unpaywall_email = database.get_setting("unpaywall_email", settings.unpa
 library_setting = database.get_setting("endnote_library", str(settings.endnote_library or ""))
 settings.endnote_library = Path(library_setting).expanduser() if library_setting.strip() else None
 pipeline = PipelineManager(settings, database)
+deletion_manager = BatchDeletionManager(settings, database, pipeline)
 SESSION_TOKEN = secrets.token_urlsafe(32)
 
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
+    await deletion_manager.recover()
     yield
+    await deletion_manager.close()
     await pipeline.close()
 
 
 app = FastAPI(title="Paper Reference Workflow", version="0.5.0", lifespan=lifespan)
 app.mount("/static", StaticFiles(directory=settings.app_root / "paper_endnote" / "static"), name="static")
+
+
+@app.exception_handler(BatchDeletingError)
+async def batch_deleting_error(_: Request, exc: BatchDeletingError) -> JSONResponse:
+    return JSONResponse(status_code=409, content={"detail": str(exc)})
 
 
 @app.middleware("http")
@@ -148,6 +157,10 @@ class EndNoteExportToolRequest(BaseModel):
     collection: str = ""
     destination: str = ""
     open_folder: bool = False
+
+
+class BatchDeleteRequest(BaseModel):
+    batch_ids: list[str] = Field(min_length=1, max_length=100)
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -276,7 +289,10 @@ async def tool_rename_pdfs(payload: LibraryToolRequest) -> dict[str, Any]:
         if payload.source == "batch":
             if not payload.batch_id.strip():
                 raise LibraryFilesError("请选择本机批次")
-            return rename_batch_pdfs(database, payload.batch_id.strip())
+            batch_id = payload.batch_id.strip()
+            require_batch(batch_id, writable=True)
+            async with pipeline.track_batch_work(batch_id, cancellable=False):
+                return rename_batch_pdfs(database, batch_id)
         if payload.source == "zotero":
             if not payload.collection.strip():
                 raise LibraryFilesError("请选择 Zotero collection")
@@ -299,12 +315,12 @@ async def tool_export_pdfs(payload: LibraryToolRequest) -> dict[str, Any]:
         if payload.source == "batch":
             if not payload.batch_id.strip():
                 raise LibraryFilesError("请选择本机批次")
-            batch = database.get_batch(payload.batch_id.strip())
-            if not batch:
-                raise LibraryFilesError("批次不存在")
+            batch_id = payload.batch_id.strip()
+            batch = require_batch(batch_id, writable=True)
             lib_name = batch["target_library"]
             destination = resolve_export_dir(payload.destination) if payload.destination.strip() else downloads_library_dir(lib_name)
-            result = export_batch_pdfs(database, payload.batch_id.strip(), destination)
+            async with pipeline.track_batch_work(batch_id, cancellable=False):
+                result = export_batch_pdfs(database, batch_id, destination)
         elif payload.source == "zotero":
             if not payload.collection.strip():
                 raise LibraryFilesError("请选择 Zotero collection")
@@ -389,6 +405,25 @@ async def create_batch(payload: BatchCreate) -> dict[str, str]:
     return {"id": batch_id}
 
 
+@app.post("/api/batches/delete-preview")
+async def preview_batch_deletion(payload: BatchDeleteRequest) -> dict[str, Any]:
+    return deletion_manager.preview(normalize_batch_ids(payload.batch_ids))
+
+
+@app.post("/api/batches/delete", status_code=202)
+async def delete_batches(payload: BatchDeleteRequest) -> dict[str, Any]:
+    operation = deletion_manager.request(normalize_batch_ids(payload.batch_ids))
+    return {"operation_id": operation["id"], **operation}
+
+
+@app.get("/api/batch-deletions/{operation_id}")
+async def get_batch_deletion(operation_id: str) -> dict[str, Any]:
+    operation = deletion_manager.get(operation_id)
+    if not operation:
+        raise HTTPException(404, "删除操作不存在")
+    return operation
+
+
 @app.get("/api/batches/{batch_id}")
 async def get_batch(batch_id: str) -> dict[str, Any]:
     batch = database.get_batch(batch_id)
@@ -399,37 +434,38 @@ async def get_batch(batch_id: str) -> dict[str, Any]:
 
 @app.post("/api/batches/{batch_id}/start")
 async def start_batch(batch_id: str) -> dict[str, str]:
-    require_batch(batch_id)
+    require_batch(batch_id, writable=True)
     pipeline.start(batch_id)
     return {"status": "running"}
 
 
 @app.post("/api/batches/{batch_id}/pause")
 async def pause_batch(batch_id: str) -> dict[str, str]:
-    require_batch(batch_id)
+    require_batch(batch_id, writable=True)
     pipeline.pause(batch_id)
     return {"status": "paused"}
 
 
 @app.post("/api/batches/{batch_id}/resume")
 async def resume_batch(batch_id: str) -> dict[str, str]:
-    require_batch(batch_id)
+    require_batch(batch_id, writable=True)
     pipeline.resume(batch_id)
     return {"status": "running"}
 
 
 @app.post("/api/batches/{batch_id}/commit")
 async def commit_batch(batch_id: str) -> dict[str, str]:
-    require_batch(batch_id)
+    require_batch(batch_id, writable=True)
     pipeline.commit(batch_id)
     return {"status": "started"}
 
 
 @app.post("/api/batches/{batch_id}/export-endnote")
 async def export_endnote(batch_id: str) -> dict[str, Any]:
-    require_batch(batch_id)
+    require_batch(batch_id, writable=True)
     try:
-        return await pipeline.export_endnote(batch_id)
+        async with pipeline.track_batch_work(batch_id, cancellable=False):
+            return await pipeline.export_endnote(batch_id)
     except Exception as exc:
         raise HTTPException(409, str(exc)) from exc
 
@@ -485,7 +521,7 @@ async def candidates(paper_id: str) -> list[dict[str, Any]]:
 
 @app.post("/api/papers/{paper_id}/confirm-metadata")
 async def confirm_metadata(paper_id: str, payload: MetadataConfirm) -> dict[str, str]:
-    require_paper(paper_id)
+    require_paper(paper_id, writable=True)
     metadata = payload.metadata
     if payload.candidate_id:
         selected = next((item for item in database.get_candidates(paper_id) if item["id"] == payload.candidate_id), None)
@@ -500,7 +536,7 @@ async def confirm_metadata(paper_id: str, payload: MetadataConfirm) -> dict[str,
 
 @app.post("/api/papers/{paper_id}/resolve-doi")
 async def resolve_doi(paper_id: str, payload: DOIUpdate) -> dict[str, str]:
-    paper = require_paper(paper_id)
+    paper = require_paper(paper_id, writable=True)
     doi = normalize_doi(payload.doi)
     if not doi:
         raise HTTPException(400, "DOI 格式无效")
@@ -534,7 +570,7 @@ async def resolve_doi(paper_id: str, payload: DOIUpdate) -> dict[str, str]:
 
 @app.post("/api/papers/{paper_id}/retry")
 async def retry_paper(paper_id: str) -> dict[str, str]:
-    paper = require_paper(paper_id)
+    paper = require_paper(paper_id, writable=True)
     database.reset_paper_for_retry(paper_id)
     pipeline.start(paper["batch_id"])
     return {"status": "queued"}
@@ -542,7 +578,7 @@ async def retry_paper(paper_id: str) -> dict[str, str]:
 
 @app.post("/api/papers/{paper_id}/skip")
 async def skip_paper(paper_id: str) -> dict[str, str]:
-    paper = require_paper(paper_id)
+    paper = require_paper(paper_id, writable=True)
     database.update_paper(paper_id, status="skipped", needs_action=None, error=None)
     database.event(paper["batch_id"], "已跳过", paper_id=paper_id)
     return {"status": "skipped"}
@@ -550,28 +586,29 @@ async def skip_paper(paper_id: str) -> dict[str, str]:
 
 @app.post("/api/papers/{paper_id}/upload-pdf")
 async def upload_pdf(paper_id: str, file: UploadFile = File(...)) -> dict[str, Any]:
-    require_paper(paper_id)
+    paper = require_paper(paper_id, writable=True)
     if not file.filename or not file.filename.casefold().endswith(".pdf"):
         raise HTTPException(400, "请选择 PDF 文件")
-    temporary = settings.runtime_dir / "uploads" / paper_id / Path(file.filename).name
-    temporary.parent.mkdir(parents=True, exist_ok=True)
-    size = 0
-    try:
-        with temporary.open("wb") as handle:
-            while chunk := await file.read(1024 * 1024):
-                size += len(chunk)
-                if size > settings.max_pdf_bytes:
-                    raise HTTPException(413, "PDF 超过 100 MB 限制")
-                handle.write(chunk)
-        result = await pipeline.accept_local_pdf(paper_id, temporary)
-        return result
-    finally:
-        temporary.unlink(missing_ok=True)
+    async with pipeline.track_batch_work(paper["batch_id"], cancellable=False):
+        temporary = settings.runtime_dir / "uploads" / paper_id / Path(file.filename).name
+        temporary.parent.mkdir(parents=True, exist_ok=True)
+        size = 0
+        try:
+            with temporary.open("wb") as handle:
+                while chunk := await file.read(1024 * 1024):
+                    size += len(chunk)
+                    if size > settings.max_pdf_bytes:
+                        raise HTTPException(413, "PDF 超过 100 MB 限制")
+                    handle.write(chunk)
+            result = await pipeline.accept_local_pdf(paper_id, temporary)
+            return result
+        finally:
+            temporary.unlink(missing_ok=True)
 
 
 @app.post("/api/papers/{paper_id}/confirm-pdf")
 async def confirm_pdf(paper_id: str, payload: PDFConfirm) -> dict[str, str]:
-    paper = require_paper(paper_id)
+    paper = require_paper(paper_id, writable=True)
     if not payload.accept:
         if paper.get("pdf_path"):
             Path(paper["pdf_path"]).unlink(missing_ok=True)
@@ -593,9 +630,12 @@ async def confirm_pdf(paper_id: str, payload: PDFConfirm) -> dict[str, str]:
 async def open_paper(
     paper_id: str, scholar: bool = False, resolver: bool = False
 ) -> dict[str, str]:
-    require_paper(paper_id)
+    paper = require_paper(paper_id, writable=True)
     try:
-        await pipeline.open_paper_url(paper_id, scholar=scholar, resolver=resolver)
+        async with pipeline.track_batch_work(paper["batch_id"], cancellable=True):
+            await pipeline.open_paper_url(paper_id, scholar=scholar, resolver=resolver)
+    except BatchDeletingError:
+        raise
     except Exception as exc:
         raise HTTPException(500, str(exc)) from exc
     return {"status": "opened"}
@@ -603,25 +643,37 @@ async def open_paper(
 
 @app.post("/api/papers/{paper_id}/acquire-institution")
 async def acquire_institution(paper_id: str) -> dict[str, Any]:
-    require_paper(paper_id)
+    paper = require_paper(paper_id, writable=True)
     try:
-        result = await pipeline.acquire_institution_pdf(paper_id)
+        async with pipeline.track_batch_work(paper["batch_id"], cancellable=True):
+            result = await pipeline.acquire_institution_pdf(paper_id)
     except Exception as exc:
         raise HTTPException(409, str(exc)) from exc
     return {"status": "verified", **result}
 
 
-def require_batch(batch_id: str) -> dict[str, Any]:
+def normalize_batch_ids(batch_ids: list[str]) -> list[str]:
+    normalized = list(dict.fromkeys(item.strip() for item in batch_ids if item.strip()))
+    if not normalized:
+        raise HTTPException(400, "请选择要删除的批次")
+    return normalized
+
+
+def require_batch(batch_id: str, *, writable: bool = False) -> dict[str, Any]:
     batch = database.get_batch(batch_id)
     if not batch:
         raise HTTPException(404, "批次不存在")
+    if writable:
+        database.assert_batch_writable(batch_id)
     return batch
 
 
-def require_paper(paper_id: str) -> dict[str, Any]:
+def require_paper(paper_id: str, *, writable: bool = False) -> dict[str, Any]:
     paper = database.get_paper(paper_id)
     if not paper:
         raise HTTPException(404, "论文不存在")
+    if writable:
+        database.assert_paper_writable(paper_id)
     return paper
 
 

@@ -1,5 +1,7 @@
 id = "mcgill"
 name = "McGill University"
+access_type = "ezproxy"
+login_url = "https://proxy.library.mcgill.ca/login"
 ezproxy_login = "https://proxy.library.mcgill.ca/login?url={url}"
 ezproxy_hosts = ["proxy.library.mcgill.ca", "proxy3.library.mcgill.ca"]
 openurl = "https://mcgill.on.worldcat.org/atoztitles/link?url_ver=Z39.88-2004&rft_id=info:doi/{doi}"

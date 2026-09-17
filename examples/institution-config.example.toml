@@ -1,0 +1,42 @@
+# Institution access examples
+#
+# Copy exactly ONE example into runtime/config.toml as [institution], then replace
+# every example.edu URL with an official URL supplied by your university library.
+# These examples contain no credentials. CARSI passwords, cookies, and SAML data
+# are entered in the visible browser and are not stored in this file.
+# Use a stable library-provided entry URL, never a one-use URL containing
+# SAMLRequest, RelayState, Signature, an OAuth code, or an access token.
+
+# --- EZProxy ---------------------------------------------------------------
+# [institution]
+# access_type = "ezproxy"
+# id = "example-university"
+# name = "Example University"
+# ezproxy_login = "https://ezproxy.example.edu/login?url={url}"
+# ezproxy_hosts = ["ezproxy.example.edu"]
+# openurl = "https://resolver.example.edu/openurl?rft_id=info:doi/{doi}"
+# login_url_markers = ["ezproxy.example.edu"]
+
+# --- CARSI / SAML (experimental) ------------------------------------------
+[institution]
+access_type = "carsi_saml"
+id = "example-university"
+name = "Example University"
+login_url = "https://idp.example.edu/login"
+school_aliases = ["Example University", "示例大学"]
+entity_id = "https://idp.example.edu/idp/shibboleth"
+openurl = "https://resolver.example.edu/openurl?rft_id=info:doi/{doi}"
+login_url_markers = ["idp.example.edu", "shibboleth", "saml"]
+
+[institution.publisher_login_urls]
+ieee = "https://ieee.example.edu/official-login"
+sciencedirect = "https://sciencedirect.example.edu/official-login"
+
+# --- Manual browser session ------------------------------------------------
+# [institution]
+# access_type = "manual_browser"
+# id = "example-university"
+# name = "Example University"
+# login_url = "https://library.example.edu/off-campus-access"
+# openurl = "https://resolver.example.edu/openurl?rft_id=info:doi/{doi}"
+# login_url_markers = ["library.example.edu", "login.example.edu"]

@@ -17,12 +17,13 @@
 ### 我能帮你做什么
 
 - 使用 Crossref 核对 DOI、题名、作者与年份。
-- 通过 Unpaywall 获取开放正式版，并支持学校 EZProxy / OpenURL。
+- 通过 Unpaywall 获取开放正式版，并支持 EZProxy、CARSI / SAML、OpenURL 与手动浏览器会话。
 - 校验 PDF 身份、主文或补充材料及文件版本。
 - 可选使用 Tesseract OCR 辅助识别扫描件。
 - 使用 Zotero 本地 API 创建 collection、去重、写入题录并关联 PDF。
 - 从 Zotero 导出 EndNote 可导入的 RIS、XML 和 PDF 包。
-- 提供 PDF 重命名、批次 PDF 导出和 EndNote 附件整理工具。
+- 提供 PDF 重命名与逐篇勾选导出，支持批次、Zotero 和 EndNote 三种来源。
+- 将 EndNote 题录与 PDF 单向合并到指定 Zotero collection。
 - 粉蓝白响应式界面，包含新建任务、批次、工具和设置四个页面，当然要有一点猫娘审美！
 - 支持单个或多个批次预览、停止并删除及磁盘清理。
 - 设置项帮助收在旁边的 `?` 中，支持鼠标、键盘和 Escape。
@@ -73,11 +74,15 @@
 5. 获取完成后可自动或手动提交 Zotero。
 6. 在“工具”中导出 EndNote 导入包，或下载批次 CSV 报告。
 
-机构凭据只保存在 **Windows 凭据管理器**。我可以在可见登录页填入账号，但不会替你提交表单、处理 2FA 或绕过验证码；看到登录确认时，就轮到主人亲自出爪啦。
+可选保存的 EZProxy 凭据只进入 **Windows 凭据管理器**。CARSI 与手动模式的账号、密码、Cookie 和 SAML 数据由你在可见浏览器中处理，不写入程序配置。我不会替你提交表单、处理 2FA 或绕过验证码；看到登录确认时，就轮到主人亲自出爪啦。
 
 ### 投喂格式
 
-可以配合skill生成下面格式的txt/csv列表喵~
+可以使用仓库内的 [auto-paper-find-skill](skills/auto-paper-find-skill/SKILL.md)，把模糊论文清单、论文简称或研究要求整理为经过核实的 TXT/CSV。将 `skills/auto-paper-find-skill` 文件夹复制到 `$CODEX_HOME/skills`（未设置时为 `~/.codex/skills`）后，在支持 skills 的会话中调用，例如：
+
+> 使用 $auto-paper-find-skill，找近五年关于延迟容忍网络路由的 10 篇论文，生成本项目可导入的 CSV；不确定的论文单独列出。
+
+该 skill 会生成文件并调用项目输入解析器验证格式；默认不启动采集。也可以手动按下面格式准备列表喵~
 每行一个 DOI 或完整题名：
 
 ```text
@@ -96,7 +101,7 @@ doi,title,year,author
 ### 去哪里找论文
 
 设置页可配置开放获取、机构获取、OCR、机构档案和凭据。获取方式、OCR 与机构档案保存在
-`runtime/config.toml`；联系邮箱和 EndNote 路径保存在本地数据库，机构凭据保存在 Windows 凭据管理器qwq。
+`runtime/config.toml`；联系邮箱和 EndNote 路径保存在本地数据库，可选的 EZProxy 凭据保存在 Windows 凭据管理器qwq。
 
 例如：
 
@@ -113,16 +118,37 @@ languages = "eng"
 max_pages = 2
 
 [institution]
+access_type = "ezproxy"
 preset = "mcgill"
 ```
 
 允许的来源只有：
 
 - `open_access`：Unpaywall 开放正式版
-- `institution`：当前机构的 EZProxy / OpenURL
+- `institution`：当前机构的 EZProxy、CARSI / SAML、OpenURL 或手动浏览器会话
 
-内置 `mcgill` 与 `generic-ezproxy` 预设；通用预设需要改成自己的校园代理地址。
-全新配置会预置并显示 McGill 档案，但默认只启用开放获取，`auto_institution` 为关闭状态。
+内置 `mcgill` 与 `generic-ezproxy` 预设；通用预设需要改成自己的校园代理地址。设置页的访问方式可以选择 `ezproxy`、`carsi_saml` 或 `manual_browser`。CARSI 和手动模式填写学校图书馆提供的完整官方登录 URL；IdP entityID 只作为学校标识，不会被当作网址打开。不要粘贴登录过程中带 `SAMLRequest`、`RelayState`、签名或令牌的一次性地址，程序也会拒绝保存这类参数。CARSI 首版对 IEEE Xplore 和 ScienceDirect 提供登录引导，其他出版社可填写官方直达链接，或在可见 Chrome 中手动完成导航。
+
+CARSI 手动配置示例（示例域名不能用于实际登录）：
+
+```toml
+[institution]
+access_type = "carsi_saml"
+id = "example-university"
+name = "示例大学"
+login_url = "https://idp.example.edu/login"
+school_aliases = ["示例大学", "Example University"]
+entity_id = "https://idp.example.edu/idp/shibboleth"
+login_url_markers = ["idp.example.edu", "shibboleth", "saml"]
+
+[institution.publisher_login_urls]
+ieee = "https://ieee.example.edu/official-login"
+sciencedirect = "https://sciencedirect.example.edu/official-login"
+```
+
+出版社链接编辑框使用每行 `publisher=https://...` 的格式，只接受完整 URL。“打开登录页”让你完成账号、2FA 和授权；“测试访问”只检查已保存配置与登录状态，不下载 PDF。论文进入“需要机构操作”后，点击“继续机构访问”会沿用同一批次和浏览器会话，不会另建批次。
+可直接参考 [`examples/institution-config.example.toml`](examples/institution-config.example.toml) 中的 EZProxy、CARSI 和手动浏览器注释模板；请把示例域名换成学校图书馆提供的官方地址，文件中不应填写账号或密码。
+全新配置不会选择学校，默认只启用开放获取，`auto_institution` 为关闭状态。
 在设置页选择机构预设时，机构来源与自动机构获取会一并勾选；手写配置若保存了有效机构档案，
 而 `sources` 或 `auto_institution` 没有显式设置，对应缺省值也会启用机构获取。显式保存的开关
 始终优先，机构档案即使停用也会保留并显示。
@@ -161,6 +187,8 @@ GET  /api/batch-deletions/{operation_id}
 ### 把论文摆进 Zotero 与 EndNote
 
 Zotero 写入会优先使用 DOI 去重，并以规范化题名与年份补充判断。已有且身份匹配的主文 PDF 会复用，不覆盖附件或批注。
+
+“工具”页的 PDF 导出会先列出当前来源中的论文；默认勾选所有可用 PDF，也可以只保留需要的文章。EndNote → Zotero 同步会跳过 EndNote 垃圾箱中的题录，复用同样的去重规则，并按内容避免重复上传 PDF。当前安全同步期刊文章，其他 EndNote 题录类型会在结果中明确列为跳过。同步前请完全退出 EndNote。
 
 EndNote 不使用桌面鼠标或菜单自动化。在“工具”中从 Zotero 导出后，默认目录
 `Downloads\<库名>` 包含：
@@ -209,7 +237,7 @@ Text Translation: Unicode (UTF-8)
   --output outputs\test-batch-20-sample.json
 ```
 
-测试集定义在 `examples/test_batch_20.csv`。抽样器只读 EndNote 文件，先排除重复文件、补充材料和无法从首页可靠确认 DOI/题名的 PDF。生成的 manifest 只保存相对于 `--pdf-root` 的路径，不暴露本地库名。需要机构登录或真实网络访问的开发者验收脚本位于 `tests/`；请仅对获准内容使用小规模测试集。
+测试集定义在 `examples/test_batch_20.csv`。抽样器只读 EndNote 文件，先排除重复文件、补充材料和无法从首页可靠确认 DOI/题名的 PDF。生成的 manifest 只保存相对于 `--pdf-root` 的路径，不暴露本地库名。CARSI 与手动会话目前只完成本地模拟页面和自动化测试，**尚未进行真实高校账号、订阅资源或真实文献库写入验收**。需要机构登录或真实网络访问的开发者验收脚本位于 `tests/`；请仅对获准内容使用小规模测试集。
 
 当开放与机构来源都已启用、且自动机构获取已打开时，每篇论文的两条路径会同时开始。首个通过主文身份校验的正式版 PDF 获胜，另一条路径随即取消并清理；两路都失败才进入人工队列。为避免多个页面争用同一登录会话，机构浏览器操作仍保持串行。PDF 入口发现超过 180 秒会进入人工队列；一旦开始尝试下载，传输和 PDF 校验时间不计入该 180 秒。
 
@@ -230,6 +258,7 @@ Text Translation: Unicode (UTF-8)
 
 - Unpaywall 需要联系邮箱；未配置时仍会完成题录匹配。
 - 机构登录、2FA、验证码、403 和特殊阅读器需要人工处理。
+- CARSI 支持目前是实验性的；学校目录、WebVPN 改写和未适配出版社可能需要手动导航。
 - 未安装 Tesseract 时，扫描件不会被自动确认。
 - Zotero 本地 API 必须由用户启用并授权。
 - EndNote 导入需要用户完成；重复导入可能产生重复题录。
@@ -248,12 +277,13 @@ DOI、論文タイトル、または CSV を渡していただければ、書誌
 ### 猫娘にできること
 
 - Crossref による DOI、タイトル、著者、発行年の照合
-- Unpaywall のオープンアクセス版と、大学の EZProxy / OpenURL に対応
+- Unpaywall のオープンアクセス版と、EZProxy、CARSI / SAML、OpenURL、手動ブラウザーセッションに対応
 - PDF の論文一致、本文・補足資料、バージョンの確認
 - Tesseract OCR によるスキャン PDF の補助判定
 - Zotero ローカル API による collection 作成、重複排除、書誌・PDF 登録
 - Zotero から EndNote 用 RIS、XML、PDF パッケージを出力
-- PDF 名変更、PDF 出力、EndNote 添付ファイル整理
+- PDF 名変更と論文単位の選択出力（バッチ、Zotero、EndNote に対応）
+- EndNote の書誌と PDF を指定した Zotero collection へ一方向に統合
 - 猫娘らしいピンク・ブルー・ホワイトのレスポンシブ UI
 - 単一または複数バッチの選択、削除前確認、安全なディスク整理
 - マウス、キーボード、Escape に対応した `?` ヘルプ
@@ -306,7 +336,7 @@ DOI、論文タイトル、または CSV を渡していただければ、書誌
 5. 取得後、Zotero へ自動または手動で送信します。
 6. 「ツール」から EndNote パッケージや PDF を出力します。
 
-機関アカウントの資格情報は **Windows 資格情報マネージャー**だけに保存されます。ログイン画面への入力はできますが、送信、2FA、CAPTCHA 回避は行いません。その場面だけは、ご主人さま自身で確認してください、にゃ。
+保存を選んだ EZProxy の資格情報は **Windows 資格情報マネージャー**だけに入ります。CARSI と手動モードのアカウント、パスワード、Cookie、SAML データは表示中のブラウザーで扱い、設定ファイルには保存しません。フォーム送信、2FA、CAPTCHA 回避は行わないので、その場面だけはご主人さま自身で確認してください、にゃ。
 
 ### 論文の渡し方
 
@@ -327,7 +357,7 @@ doi,title,year,author
 
 ### 論文を探す場所と設定
 
-取得方法、OCR、機関プロファイルは `runtime/config.toml` に保存されます。連絡先メールと EndNote パスはローカルデータベース、機関の認証情報は Windows 資格情報マネージャーに保存されます。
+取得方法、OCR、機関プロファイルは `runtime/config.toml` に保存されます。連絡先メールと EndNote パスはローカルデータベース、任意で保存する EZProxy の資格情報は Windows 資格情報マネージャーに保存されます。
 
 ```toml
 [acquisition]
@@ -342,17 +372,37 @@ languages = "eng"
 max_pages = 2
 
 [institution]
+access_type = "ezproxy"
 preset = "mcgill"
 ```
 
 利用できる取得元は次の 2 つです。
 
 - `open_access`：Unpaywall のオープンアクセス版
-- `institution`：設定した EZProxy / OpenURL
+- `institution`：設定した EZProxy、CARSI / SAML、OpenURL、または手動ブラウザーセッション
 
-`mcgill` と `generic-ezproxy` のプリセットがあります。汎用プリセットでは所属機関の URL を設定してください。
-新規設定には McGill プロファイルがあらかじめ表示されますが、既定で有効なのはオープンアクセスだけで、
-`auto_institution` はオフです。設定画面で機関プリセットを選ぶと、機関ソースと自動機関取得もオンになります。
+`mcgill` と `generic-ezproxy` のプリセットがあります。汎用プリセットでは所属機関の URL を設定してください。設定画面では `ezproxy`、`carsi_saml`、`manual_browser` を選択できます。CARSI と手動モードには、大学図書館が案内する公式ログイン URL を完全な形で入力します。IdP entityID は大学の識別子としてだけ使用し、URL として直接開きません。ログイン途中の `SAMLRequest`、`RelayState`、署名、トークンを含む一時 URL は入力しないでください。このようなパラメーターは保存時にも拒否されます。CARSI の初期版は IEEE Xplore と ScienceDirect のログイン案内に対応し、それ以外の出版社では公式の直接リンクまたは表示中の Chrome での手動操作を利用します。
+
+CARSI の手動設定例です（例示ドメインでは実際にログインできません）。
+
+```toml
+[institution]
+access_type = "carsi_saml"
+id = "example-university"
+name = "Example University"
+login_url = "https://idp.example.edu/login"
+school_aliases = ["Example University", "示例大学"]
+entity_id = "https://idp.example.edu/idp/shibboleth"
+login_url_markers = ["idp.example.edu", "shibboleth", "saml"]
+
+[institution.publisher_login_urls]
+ieee = "https://ieee.example.edu/official-login"
+sciencedirect = "https://sciencedirect.example.edu/official-login"
+```
+
+出版社リンクの入力欄は 1 行ごとに `publisher=https://...` と記述し、完全な URL だけを受け付けます。「ログインページを開く」でアカウント、2FA、属性提供の確認を行い、「アクセスをテスト」は保存済みの設定とログイン状態だけを確認して PDF を取得しません。論文が機関操作待ちになった場合は「機関アクセスを続行」で同じバッチとブラウザーセッションを再利用します。
+EZProxy、CARSI、手動ブラウザーのコメント付きテンプレートは [`examples/institution-config.example.toml`](examples/institution-config.example.toml) にあります。例示ドメインを大学図書館の公式 URL に置き換え、アカウント名やパスワードは記入しないでください。
+新規設定では大学を選択せず、既定で有効なのはオープンアクセスだけで、`auto_institution` はオフです。設定画面で機関プリセットを選ぶと、機関ソースと自動機関取得もオンになります。
 手書きの設定に有効な機関プロファイルがあり、`sources` または `auto_institution` が省略されている場合も、
 省略した項目では機関取得が既定で有効になります。明示した値は常に優先され、無効化してもプロファイルは保持・表示されます。
 
@@ -388,6 +438,8 @@ GET  /api/batch-deletions/{operation_id}
 ### Zotero と EndNote へきれいに収納
 
 Zotero では DOI を優先して重複を判定し、必要に応じて正規化したタイトルと発行年も使います。既存の一致する本文 PDF は再利用し、添付ファイルや注釈を上書きしません。
+
+「ツール」の PDF 出力では、現在のデータ元にある論文を一覧表示します。利用可能な PDF は最初からすべて選択され、必要な論文だけに絞れます。EndNote → Zotero 同期は EndNote のゴミ箱を除外し、同じ重複判定で指定 collection に統合します。現在はジャーナル論文を安全に同期し、その他の EndNote レコード形式は結果でスキップ理由を表示します。同期前に EndNote を完全に終了してください、にゃ。
 
 EndNote の画面操作は自動化しません。「ツール」から出力した
 `Downloads\<ライブラリ名>` には次が含まれます。
@@ -429,7 +481,7 @@ Text Translation: Unicode (UTF-8)
   --output outputs\test-batch-20-sample.json
 ```
 
-標準の 20 件は `examples/test_batch_20.csv` です。サンプラーは EndNote ライブラリを変更せず、SHA-256 で重複を除外し、冒頭ページから DOI とタイトルを確認できる本文 PDF のみを採用します。manifest には `--pdf-root` からの相対パスのみを保存します。機関ログインや実ネットワークを使う開発者向け検証スクリプトは `tests/` にあります。購読コンテンツでは許可された少量のデータだけを使用してください。
+標準の 20 件は `examples/test_batch_20.csv` です。サンプラーは EndNote ライブラリを変更せず、SHA-256 で重複を除外し、冒頭ページから DOI とタイトルを確認できる本文 PDF のみを採用します。manifest には `--pdf-root` からの相対パスのみを保存します。CARSI と手動セッションはローカル模擬ページと自動テストまで完了していますが、**実際の大学アカウント、購読資料、実文献ライブラリへの書き込みでは未検証です**。機関ログインや実ネットワークを使う開発者向け検証スクリプトは `tests/` にあります。購読コンテンツでは許可された少量のデータだけを使用してください。
 
 オープンアクセスと機関ソースの両方を有効にし、自動機関取得もオンにした場合、各論文で 2 つの経路を同時に開始します。本文の同一性検証に最初に合格した正式版 PDF を採用して、もう一方を停止・清理します。両方が失敗した場合だけ手動キューへ移ります。同じログインセッションを複数ページが競合しないよう、機関ブラウザー操作自体は直列です。PDF 入口の検出が 180 秒を超えると手動キューへ移り、ダウンロード開始後の転送と PDF 検証はこの 180 秒に含まれません。
 
@@ -450,6 +502,7 @@ PDF を取得せず、合法なオープン候補だけを比較する場合は�
 
 - Unpaywall には連絡先メールが必要です。
 - 機関ログイン、2FA、CAPTCHA、403、特殊な PDF ビューアーには手作業が必要です。
+- CARSI 対応は実験段階です。大学ディレクトリ、WebVPN の URL 書き換え、未対応の出版社では手動操作が必要になる場合があります。
 - Tesseract がない場合、スキャン PDF は自動確定されません。
 - Zotero ローカル API はユーザーによる有効化と承認が必要です。
 - EndNote への取り込みは手動です。同じファイルを繰り返し取り込むと重複する場合があります。
@@ -469,12 +522,13 @@ Everything runs locally on Windows and listens only on `127.0.0.1` by default. T
 
 - Crossref metadata resolution for DOI, title, authors, and publication year
 - Open-access discovery through Unpaywall
-- Institutional access through configurable EZProxy and OpenURL profiles
+- Institutional access through configurable EZProxy, CARSI / SAML, OpenURL, and manual browser sessions
 - PDF identity, document-role, and version validation
 - Optional Tesseract OCR support for scanned PDFs
 - Zotero collection creation, deduplication, metadata writes, and PDF attachment upload
 - EndNote-compatible RIS, XML, and PDF export packages
-- PDF renaming and export tools for Zotero, local batches, and EndNote data
+- PDF renaming and per-paper export selection for Zotero, local batches, and EndNote data
+- One-way synchronization of EndNote records and PDFs into a selected Zotero collection
 - Catgirl-approved pink, blue, and white responsive interface with keyboard-accessible help
 - Single and multi-batch deletion with previews and safe disk cleanup
 
@@ -523,7 +577,7 @@ The database, downloaded files, configuration, Zotero authorization key, and ded
 5. Submit the completed batch to Zotero automatically or manually.
 6. Export an EndNote package or download the batch CSV report.
 
-Institutional credentials are stored only in **Windows Credential Manager**. I may fill a visible login form, but I will not submit it, handle 2FA, bypass CAPTCHA, or replay credentials invisibly. When that page appears, it is your turn to lend a paw.
+Optional saved EZProxy credentials go only to **Windows Credential Manager**. CARSI and manual-mode usernames, passwords, cookies, and SAML data stay in the visible browser and are not written to application configuration. I will not submit login forms, handle 2FA, bypass CAPTCHA, or replay credentials invisibly. When that page appears, it is your turn to lend a paw.
 
 ### How to feed me papers
 
@@ -544,7 +598,7 @@ doi,title,year,author
 
 ### Where papers are found
 
-Acquisition, OCR, and institutional-profile settings are stored in `runtime/config.toml`. Contact emails and the EndNote path are stored in the local database; institutional credentials stay in Windows Credential Manager.
+Acquisition, OCR, and institutional-profile settings are stored in `runtime/config.toml`. Contact emails and the EndNote path are stored in the local database; optional saved EZProxy credentials stay in Windows Credential Manager.
 
 ```toml
 [acquisition]
@@ -559,16 +613,37 @@ languages = "eng"
 max_pages = 2
 
 [institution]
+access_type = "ezproxy"
 preset = "mcgill"
 ```
 
 Supported acquisition sources are:
 
 - `open_access`: authorized open-access copies discovered through Unpaywall
-- `institution`: the configured institutional EZProxy or OpenURL resolver
+- `institution`: the configured EZProxy, CARSI / SAML, OpenURL, or manual browser session
 
-The repository includes `mcgill` and `generic-ezproxy` presets. Replace the URLs in the generic preset with those supplied by your institution.
-A fresh configuration displays the preloaded McGill profile, but enables only open access and keeps `auto_institution` off. Selecting an institutional preset in the settings form also enables the institutional source and automatic institutional retrieval. In a hand-written configuration with a valid institutional profile, omitted `sources` or `auto_institution` values default to institutional acquisition. Explicit values always win, and the profile remains stored and visible when institutional acquisition is disabled.
+The repository includes `mcgill` and `generic-ezproxy` presets. Replace the URLs in the generic preset with those supplied by your institution. The settings page offers `ezproxy`, `carsi_saml`, and `manual_browser`. CARSI and manual mode take the complete official login URL supplied by the university library. An IdP entityID is stored only as an institution identifier and is never opened as a URL. Do not paste a one-use URL containing `SAMLRequest`, `RelayState`, a signature, or a token from an in-progress login; the application also refuses to save those parameters. Initial CARSI support guides IEEE Xplore and ScienceDirect login; other publishers can use a configured official direct link or manual navigation in the visible Chrome window.
+
+Example manual CARSI configuration (the example domains cannot be used for a real login):
+
+```toml
+[institution]
+access_type = "carsi_saml"
+id = "example-university"
+name = "Example University"
+login_url = "https://idp.example.edu/login"
+school_aliases = ["Example University", "示例大学"]
+entity_id = "https://idp.example.edu/idp/shibboleth"
+login_url_markers = ["idp.example.edu", "shibboleth", "saml"]
+
+[institution.publisher_login_urls]
+ieee = "https://ieee.example.edu/official-login"
+sciencedirect = "https://sciencedirect.example.edu/official-login"
+```
+
+Enter publisher links as one `publisher=https://...` pair per line; only complete URLs are accepted. “Open login page” lets you complete credentials, 2FA, and attribute consent. “Test access” checks the saved configuration and current login state without downloading a PDF. When a paper needs institutional action, “Continue institutional access” reuses its current batch and browser session.
+See [`examples/institution-config.example.toml`](examples/institution-config.example.toml) for commented EZProxy, CARSI, and manual-browser templates. Replace the example domains with official URLs from your university library and do not put usernames or passwords in the file.
+A fresh configuration selects no institution, enables only open access, and keeps `auto_institution` off. Selecting an institutional preset in the settings form also enables the institutional source and automatic institutional retrieval. In a hand-written configuration with a valid institutional profile, omitted `sources` or `auto_institution` values default to institutional acquisition. Explicit values always win, and the profile remains stored and visible when institutional acquisition is disabled.
 
 ### Safe batch cleanup
 
@@ -604,6 +679,8 @@ GET  /api/batch-deletions/{operation_id}
 ### Neatly shelving papers in Zotero and EndNote
 
 Zotero records are deduplicated primarily by DOI, with normalized title and year as fallback signals. Existing matching primary PDFs are reused without overwriting attachments or annotations.
+
+The PDF export tool lists papers from the selected source and selects every available PDF by default; individual papers can be unchecked before copying. EndNote-to-Zotero sync excludes trashed EndNote records, applies the same deduplication rules, and avoids uploading duplicate PDF content. It currently syncs journal articles safely and reports other EndNote reference types as skipped. Close EndNote before starting a sync.
 
 The project does not automate EndNote desktop menus. An export created from the Tools page is written to `Downloads\<library-name>` by default and contains:
 
@@ -651,7 +728,7 @@ Build the reproducible 20-paper sample from read-only EndNote attachment storage
   --output outputs\test-batch-20-sample.json
 ```
 
-The canonical fixture is `examples/test_batch_20.csv`. The sampler deduplicates files by SHA-256 and accepts only main PDFs whose DOI and title can be confirmed from the opening pages. Its manifest stores only paths relative to `--pdf-root`, so the local library name is not exposed. Developer acceptance scripts that use institutional login or the live network remain under `tests/`; use only small, authorized datasets.
+The canonical fixture is `examples/test_batch_20.csv`. The sampler deduplicates files by SHA-256 and accepts only main PDFs whose DOI and title can be confirmed from the opening pages. Its manifest stores only paths relative to `--pdf-root`, so the local library name is not exposed. CARSI and manual sessions have been checked only with local simulated pages and automated tests; **they have not been validated with a real university account, subscription resource, or live reference-library write**. Developer acceptance scripts that use institutional login or the live network remain under `tests/`; use only small, authorized datasets.
 
 When both sources and automatic institutional retrieval are enabled, the open-access and institutional paths start concurrently for each paper. The first published-version main PDF to pass identity validation wins; the other path is cancelled and cleaned up. Only a double failure moves the paper to the manual queue. Institutional browser operations remain serialized so that pages do not compete for the same authenticated session. PDF-entry discovery is limited to 180 seconds; transfer and validation time stop counting once a download attempt starts.
 
@@ -672,6 +749,7 @@ Publisher flows are intentionally distinct. IEEE prefers proxied `stampPDF` / `i
 
 - Unpaywall requires a contact email; metadata resolution still works without it.
 - Institutional login, 2FA, CAPTCHA, HTTP 403 responses, and unfamiliar document viewers require user action.
+- CARSI support is experimental; institution directories, WebVPN rewriting, and unadapted publishers may require manual navigation.
 - Scanned PDFs are not automatically accepted when Tesseract is unavailable.
 - The Zotero local API must be enabled and authorized by the user.
 - EndNote import remains a user action; repeated imports may create duplicate records.

@@ -10,6 +10,9 @@ ROOT = Path(__file__).parents[1]
 class PaperActionMenuTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
+        cls.html = (ROOT / "paper_endnote" / "static" / "index.html").read_text(
+            encoding="utf-8"
+        )
         cls.javascript = (ROOT / "paper_endnote" / "static" / "app.js").read_text(
             encoding="utf-8"
         )
@@ -26,6 +29,61 @@ class PaperActionMenuTests(unittest.TestCase):
     def test_polling_preserves_an_open_paper_menu(self) -> None:
         self.assertIn("#task-detail .paper-more-actions[open]", self.javascript)
         self.assertIn(".paper-more-menu {", self.styles)
+
+    def test_institution_access_modes_have_dynamic_settings(self) -> None:
+        self.assertIn('id="institution-access-type"', self.html)
+        self.assertIn('value="ezproxy"', self.html)
+        self.assertIn('value="carsi_saml"', self.html)
+        self.assertIn('value="manual_browser"', self.html)
+        self.assertIn('id="carsi-experimental"', self.html)
+        self.assertIn('id="institution-publisher-login-urls"', self.html)
+        self.assertIn("syncInstitutionFields", self.javascript)
+
+    def test_institution_actions_use_resume_and_probe_endpoints(self) -> None:
+        self.assertIn('paper.needs_action === "manual_institution"', self.javascript)
+        self.assertIn('/continue-institution`', self.javascript)
+        self.assertIn('"/api/institution/test-access"', self.javascript)
+        self.assertIn(
+            'publisher_login_urls: accessType === "carsi_saml" ? parsePublisherLoginUrls',
+            self.javascript,
+        )
+        self.assertIn("{batch_id: batch.id}", self.javascript)
+
+    def test_pdf_export_has_a_selectable_candidate_picker(self) -> None:
+        self.assertIn('id="export-picker"', self.html)
+        self.assertIn('id="export-select-all"', self.html)
+        self.assertIn('id="export-selection-count"', self.html)
+        self.assertIn('id="export-items"', self.html)
+        self.assertIn('aria-label="选择要导出的论文"', self.html)
+        self.assertIn("function renderExportItems(items)", self.javascript)
+        self.assertIn("function selectedExportItemIds()", self.javascript)
+        self.assertIn('data-export-item value="${esc(item.id)}"', self.javascript)
+        self.assertIn('"/api/tools/export-pdfs/candidates"', self.javascript)
+        self.assertIn("item_ids: itemIds", self.javascript)
+
+    def test_pdf_export_ignores_stale_candidate_requests(self) -> None:
+        self.assertIn("exportRequestToken: 0", self.javascript)
+        self.assertIn("exportController: null", self.javascript)
+        self.assertIn("state.exportController?.abort()", self.javascript)
+        self.assertIn("const controller = new AbortController()", self.javascript)
+        self.assertIn("signal: controller.signal", self.javascript)
+        self.assertIn("token !== state.exportRequestToken", self.javascript)
+
+    def test_endnote_to_zotero_sync_form_uses_sync_endpoint(self) -> None:
+        self.assertIn('id="sync-endnote-zotero-form"', self.html)
+        self.assertIn("EndNote → Zotero", self.html)
+        self.assertIn('id="sync-endnote-library"', self.html)
+        self.assertIn('id="sync-zotero-collection"', self.html)
+        self.assertIn('id="sync-endnote-report"', self.html)
+        self.assertIn(
+            '$("#sync-endnote-zotero-form").addEventListener("submit"',
+            self.javascript,
+        )
+        self.assertIn('"/api/tools/sync-endnote-zotero"', self.javascript)
+        self.assertIn("body: JSON.stringify({collection})", self.javascript)
+        self.assertIn("其他题录类型会列为跳过", self.html)
+        self.assertIn('row.status === "skipped"', self.javascript)
+        self.assertIn("skippedDetails", self.javascript)
 
 
 if __name__ == "__main__":

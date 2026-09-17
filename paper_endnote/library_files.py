@@ -11,7 +11,13 @@ from typing import Any
 
 from .db import Database
 from .downloader import safe_filename
-from .endnote import EndNoteError, EndNoteExportRecord, build_endnote_export_package, export_filename
+from .endnote import (
+    EndNoteError,
+    EndNoteExportRecord,
+    build_endnote_export_package,
+    export_filename,
+    resolve_internal_attachment,
+)
 from .inputs import normalize_doi
 from .zotero import ZoteroAdapter, ZoteroError
 
@@ -62,6 +68,31 @@ def unique_destination(directory: Path, filename: str, *, ignore: Path | None = 
         if not candidate.exists() or (ignore_resolved and candidate.resolve() == ignore_resolved):
             return candidate
         index += 1
+
+
+def _reserve_unique_destination(directory: Path, filename: str) -> Path:
+    """Atomically reserve a new export path owned by the current operation."""
+
+    directory.mkdir(parents=True, exist_ok=True)
+    stem = Path(filename).stem
+    suffix = Path(filename).suffix or ".pdf"
+    index = 1
+    while True:
+        candidate = directory / (filename if index == 1 else f"{stem}_{index}{suffix}")
+        try:
+            descriptor = os.open(candidate, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o666)
+        except FileExistsError:
+            index += 1
+            continue
+        try:
+            os.close(descriptor)
+        except BaseException:
+            try:
+                candidate.unlink(missing_ok=True)
+            except OSError:
+                pass
+            raise
+        return candidate
 
 
 def downloads_library_dir(library_name: str) -> Path:
@@ -126,39 +157,119 @@ def copy_pdf_file(path: Path, destination_dir: Path, metadata: dict[str, Any] | 
     if not source.is_file():
         raise LibraryFilesError(f"PDF 不存在：{source}")
     filename = bibliographic_filename(metadata or {}, source.stem) if metadata else safe_filename(source.name)
-    destination = unique_destination(destination_dir, filename)
-    shutil.copy2(source, destination)
+    destination = _reserve_unique_destination(destination_dir, filename)
+    _copy_export_file(source, destination)
     return {"path": str(destination), "filename": destination.name, "source": str(source)}
 
 
-def export_endnote_data_pdfs(library: Path, destination_dir: Path) -> dict[str, Any]:
-    library = Path(library).expanduser()
-    if library.suffix.casefold() != ".enl":
-        raise LibraryFilesError("EndNote 库必须是 .enl 文件")
-    if not library.is_file():
-        raise LibraryFilesError(f"EndNote 库不存在：{library}")
+def _copy_export_file(source: Path, destination: Path) -> None:
+    """Copy one export file without leaving a partial destination on failure."""
+
+    try:
+        shutil.copy2(source, destination)
+    except BaseException:
+        try:
+            destination.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
+
+
+def _rollback_export_files(paths: list[Path]) -> None:
+    """Best-effort removal of files created by the current export attempt."""
+
+    for path in reversed(paths):
+        try:
+            path.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
+def _confined_endnote_pdf_files(pdf_root: Path) -> list[Path]:
+    """Return real PDFs whose resolved targets remain inside the EndNote PDF root."""
+
+    root = pdf_root.resolve()
+    files: list[Path] = []
+    seen: set[Path] = set()
+    for path in sorted(pdf_root.rglob("*.pdf")):
+        try:
+            resolved = path.resolve(strict=True)
+        except (OSError, RuntimeError):
+            continue
+        if (
+            not resolved.is_relative_to(root)
+            or resolved in seen
+            or not resolved.is_file()
+            or resolved.suffix.casefold() != ".pdf"
+        ):
+            continue
+        seen.add(resolved)
+        files.append(path)
+    return files
+
+
+def export_endnote_data_pdfs(
+    library: Path, destination_dir: Path, *, item_ids: set[str] | None = None
+) -> dict[str, Any]:
+    library = _validate_endnote_library(library)
+    if item_ids is not None and not item_ids:
+        raise LibraryFilesError("请至少选择一篇论文")
     pdf_root = library.with_suffix(".Data") / "PDF"
     if not pdf_root.is_dir():
         raise LibraryFilesError(f"没有 EndNote 数据区 PDF 目录：{pdf_root}")
+    if item_ids is not None:
+        item_map = _endnote_pdf_item_map(library)
+        unknown = item_ids - set(item_map)
+        if unknown:
+            raise LibraryFilesError("所选 EndNote 论文已变化，请刷新后重试")
+        copied: list[dict[str, Any]] = []
+        created_paths: list[Path] = []
+        skipped = 0
+        try:
+            for identifier in sorted(item_ids):
+                metadata, paths = item_map[identifier]
+                existing = [Path(path) for path in paths if Path(path).is_file()]
+                if not existing:
+                    skipped += 1
+                    continue
+                for path in existing:
+                    result = copy_pdf_file(path, destination_dir, metadata)
+                    created_paths.append(Path(result["path"]))
+                    copied.append({"item_id": identifier, **result})
+        except BaseException:
+            _rollback_export_files(created_paths)
+            raise
+        return {
+            "copied": len(copied),
+            "skipped": skipped,
+            "selected": len(item_ids),
+            "destination": str(destination_dir),
+            "source": str(pdf_root),
+            "files": copied,
+        }
     metadata_by_file = _endnote_pdf_metadata(library)
     copied: list[dict[str, Any]] = []
+    created_paths: list[Path] = []
     skipped = 0
-    for file in sorted(pdf_root.rglob("*.pdf")):
-        if not file.is_file():
-            skipped += 1
-            continue
-        metadata = metadata_by_file.get(file.resolve())
-        if metadata:
-            result = copy_pdf_file(file, destination_dir, metadata)
-        else:
-            name = safe_filename(f"{file.parent.name}_{file.name}")
-            destination = unique_destination(destination_dir, name)
-            shutil.copy2(file, destination)
-            result = {"filename": destination.name, "source": str(file), "path": str(destination)}
-        copied.append(result)
+    try:
+        for file in _confined_endnote_pdf_files(pdf_root):
+            metadata = metadata_by_file.get(file.resolve())
+            if metadata:
+                result = copy_pdf_file(file, destination_dir, metadata)
+            else:
+                name = safe_filename(f"{file.parent.name}_{file.name}")
+                destination = _reserve_unique_destination(destination_dir, name)
+                _copy_export_file(file, destination)
+                result = {"filename": destination.name, "source": str(file), "path": str(destination)}
+            created_paths.append(Path(result["path"]))
+            copied.append(result)
+    except BaseException:
+        _rollback_export_files(created_paths)
+        raise
     return {
         "copied": len(copied),
         "skipped": skipped,
+        "selected": None,
         "destination": str(destination_dir),
         "source": str(pdf_root),
         "files": copied,
@@ -196,12 +307,38 @@ def _split_endnote_authors(value: str) -> list[str]:
 
 def _metadata_from_endnote_ref(row: sqlite3.Row | dict[str, Any]) -> dict[str, Any]:
     data = dict(row)
+    year_text = str(data.get("year") or "")
+    year_match = re.search(r"\b(?:18|19|20|21)\d{2}\b", year_text)
+    tags = [
+        part.strip()
+        for part in re.split(r"[\r\n]+|//|;", str(data.get("keywords") or ""))
+        if part.strip()
+    ]
+    raw_reference_type = data.get("reference_type")
+    try:
+        reference_type = int(raw_reference_type) if raw_reference_type is not None else None
+    except (TypeError, ValueError):
+        reference_type = None
     return {
         "authors": _split_endnote_authors(str(data.get("author") or "")),
         "title": data.get("title") or "",
-        "year": data.get("year"),
-        "doi": data.get("electronic_resource_number"),
+        "year": int(year_match.group(0)) if year_match else None,
+        "doi": normalize_doi(data.get("electronic_resource_number")),
         "journal": data.get("secondary_title") or "",
+        "volume": data.get("volume") or "",
+        "issue": data.get("number") or "",
+        "pages": data.get("pages") or "",
+        "url": data.get("url") or "",
+        "abstract": data.get("abstract") or "",
+        "short_title": data.get("short_title") or "",
+        "language": data.get("language") or "",
+        "access_date": data.get("access_date") or "",
+        "tags": tags,
+        "publisher": data.get("publisher") or "",
+        "isbn": data.get("isbn") or "",
+        "endnote_reference_type": reference_type,
+        "item_type": "journalArticle" if reference_type == 0 else None,
+        "library_catalog": "EndNote",
     }
 
 
@@ -229,11 +366,172 @@ def _connect_endnote_db(path: Path, *, writable: bool) -> sqlite3.Connection:
     return connection
 
 
+def _validate_endnote_library(library: Path) -> Path:
+    library = Path(library).expanduser()
+    if library.suffix.casefold() != ".enl":
+        raise LibraryFilesError("EndNote 库必须是 .enl 文件")
+    if not library.is_file():
+        raise LibraryFilesError(f"EndNote 库不存在：{library}")
+    return library
+
+
+def _resolve_endnote_pdf(library: Path, stored_path: str) -> Path | None:
+    stored = str(stored_path or "").strip().replace("\\", "/")
+    if not stored:
+        return None
+    pdf_root = library.with_suffix(".Data") / "PDF"
+    confined_to_pdf_root = stored.casefold().startswith("internal-pdf://")
+    candidate = resolve_internal_attachment(library, stored)
+    if (
+        candidate is None
+        and not stored.casefold().startswith("file:")
+        and not re.match(r"^[A-Za-z]:/", stored)
+    ):
+        relative = Path(stored.replace("/", os.sep))
+        if not relative.is_absolute():
+            candidate = pdf_root / relative
+            confined_to_pdf_root = True
+    if candidate:
+        candidate = candidate.expanduser().resolve()
+        if confined_to_pdf_root:
+            root = pdf_root.resolve()
+            if not candidate.is_relative_to(root):
+                candidate = None
+        if candidate and candidate.is_file() and candidate.suffix.casefold() == ".pdf":
+            return candidate
+    return None
+
+
+def read_endnote_library_records(library: Path) -> list[dict[str, Any]]:
+    """Read active EndNote references and their PDF attachments without modifying the library."""
+
+    library = _validate_endnote_library(library)
+    sdb = _endnote_sdb(library)
+    connection = _connect_endnote_db(sdb, writable=False)
+    wanted = (
+        "id",
+        "trash_state",
+        "reference_type",
+        "author",
+        "year",
+        "title",
+        "pages",
+        "secondary_title",
+        "volume",
+        "number",
+        "url",
+        "abstract",
+        "keywords",
+        "short_title",
+        "language",
+        "access_date",
+        "publisher",
+        "isbn",
+        "electronic_resource_number",
+    )
+    try:
+        ref_columns = {str(row[1]) for row in connection.execute("PRAGMA table_info(refs)")}
+        if "id" not in ref_columns:
+            raise LibraryFilesError("EndNote 数据库缺少题录 ID")
+        expressions = [
+            f'"{name}" AS "{name}"' if name in ref_columns else f'NULL AS "{name}"'
+            for name in wanted
+        ]
+        where = "WHERE COALESCE(trash_state, 0)=0" if "trash_state" in ref_columns else ""
+        refs = connection.execute(
+            f"SELECT {', '.join(expressions)} FROM refs {where} ORDER BY id"
+        ).fetchall()
+        file_columns = {str(row[1]) for row in connection.execute("PRAGMA table_info(file_res)")}
+        files = []
+        if {"refs_id", "file_path"}.issubset(file_columns):
+            files = connection.execute(
+                "SELECT refs_id, file_path FROM file_res ORDER BY refs_id, file_pos"
+                if "file_pos" in file_columns
+                else "SELECT refs_id, file_path FROM file_res ORDER BY refs_id"
+            ).fetchall()
+    except sqlite3.DatabaseError as exc:
+        raise LibraryFilesError(f"读取 EndNote 数据库失败：{exc}") from exc
+    finally:
+        connection.close()
+
+    attachments: dict[str, list[Path]] = {}
+    for row in files:
+        ref_id = str(row["refs_id"])
+        path = _resolve_endnote_pdf(library, str(row["file_path"] or ""))
+        if path and path not in attachments.setdefault(ref_id, []):
+            attachments[ref_id].append(path)
+
+    records: list[dict[str, Any]] = []
+    for row in refs:
+        ref_id = str(row["id"])
+        records.append(
+            {
+                "id": f"ref:{ref_id}",
+                "ref_id": ref_id,
+                "metadata": _metadata_from_endnote_ref(row),
+                "pdf_paths": attachments.get(ref_id, []),
+            }
+        )
+    return records
+
+
+def _pdf_item(identifier: str, metadata: dict[str, Any], paths: list[Path]) -> dict[str, Any]:
+    existing = [Path(path) for path in paths if Path(path).is_file()]
+    authors = metadata.get("authors") or []
+    return {
+        "id": identifier,
+        "title": metadata.get("title") or (existing[0].stem if existing else "未命名论文"),
+        "authors": authors,
+        "author": authors[0] if authors else "",
+        "year": metadata.get("year"),
+        "doi": normalize_doi(metadata.get("doi")),
+        "available": bool(existing),
+        "file_count": len(existing),
+        "size": sum(path.stat().st_size for path in existing),
+        "filename": existing[0].name if existing else "",
+    }
+
+
+def _endnote_pdf_item_map(
+    library: Path,
+) -> dict[str, tuple[dict[str, Any], list[Path]]]:
+    library = _validate_endnote_library(library)
+    records: list[dict[str, Any]] = []
+    try:
+        records = read_endnote_library_records(library)
+    except LibraryFilesError:
+        if _endnote_sdb(library).is_file():
+            raise
+    item_map: dict[str, tuple[dict[str, Any], list[Path]]] = {
+        record["id"]: (record["metadata"], record["pdf_paths"])
+        for record in records
+    }
+    known = {Path(path).resolve() for record in records for path in record["pdf_paths"]}
+    pdf_root = library.with_suffix(".Data") / "PDF"
+    if not pdf_root.is_dir():
+        raise LibraryFilesError(f"没有 EndNote 数据区 PDF 目录：{pdf_root}")
+    for path in _confined_endnote_pdf_files(pdf_root):
+        resolved = path.resolve()
+        if resolved in known:
+            continue
+        relative = path.relative_to(pdf_root).as_posix()
+        item_map[f"file:{relative}"] = ({"title": path.stem}, [path])
+    return item_map
+
+
+def list_endnote_pdf_items(library: Path) -> list[dict[str, Any]]:
+    return [
+        _pdf_item(identifier, metadata, paths)
+        for identifier, (metadata, paths) in _endnote_pdf_item_map(library).items()
+    ]
+
+
 def _endnote_pdf_metadata(library: Path) -> dict[Path, dict[str, Any]]:
     sdb = _endnote_sdb(library)
     if not sdb.is_file():
         return {}
     pdf_root = Path(library).with_suffix(".Data") / "PDF"
+    pdf_files = _confined_endnote_pdf_files(pdf_root) if pdf_root.is_dir() else []
     mapping: dict[Path, dict[str, Any]] = {}
     connection = _connect_endnote_db(sdb, writable=False)
     try:
@@ -258,7 +556,7 @@ def _endnote_pdf_metadata(library: Path) -> dict[Path, dict[str, Any]]:
         if folder and name:
             candidates.append(pdf_root / folder / name)
         if name:
-            candidates.extend(pdf_root.rglob(name))
+            candidates.extend(path for path in pdf_files if path.name == name)
         metadata = _metadata_from_endnote_ref(row)
         for candidate in candidates:
             if candidate.is_file():
@@ -378,24 +676,66 @@ def rename_batch_pdfs(database: Database, batch_id: str) -> dict[str, Any]:
     return {"renamed": renamed, "skipped": skipped, "files": files, "source": batch["name"]}
 
 
-def export_batch_pdfs(database: Database, batch_id: str, destination: Path) -> dict[str, Any]:
+def list_batch_pdf_items(database: Database, batch_id: str) -> list[dict[str, Any]]:
     batch = database.get_batch(batch_id)
     if not batch:
         raise LibraryFilesError("批次不存在")
+    items = []
+    for paper in batch["papers"]:
+        path = Path(paper["pdf_path"]) if paper.get("pdf_path") else None
+        available = bool(
+            path
+            and paper.get("pdf_status") in {"verified", "accepted"}
+            and path.is_file()
+        )
+        items.append(
+            _pdf_item(
+                paper["id"],
+                paper_metadata(paper),
+                [path] if available and path else [],
+            )
+        )
+    return items
+
+
+def export_batch_pdfs(
+    database: Database,
+    batch_id: str,
+    destination: Path,
+    *,
+    item_ids: set[str] | None = None,
+) -> dict[str, Any]:
+    batch = database.get_batch(batch_id)
+    if not batch:
+        raise LibraryFilesError("批次不存在")
+    if item_ids is not None and not item_ids:
+        raise LibraryFilesError("请至少选择一篇论文")
+    known_ids = {paper["id"] for paper in batch["papers"]}
+    if item_ids is not None and item_ids - known_ids:
+        raise LibraryFilesError("所选批次论文已变化，请刷新后重试")
     copied = 0
     skipped = 0
     files: list[dict[str, Any]] = []
-    for paper in batch["papers"]:
-        path = paper.get("pdf_path")
-        if not path or paper.get("pdf_status") not in {"verified", "accepted"} or not Path(path).is_file():
-            skipped += 1
-            continue
-        result = copy_pdf_file(Path(path), destination, paper_metadata(paper))
-        copied += 1
-        files.append({"paper_id": paper["id"], **result})
+    created_paths: list[Path] = []
+    try:
+        for paper in batch["papers"]:
+            if item_ids is not None and paper["id"] not in item_ids:
+                continue
+            path = paper.get("pdf_path")
+            if not path or paper.get("pdf_status") not in {"verified", "accepted"} or not Path(path).is_file():
+                skipped += 1
+                continue
+            result = copy_pdf_file(Path(path), destination, paper_metadata(paper))
+            created_paths.append(Path(result["path"]))
+            copied += 1
+            files.append({"paper_id": paper["id"], **result})
+    except BaseException:
+        _rollback_export_files(created_paths)
+        raise
     return {
         "copied": copied,
         "skipped": skipped,
+        "selected": len(item_ids) if item_ids is not None else None,
         "files": files,
         "destination": str(destination),
         "source": batch["name"],
@@ -427,23 +767,67 @@ async def rename_zotero_pdfs(zotero: ZoteroAdapter, collection: str) -> dict[str
     return {"renamed": renamed, "skipped": skipped, "files": files, "source": collection}
 
 
-async def export_zotero_pdfs(zotero: ZoteroAdapter, collection: str, destination: Path) -> dict[str, Any]:
+async def list_zotero_pdf_items(zotero: ZoteroAdapter, collection: str) -> list[dict[str, Any]]:
+    items: list[dict[str, Any]] = []
+    async for item in zotero.iter_collection_items(collection):
+        data = item.get("data", item)
+        if str(data.get("itemType") or "") in {"attachment", "note", "annotation"}:
+            continue
+        key = data.get("key") or item.get("key")
+        if not key:
+            continue
+        row = await zotero.export_row(key)
+        path = Path(row["pdf_path"]) if row.get("pdf_path") else None
+        items.append(_pdf_item(key, row.get("metadata") or {}, [path] if path else []))
+    return items
+
+
+async def export_zotero_pdfs(
+    zotero: ZoteroAdapter,
+    collection: str,
+    destination: Path,
+    *,
+    item_ids: set[str] | None = None,
+) -> dict[str, Any]:
+    if item_ids is not None and not item_ids:
+        raise LibraryFilesError("请至少选择一篇论文")
     copied = 0
     skipped = 0
     files: list[dict[str, Any]] = []
+    known_ids: set[str] = set()
+    source_items: list[tuple[str, dict[str, Any]]] = []
     async for item in zotero.iter_collection_items(collection):
-        key = item.get("data", item).get("key") or item.get("key")
-        row = await zotero.export_row(key)
-        path = row.get("pdf_path")
-        if not path:
-            skipped += 1
+        data = item.get("data", item)
+        if str(data.get("itemType") or "") in {"attachment", "note", "annotation"}:
             continue
-        result = copy_pdf_file(Path(path), destination, row["metadata"])
-        copied += 1
-        files.append({"zotero_key": key, **result})
+        key = data.get("key") or item.get("key")
+        if not key:
+            continue
+        known_ids.add(key)
+        source_items.append((key, item))
+    if item_ids is not None and item_ids - known_ids:
+        raise LibraryFilesError("所选 Zotero 论文已变化，请刷新后重试")
+    created_paths: list[Path] = []
+    try:
+        for key, _item in source_items:
+            if item_ids is not None and key not in item_ids:
+                continue
+            row = await zotero.export_row(key)
+            path = row.get("pdf_path")
+            if not path:
+                skipped += 1
+                continue
+            result = copy_pdf_file(Path(path), destination, row["metadata"])
+            created_paths.append(Path(result["path"]))
+            copied += 1
+            files.append({"zotero_key": key, **result})
+    except BaseException:
+        _rollback_export_files(created_paths)
+        raise
     return {
         "copied": copied,
         "skipped": skipped,
+        "selected": len(item_ids) if item_ids is not None else None,
         "files": files,
         "destination": str(destination),
         "source": collection,
@@ -491,3 +875,96 @@ async def export_zotero_endnote_package(
     except EndNoteError as exc:
         raise LibraryFilesError(str(exc)) from exc
     return {**manifest, "destination": str(destination), "source": collection}
+
+
+async def sync_endnote_to_zotero(
+    zotero: ZoteroAdapter, library: Path, collection: str
+) -> dict[str, Any]:
+    """Copy active EndNote references into one Zotero collection with exact-match deduplication."""
+
+    collection = str(collection or "").strip()
+    if not collection:
+        raise LibraryFilesError("请填写目标 Zotero collection")
+    if endnote_desktop_running():
+        raise LibraryFilesError("请先完全退出 EndNote，再同步到 Zotero")
+    records = read_endnote_library_records(library)
+    if not records:
+        raise LibraryFilesError("EndNote 库中没有可同步的题录")
+    try:
+        collection_key = await zotero.ensure_collection(collection, create=True)
+    except ZoteroError as exc:
+        raise LibraryFilesError(str(exc)) from exc
+
+    created = 0
+    matched = 0
+    synced = 0
+    skipped = 0
+    failed = 0
+    pdf_attached = 0
+    pdf_existing = 0
+    errors: list[dict[str, str]] = []
+    rows: list[dict[str, Any]] = []
+    for record in records:
+        metadata = record["metadata"]
+        title = str(metadata.get("title") or "").strip()
+        doi = normalize_doi(metadata.get("doi"))
+        if not metadata.get("item_type"):
+            skipped += 1
+            reference_type = metadata.get("endnote_reference_type")
+            reference_label = str(reference_type) if reference_type is not None else "未知"
+            rows.append(
+                {
+                    "id": record["id"],
+                    "status": "skipped",
+                    "title": title,
+                    "error": f"暂不支持的 EndNote 题录类型：{reference_label}",
+                }
+            )
+            continue
+        if not title and not doi:
+            skipped += 1
+            rows.append({"id": record["id"], "status": "skipped", "title": ""})
+            continue
+        pdf_paths = [Path(path) for path in record["pdf_paths"] if Path(path).is_file()]
+        try:
+            result = await zotero.commit_paper(
+                collection_key,
+                metadata,
+                None,
+            )
+            created += int(bool(result.get("created")))
+            matched += int(not bool(result.get("created")))
+            for path in pdf_paths:
+                attachment = await zotero.attach_pdf(result["record_number"], path)
+                pdf_attached += int(bool(attachment.get("attached")))
+                pdf_existing += int(bool(attachment.get("existing")))
+            synced += 1
+            rows.append(
+                {
+                    "id": record["id"],
+                    "status": "synced",
+                    "title": title,
+                    "zotero_key": result["record_number"],
+                    "pdf_count": len(pdf_paths),
+                }
+            )
+        except Exception as exc:
+            failed += 1
+            message = str(exc)
+            errors.append({"id": record["id"], "title": title or doi or record["id"], "error": message})
+            rows.append({"id": record["id"], "status": "failed", "title": title, "error": message})
+    return {
+        "source": str(Path(library)),
+        "collection": collection,
+        "collection_key": collection_key,
+        "record_count": len(records),
+        "synced": synced,
+        "created": created,
+        "matched": matched,
+        "skipped": skipped,
+        "failed": failed,
+        "pdf_attached": pdf_attached,
+        "pdf_existing": pdf_existing,
+        "errors": errors,
+        "records": rows,
+    }

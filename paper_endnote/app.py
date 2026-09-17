@@ -27,6 +27,7 @@ from .deletion import BatchDeletionManager
 from .endnote import probe_endnote
 from .inputs import parse_input
 from .inputs import normalize_doi
+from .institution_access import NeedsManualInstitutionAction, profile_access_type
 from .library_files import (
     LibraryFilesError,
     downloads_library_dir,
@@ -34,11 +35,16 @@ from .library_files import (
     export_endnote_data_pdfs,
     export_zotero_endnote_package,
     export_zotero_pdfs,
+    list_batch_pdf_items,
+    list_endnote_pdf_items,
+    list_zotero_pdf_items,
     rename_batch_pdfs,
     rename_endnote_pdfs,
     rename_zotero_pdfs,
     resolve_export_dir,
+    sync_endnote_to_zotero,
 )
+from .redaction import redact_diagnostic_text
 from .ocr import ocr_status
 from .pipeline import PipelineManager
 from .reporting import batch_csv
@@ -46,6 +52,7 @@ from .user_config import (
     ALLOWED_SOURCES,
     ConfigError,
     DEFAULT_SOURCES,
+    INSTITUTION_ACCESS_TYPES,
     OcrOptions,
     institution_from_payload,
     list_presets,
@@ -127,11 +134,22 @@ class PDFConfirm(BaseModel):
 class InstitutionUpdate(BaseModel):
     id: str = ""
     name: str = ""
+    access_type: str = Field(default="ezproxy", pattern="^(ezproxy|carsi_saml|manual_browser)$")
+    login_url: str = ""
+    login_url_markers: list[str] = Field(default_factory=list)
+    openurl: str = ""
     ezproxy_login: str = ""
     ezproxy_hosts: list[str] = Field(default_factory=list)
-    openurl: str = ""
-    login_url_markers: list[str] = Field(default_factory=list)
+    school_aliases: list[str] = Field(default_factory=list)
+    entity_id: str = ""
+    publisher_login_urls: dict[str, str] = Field(default_factory=dict)
     preset: str = ""
+
+
+class InstitutionContext(BaseModel):
+    publisher: str = ""
+    target_url: str = ""
+    batch_id: str = ""
 
 
 class SettingsUpdate(BaseModel):
@@ -160,12 +178,17 @@ class LibraryToolRequest(BaseModel):
     collection: str = ""
     destination: str = ""
     open_folder: bool = False
+    item_ids: list[str] | None = Field(default=None, max_length=10000)
 
 
 class EndNoteExportToolRequest(BaseModel):
     collection: str = ""
     destination: str = ""
     open_folder: bool = False
+
+
+class EndNoteZoteroSyncRequest(BaseModel):
+    collection: str = Field(min_length=1, max_length=120)
 
 
 class BatchDeleteRequest(BaseModel):
@@ -186,6 +209,8 @@ async def state() -> dict[str, Any]:
         "endnote": probe_endnote(settings.endnote_exe, settings.endnote_library),
         "zotero": await pipeline.zotero.probe(),
         "ocr": ocr_status(),
+        "institution_access_types": list(INSTITUTION_ACCESS_TYPES),
+        "institution_sessions": pipeline.institution_session_states(),
         "presets": [profile.as_dict() for profile in list_presets().values()],
         "credentials": credential_status(settings.institution.id),
         "settings": {
@@ -232,14 +257,8 @@ async def update_settings(payload: SettingsUpdate) -> dict[str, str]:
         "login_wait_seconds",
     }
     try:
-        institution_specified = bool(
-            ("institution_preset" in provided and payload.institution_preset)
-            or ("institution" in provided and payload.institution)
-        )
-        sources = (
-            normalize_sources(payload.acquisition_sources)
-            if "acquisition_sources" in provided
-            else ALLOWED_SOURCES if institution_specified else settings.acquisition_sources
+        institution_touched = bool(
+            "institution_preset" in provided or "institution" in provided
         )
         if "institution_preset" in provided and payload.institution_preset:
             institution = load_preset(payload.institution_preset)
@@ -247,9 +266,48 @@ async def update_settings(payload: SettingsUpdate) -> dict[str, str]:
             institution_data = settings.institution.as_dict()
             for field_name in payload.institution.model_fields_set:
                 institution_data[field_name] = getattr(payload.institution, field_name)
+            if (
+                "access_type" in payload.institution.model_fields_set
+                and payload.institution.access_type != "ezproxy"
+            ):
+                if "ezproxy_login" not in payload.institution.model_fields_set:
+                    institution_data["ezproxy_login"] = ""
+                if "ezproxy_hosts" not in payload.institution.model_fields_set:
+                    institution_data["ezproxy_hosts"] = []
+            if (
+                "access_type" in payload.institution.model_fields_set
+                and payload.institution.access_type != "carsi_saml"
+            ):
+                if "school_aliases" not in payload.institution.model_fields_set:
+                    institution_data["school_aliases"] = []
+                if "entity_id" not in payload.institution.model_fields_set:
+                    institution_data["entity_id"] = ""
+                if "publisher_login_urls" not in payload.institution.model_fields_set:
+                    institution_data["publisher_login_urls"] = {}
             institution = institution_from_payload(institution_data)
         else:
             institution = settings.institution
+        institution_specified = bool(institution.id)
+        sources = (
+            normalize_sources(payload.acquisition_sources)
+            if "acquisition_sources" in provided
+            else (
+                ALLOWED_SOURCES if institution_specified else DEFAULT_SOURCES
+            )
+            if institution_touched
+            else settings.acquisition_sources
+        )
+        auto_institution = (
+            payload.auto_institution
+            if "auto_institution" in provided
+            else institution_specified
+            if institution_touched
+            else settings.auto_institution
+        )
+        if not institution_specified and (
+            "institution" in sources or auto_institution
+        ):
+            raise ConfigError("启用机构获取前，请先填写机构 ID 和访问方式")
         ocr_languages = settings.ocr.languages
         if "ocr_languages" in provided:
             ocr_languages = payload.ocr_languages.strip() or "eng"
@@ -265,10 +323,7 @@ async def update_settings(payload: SettingsUpdate) -> dict[str, str]:
             settings.ocr = ocr
             settings.acquisition_sources = sources
             settings.institution = institution
-            if "auto_institution" in provided:
-                settings.auto_institution = payload.auto_institution
-            elif institution_specified:
-                settings.auto_institution = True
+            settings.auto_institution = auto_institution
             if "auto_commit" in provided:
                 settings.auto_commit = payload.auto_commit
             if "login_wait_seconds" in provided:
@@ -293,6 +348,10 @@ async def update_settings(payload: SettingsUpdate) -> dict[str, str]:
 
 @app.post("/api/credentials")
 async def update_credentials(payload: CredentialsUpdate) -> dict[str, Any]:
+    if not settings.institution.id:
+        raise HTTPException(400, "请先保存机构配置")
+    if profile_access_type(settings.institution) != "ezproxy":
+        raise HTTPException(400, "CARSI 和手动模式不会保存账号或密码")
     try:
         save_credentials(settings.institution.id, payload.username, payload.password)
     except CredentialError as exc:
@@ -355,6 +414,56 @@ async def tool_rename_pdfs(payload: LibraryToolRequest) -> dict[str, Any]:
         raise LibraryFilesError("未知数据区")
     except LibraryFilesError as exc:
         raise HTTPException(400, str(exc)) from exc
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(409, str(exc)) from exc
+
+
+def selected_tool_item_ids(payload: LibraryToolRequest) -> set[str] | None:
+    if payload.item_ids is None:
+        return None
+    normalized = {str(item).strip() for item in payload.item_ids if str(item).strip()}
+    if not normalized:
+        raise LibraryFilesError("请至少选择一篇论文")
+    return normalized
+
+
+@app.post("/api/tools/export-pdfs/candidates")
+async def tool_export_pdf_candidates(payload: LibraryToolRequest) -> dict[str, Any]:
+    try:
+        if payload.source == "batch":
+            batch_id = payload.batch_id.strip()
+            if not batch_id:
+                raise LibraryFilesError("请选择本机批次")
+            batch = require_batch(batch_id)
+            items = list_batch_pdf_items(database, batch_id)
+            source_name = batch["name"]
+        elif payload.source == "zotero":
+            collection = payload.collection.strip()
+            if not collection:
+                raise LibraryFilesError("请选择 Zotero collection")
+            items = await list_zotero_pdf_items(pipeline.zotero, collection)
+            source_name = collection
+        elif payload.source == "endnote":
+            library = settings.endnote_library
+            if not library:
+                raise LibraryFilesError("请先在设置中填写 EndNote 库路径")
+            items = list_endnote_pdf_items(library)
+            source_name = library.stem
+        else:
+            raise LibraryFilesError("未知数据区")
+        return {
+            "source": payload.source,
+            "source_name": source_name,
+            "items": items,
+            "available_count": sum(1 for item in items if item["available"]),
+            "available_size": sum(int(item["size"]) for item in items if item["available"]),
+        }
+    except LibraryFilesError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    except HTTPException:
+        raise
     except Exception as exc:
         raise HTTPException(409, str(exc)) from exc
 
@@ -362,6 +471,7 @@ async def tool_rename_pdfs(payload: LibraryToolRequest) -> dict[str, Any]:
 @app.post("/api/tools/export-pdfs")
 async def tool_export_pdfs(payload: LibraryToolRequest) -> dict[str, Any]:
     try:
+        item_ids = selected_tool_item_ids(payload)
         if payload.source == "batch":
             if not payload.batch_id.strip():
                 raise LibraryFilesError("请选择本机批次")
@@ -370,7 +480,7 @@ async def tool_export_pdfs(payload: LibraryToolRequest) -> dict[str, Any]:
             lib_name = batch["target_library"]
             destination = resolve_export_dir(payload.destination) if payload.destination.strip() else downloads_library_dir(lib_name)
             async with pipeline.track_batch_work(batch_id, cancellable=False):
-                result = export_batch_pdfs(database, batch_id, destination)
+                result = export_batch_pdfs(database, batch_id, destination, item_ids=item_ids)
         elif payload.source == "zotero":
             if not payload.collection.strip():
                 raise LibraryFilesError("请选择 Zotero collection")
@@ -379,7 +489,9 @@ async def tool_export_pdfs(payload: LibraryToolRequest) -> dict[str, Any]:
                 if payload.destination.strip()
                 else downloads_library_dir(payload.collection.strip())
             )
-            result = await export_zotero_pdfs(pipeline.zotero, payload.collection.strip(), destination)
+            result = await export_zotero_pdfs(
+                pipeline.zotero, payload.collection.strip(), destination, item_ids=item_ids
+            )
         elif payload.source == "endnote":
             library = settings.endnote_library
             if not library:
@@ -389,7 +501,7 @@ async def tool_export_pdfs(payload: LibraryToolRequest) -> dict[str, Any]:
                 if payload.destination.strip()
                 else downloads_library_dir(library.stem)
             )
-            result = export_endnote_data_pdfs(library, destination)
+            result = export_endnote_data_pdfs(library, destination, item_ids=item_ids)
         else:
             raise LibraryFilesError("未知数据区")
         if payload.open_folder:
@@ -397,6 +509,8 @@ async def tool_export_pdfs(payload: LibraryToolRequest) -> dict[str, Any]:
         return result
     except LibraryFilesError as exc:
         raise HTTPException(400, str(exc)) from exc
+    except HTTPException:
+        raise
     except Exception as exc:
         raise HTTPException(409, str(exc)) from exc
 
@@ -422,13 +536,51 @@ async def tool_export_endnote(payload: EndNoteExportToolRequest) -> dict[str, An
         raise HTTPException(409, str(exc)) from exc
 
 
-@app.post("/api/institution/login")
-async def institution_login() -> dict[str, str]:
+@app.post("/api/tools/sync-endnote-zotero")
+async def tool_sync_endnote_zotero(payload: EndNoteZoteroSyncRequest) -> dict[str, Any]:
     try:
-        url = await pipeline.open_institution_login()
+        library = settings.endnote_library
+        if not library:
+            raise LibraryFilesError("请先在设置中填写 EndNote 库路径")
+        async with pipeline.zotero.sync_guard():
+            return await sync_endnote_to_zotero(
+                pipeline.zotero,
+                library,
+                payload.collection.strip(),
+            )
+    except LibraryFilesError as exc:
+        raise HTTPException(400, str(exc)) from exc
     except Exception as exc:
-        raise HTTPException(500, str(exc)) from exc
-    return {"status": "opened", "url": url}
+        raise HTTPException(409, str(exc)) from exc
+
+
+@app.post("/api/institution/login")
+async def institution_login(
+    payload: InstitutionContext | None = None,
+) -> dict[str, Any]:
+    context = payload or InstitutionContext()
+    try:
+        return await pipeline.open_institution_login(
+            target_url=context.target_url.strip() or None,
+            publisher=context.publisher.strip().casefold() or None,
+            batch_id=context.batch_id.strip() or None,
+        )
+    except Exception as exc:
+        raise HTTPException(500, redact_diagnostic_text(exc)) from exc
+
+
+@app.post("/api/institution/test-access")
+async def institution_test_access(
+    payload: InstitutionContext | None = None,
+) -> dict[str, Any]:
+    context = payload or InstitutionContext()
+    try:
+        return await pipeline.test_institution_access(
+            target_url=context.target_url.strip() or None,
+            publisher=context.publisher.strip().casefold() or None,
+        )
+    except Exception as exc:
+        raise HTTPException(409, redact_diagnostic_text(exc)) from exc
 
 
 @app.get("/api/batches")
@@ -448,7 +600,12 @@ async def create_batch(payload: BatchCreate) -> dict[str, str]:
         raise HTTPException(400, "Zotero collection 名称无效")
     batch_id = database.create_batch(
         name=payload.name.strip(), target_library=target, library_mode=payload.library_mode,
-        reference_manager="zotero", items=items
+        reference_manager="zotero", items=items,
+        institution_config={
+            **settings.institution.as_dict(),
+            "_acquisition_sources": list(settings.acquisition_sources),
+            "_auto_institution": bool(settings.auto_institution),
+        },
     )
     if payload.start_immediately:
         pipeline.start(batch_id)
@@ -517,7 +674,7 @@ async def export_endnote(batch_id: str) -> dict[str, Any]:
         async with pipeline.track_batch_work(batch_id, cancellable=False):
             return await pipeline.export_endnote(batch_id)
     except Exception as exc:
-        raise HTTPException(409, str(exc)) from exc
+        raise HTTPException(409, redact_diagnostic_text(exc)) from exc
 
 
 @app.get("/api/batches/{batch_id}/endnote-export.zip")
@@ -610,6 +767,8 @@ async def resolve_doi(paper_id: str, payload: DOIUpdate) -> dict[str, str]:
         source_url=None,
         pdf_path=None,
         pdf_sha256=None,
+        institution_publisher=None,
+        institution_state=None,
         needs_action=None,
         error=None,
     )
@@ -687,7 +846,7 @@ async def open_paper(
     except BatchDeletingError:
         raise
     except Exception as exc:
-        raise HTTPException(500, str(exc)) from exc
+        raise HTTPException(500, redact_diagnostic_text(exc)) from exc
     return {"status": "opened"}
 
 
@@ -697,9 +856,21 @@ async def acquire_institution(paper_id: str) -> dict[str, Any]:
     try:
         async with pipeline.track_batch_work(paper["batch_id"], cancellable=True):
             result = await pipeline.acquire_institution_pdf(paper_id)
+    except NeedsManualInstitutionAction as exc:
+        return {"status": "waiting", "action": exc.as_dict()}
     except Exception as exc:
-        raise HTTPException(409, str(exc)) from exc
+        raise HTTPException(409, redact_diagnostic_text(exc)) from exc
     return {"status": "verified", **result}
+
+
+@app.post("/api/papers/{paper_id}/continue-institution")
+async def continue_institution(paper_id: str) -> dict[str, Any]:
+    paper = require_paper(paper_id, writable=True)
+    try:
+        async with pipeline.track_batch_work(paper["batch_id"], cancellable=True):
+            return await pipeline.continue_institution_pdf(paper_id)
+    except Exception as exc:
+        raise HTTPException(409, redact_diagnostic_text(exc)) from exc
 
 
 def normalize_batch_ids(batch_ids: list[str]) -> list[str]:

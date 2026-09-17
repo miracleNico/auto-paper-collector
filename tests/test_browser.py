@@ -7,10 +7,33 @@ from pathlib import Path
 
 from paper_endnote.browser import BrowserSession
 from paper_endnote.publishers import is_publisher_block, publisher_pdf_candidates
-from paper_endnote.user_config import extract_doi_from_ezproxy_url, institution_openurl, load_preset
+from paper_endnote.user_config import (
+    InstitutionProfile,
+    extract_doi_from_ezproxy_url,
+    institution_openurl,
+    load_preset,
+)
 
 
 class BrowserSessionTests(unittest.TestCase):
+    def test_profile_directories_are_isolated_for_non_ascii_school_ids(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            settings = type(
+                "Settings", (), {"browser_profile_dir": Path(directory) / "profile"}
+            )()
+            session = BrowserSession(settings)
+            first = InstitutionProfile(
+                id="示例大学一", name="一", access_type="manual_browser"
+            )
+            second = InstitutionProfile(
+                id="示例大学二", name="二", access_type="manual_browser"
+            )
+            self.assertNotEqual(session._profile_dir(first), session._profile_dir(second))
+            self.assertEqual(
+                session._profile_dir(load_preset("mcgill")),
+                settings.browser_profile_dir,
+            )
+
     def test_extracts_embedded_pdf_from_wrapper(self) -> None:
         markup = '<html><embed src="/ielx8/1/2/article.pdf?token=ok"></html>'
         self.assertEqual(
@@ -120,6 +143,60 @@ class _FakeContext:
 
 
 class BrowserSessionAsyncTests(unittest.IsolatedAsyncioTestCase):
+    async def test_popup_inherits_its_opener_paper_binding(self) -> None:
+        session = BrowserSession.__new__(BrowserSession)
+        session._page_papers = {}
+        session._pages_by_paper = {}
+        session._bound_pages = set()
+
+        class BoundPage:
+            def __init__(self, opener=None) -> None:
+                self._opener = opener
+
+            def on(self, *_args) -> None:
+                return None
+
+            async def opener(self):
+                return self._opener
+
+        opener = BoundPage()
+        popup = BoundPage(opener)
+        session._bind_page(opener, "paper-correct")
+        session._bind_page(popup, None)
+        await session._inherit_opener_binding(popup)
+
+        self.assertEqual(session._page_papers[id(popup)], "paper-correct")
+
+    async def test_same_named_download_never_overwrites_existing_file(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            session = BrowserSession.__new__(BrowserSession)
+            session.settings = type(
+                "Settings", (), {"download_dir": Path(directory)}
+            )()
+            session._blocked_papers = set()
+            saved: list[Path] = []
+
+            async def callback(_paper_id: str, path: Path) -> None:
+                saved.append(path)
+
+            session._download_callback = callback
+            destination = Path(directory) / "paper-1" / "manual-paper.pdf"
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            destination.write_bytes(b"verified-original")
+
+            class SameNamedDownload:
+                suggested_filename = "paper.pdf"
+
+                async def save_as(self, path: str) -> None:
+                    Path(path).write_bytes(b"new-download")
+
+            await session._save_download(SameNamedDownload(), "paper-1")
+
+            self.assertEqual(destination.read_bytes(), b"verified-original")
+            self.assertEqual(len(saved), 1)
+            self.assertNotEqual(saved[0], destination)
+            self.assertEqual(saved[0].read_bytes(), b"new-download")
+
     async def test_cancelled_download_wait_removes_partial_browser_file(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             session = BrowserSession.__new__(BrowserSession)
@@ -194,7 +271,7 @@ class BrowserSessionAsyncTests(unittest.IsolatedAsyncioTestCase):
             session._download_callback = None
             session._bind_page = lambda *_args: None
 
-            async def open_entry(_page, url: str) -> str:
+            async def open_entry(_page, url: str, **_kwargs) -> str:
                 return url
 
             async def reveal(_page) -> None:
@@ -212,7 +289,7 @@ class BrowserSessionAsyncTests(unittest.IsolatedAsyncioTestCase):
 
             session._open_institution_entry = open_entry
             session._reveal = reveal
-            session._is_login_url = lambda _url: False
+            session._is_login_url = lambda _url, _profile=None: False
             session._candidate_links = candidate_links
             session._fetch_pdf = slow_fetch
 

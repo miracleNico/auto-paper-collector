@@ -17,9 +17,17 @@ from .config import Settings
 from .db import BatchDeletingError, Database
 from .downloader import download_pdf, safe_filename
 from .inputs import normalize_doi, title_similarity
+from .institution_access import NeedsManualInstitutionAction, profile_access_type
 from .library_files import downloads_library_dir, export_zotero_endnote_package
-from .pdf_validation import validate_pdf
-from .user_config import institution_openurl, institution_proxy_url
+from .pdf_validation import sha256_file, validate_pdf
+from .publishers import publisher_key
+from .redaction import redact_url
+from .user_config import (
+    InstitutionProfile,
+    institution_from_payload,
+    institution_openurl,
+    institution_proxy_url,
+)
 from .zotero import ZoteroAdapter
 
 
@@ -40,8 +48,8 @@ class PipelineManager:
         self._commit_lock = asyncio.Lock()
         self.institution_gap_seconds = 6.0
         self.institution_discovery_timeout_seconds = 180.0
-        self._institution_session_ready = False
-        self._institution_login_failed = False
+        self._institution_ready_sessions: set[tuple[str, str]] = set()
+        self._institution_login_failures: set[tuple[str, str]] = set()
         # Browser downloads normally update the paper immediately.  During a
         # two-source race they must remain staged until the winner is chosen.
         self._staged_browser_papers: set[str] = set()
@@ -63,8 +71,13 @@ class PipelineManager:
         await self.browser.close()
         await self.zotero.close()
 
+    def institution_session_states(self) -> list[dict[str, str]]:
+        getter = getattr(self.browser, "institution_session_states", None)
+        return getter() if getter is not None else []
+
     def start(self, batch_id: str) -> None:
         self.db.assert_batch_writable(batch_id)
+        self._institution_profile_for_batch(batch_id)
         current = self._batch_tasks.get(batch_id)
         if current and not current.done():
             return
@@ -140,8 +153,7 @@ class PipelineManager:
         await self.browser.stop_papers(paper_ids)
 
     async def _run_batch(self, batch_id: str) -> None:
-        self._institution_session_ready = False
-        self._institution_login_failed = False
+        self._institution_profile_for_batch(batch_id)
         try:
             while True:
                 batch = self.db.get_batch(batch_id)
@@ -171,8 +183,20 @@ class PipelineManager:
                 except asyncio.CancelledError:
                     raise
                 except LoginTimeoutError as exc:
-                    self._institution_login_failed = True
-                    self._downgrade_remaining_institution(batch_id, str(exc))
+                    profile = self._institution_profile_for_batch(batch_id)
+                    fallback = paper.get("metadata", {}).get("url") or paper.get("source_url") or ""
+                    failed_publisher = str(
+                        paper.get("institution_publisher") or publisher_key(fallback)
+                    )
+                    failed_key = (profile.id.casefold(), failed_publisher)
+                    self._institution_ready_sessions.discard(failed_key)
+                    self._institution_login_failures.add(failed_key)
+                    marker = getattr(self.browser, "mark_institution_session", None)
+                    if marker is not None:
+                        marker(failed_key[1], "expired", profile=profile)
+                    self._downgrade_remaining_institution(
+                        batch_id, str(exc), failed_key=failed_key
+                    )
                     self.db.event(batch_id, f"等待登录超时：{exc}", level="warning", paper_id=paper["id"])
                 except Exception as exc:
                     self.db.update_paper(
@@ -264,19 +288,114 @@ class PipelineManager:
             **self.settings.pdf_ocr_kwargs(),
         )
 
-    def _institution_entry(self, *, doi: str | None, fallback: str) -> str:
-        if doi:
-            return institution_proxy_url(self.settings.institution, f"https://doi.org/{doi}")
-        return fallback
+    def _intact_existing_pdf(self, paper: dict[str, Any]) -> Path | None:
+        if paper.get("pdf_status") not in {"verified", "accepted"}:
+            return None
+        raw_path = paper.get("pdf_path")
+        if not raw_path:
+            return None
+        path = Path(raw_path)
+        if not path.is_file():
+            return None
+        try:
+            stored_hash = str(paper.get("pdf_sha256") or "")
+            if stored_hash:
+                return path if sha256_file(path) == stored_hash else None
+            result = self._validate_pdf(
+                path,
+                expected_doi=paper.get("doi"),
+                expected_title=paper.get("title"),
+            )
+            if result.valid_pdf and result.role == "main":
+                return path
+        except Exception:
+            return None
+        return None
+
+    def _institution_profile_for_batch(self, batch_id: str) -> InstitutionProfile:
+        batch = self.db.get_batch(batch_id)
+        if not batch:
+            raise KeyError(batch_id)
+        snapshot = batch.get("institution_config")
+        if not isinstance(snapshot, dict):
+            snapshot = self.db.ensure_batch_institution_config(
+                batch_id, self.current_institution_snapshot()
+            )
+        snapshot = self.db.ensure_batch_institution_config_fields(
+            batch_id,
+            {
+                "_acquisition_sources": list(self.settings.acquisition_sources),
+                "_auto_institution": bool(self.settings.auto_institution),
+            },
+        )
+        return institution_from_payload(snapshot)
+
+    def current_institution_snapshot(self) -> dict[str, Any]:
+        """Return the credential-free institution policy saved with a new batch."""
+        return {
+            **self.settings.institution.as_dict(),
+            "_acquisition_sources": list(self.settings.acquisition_sources),
+            "_auto_institution": bool(self.settings.auto_institution),
+        }
+
+    def _acquisition_options_for_batch(
+        self, batch_id: str
+    ) -> tuple[tuple[str, ...], bool]:
+        # Also upgrades a legacy/profile-only snapshot exactly once.
+        self._institution_profile_for_batch(batch_id)
+        batch = self.db.get_batch(batch_id)
+        if not batch:
+            raise KeyError(batch_id)
+        snapshot = batch.get("institution_config") or {}
+        raw_sources = snapshot.get("_acquisition_sources")
+        if isinstance(raw_sources, (list, tuple)):
+            sources = tuple(
+                value
+                for value in (str(item) for item in raw_sources)
+                if value in {"open_access", "institution"}
+            )
+        else:
+            sources = tuple(self.settings.acquisition_sources)
+        if not sources:
+            sources = ("open_access",)
+        return sources, bool(snapshot.get("_auto_institution", False))
+
+    def _institution_profile_for_paper(self, paper: dict[str, Any]) -> InstitutionProfile:
+        return self._institution_profile_for_batch(paper["batch_id"])
+
+    @staticmethod
+    def _resolved_publisher(result: dict[str, Any], fallback: str) -> str:
+        """Prefer the post-login publisher URL when a DOI started as generic."""
+        publisher = str(result.get("publisher") or fallback or "generic")
+        if publisher == "generic":
+            resolved = publisher_key(
+                str(result.get("publisher_url") or result.get("source_url") or "")
+            )
+            if resolved != "generic":
+                publisher = resolved
+        return publisher
+
+    def _institution_entry(
+        self,
+        *,
+        doi: str | None,
+        fallback: str,
+        profile: InstitutionProfile | None = None,
+    ) -> str:
+        profile = profile or self.settings.institution
+        target = f"https://doi.org/{doi}" if doi else fallback
+        if profile_access_type(profile) == "ezproxy" and profile.ezproxy_login:
+            return institution_proxy_url(profile, target)
+        return target
 
     async def _find_pdf(self, batch_id: str, paper: dict[str, Any]) -> None:
         self.db.update_paper(paper["id"], status="looking_for_pdf", pdf_status="searching", error=None)
         doi = paper.get("doi")
-        sources = self.settings.acquisition_sources
+        sources, auto_institution = self._acquisition_options_for_batch(batch_id)
         if (
             "open_access" in sources
             and "institution" in sources
-            and self.settings.auto_institution
+            and auto_institution
         ):
             await self._race_pdf_sources(batch_id, paper)
             return
@@ -317,13 +436,19 @@ class PipelineManager:
             f"https://doi.org/{doi}" if doi else scholar_search_url(paper.get("title") or paper["input_text"])
         )
         if "institution" in sources:
-            source_url = self._institution_entry(doi=doi, fallback=fallback)
-            if self.settings.auto_institution:
-                if self._institution_login_failed:
+            profile = self._institution_profile_for_batch(batch_id)
+            source_url = self._institution_entry(
+                doi=doi, fallback=fallback, profile=profile
+            )
+            if auto_institution:
+                failed_key = (profile.id.casefold(), publisher_key(fallback))
+                if failed_key in self._institution_login_failures:
                     self.db.update_paper(
                         paper["id"], pdf_status="not_found", status="needs_pdf",
                         source_url=source_url,
-                        needs_action="manual_pdf",
+                        institution_publisher=failed_key[1],
+                        institution_state="expired",
+                        needs_action="manual_institution",
                         error="等待登录超时，本批剩余条目已转入人工队列",
                         endnote_status="pending",
                     )
@@ -333,13 +458,15 @@ class PipelineManager:
                     pdf_status="not_found",
                     status="institution_pending",
                     source_url=source_url,
+                    institution_publisher=failed_key[1],
+                    institution_state="unknown",
                     needs_action=None,
                     error=None,
                     endnote_status="pending",
                 )
                 self.db.event(
                     batch_id,
-                    f"开放获取未命中，转入 {self.settings.institution.name} 自动获取",
+                    f"开放获取未命中，转入 {profile.name or '机构'} 自动获取",
                     paper_id=paper["id"],
                 )
                 return
@@ -347,7 +474,7 @@ class PipelineManager:
                 paper["id"], pdf_status="not_found", status="needs_pdf",
                 source_url=source_url,
                 needs_action="manual_pdf",
-                error=f"未找到可自动获取的开放正式版；请通过 {self.settings.institution.name} 处理",
+                error=f"未找到可自动获取的开放正式版；请通过 {profile.name or '机构'} 处理",
                 endnote_status="pending",
             )
             return
@@ -428,23 +555,45 @@ class PipelineManager:
             if doi
             else scholar_search_url(paper.get("title") or paper["input_text"])
         )
-        target = self._institution_entry(doi=doi, fallback=fallback)
+        profile = self._institution_profile_for_batch(batch_id)
+        target = self._institution_entry(
+            doi=doi, fallback=fallback, profile=profile
+        )
+        publisher = publisher_key(fallback)
+        publisher = str(paper.get("institution_publisher") or publisher)
+        session_key = (profile.id.casefold(), publisher)
         destination = self.settings.download_dir / paper_id / "institution-main.pdf"
-        if self._institution_login_failed:
+        if session_key in self._institution_login_failures:
             return {
                 "success": False,
                 "source": "institution",
                 "source_url": target,
+                "manual_action": {
+                    "reason": "session_expired",
+                    "publisher": publisher,
+                    "paper_id": paper_id,
+                    "page_url": target,
+                    "action": "continue_institution",
+                    "detail": "等待登录超时，本批剩余条目已转入人工队列",
+                },
                 "error": "等待登录超时，本批剩余条目已转入人工队列",
             }
         download_started = False
         try:
-            if not self._institution_session_ready:
-                await self.browser.ensure_logged_in(target)
-                self._institution_session_ready = True
+            if (
+                profile_access_type(profile) == "ezproxy"
+                and session_key not in self._institution_ready_sessions
+            ):
+                await self.browser.ensure_logged_in(
+                    target, profile=profile, publisher=publisher
+                )
+                self._institution_ready_sessions.add(session_key)
+                marker = getattr(self.browser, "mark_institution_session", None)
+                if marker is not None:
+                    marker(publisher, "ready", profile=profile)
                 self.db.event(
                     batch_id,
-                    f"{self.settings.institution.name} 会话已就绪",
+                    f"{profile.name or '机构'} 会话已就绪",
                     paper_id=paper_id,
                 )
 
@@ -459,13 +608,24 @@ class PipelineManager:
                     discovery_timeout.reschedule(None)
 
                 browser_result = await self.browser.acquire_for_paper(
-                    paper_id, target, on_download_started=mark_download_started
+                    paper_id,
+                    target,
+                    on_download_started=mark_download_started,
+                    publisher=publisher,
+                    profile=profile,
                 )
             path = Path(browser_result.get("path") or destination)
             result = self._validate_pdf(
                 path, expected_doi=doi, expected_title=paper.get("title")
             )
             if result.identity == "verified" and result.role == "main":
+                actual_publisher = self._resolved_publisher(browser_result, publisher)
+                ready_key = (profile.id.casefold(), actual_publisher)
+                self._institution_login_failures.discard(ready_key)
+                self._institution_ready_sessions.add(ready_key)
+                marker = getattr(self.browser, "mark_institution_session", None)
+                if marker is not None:
+                    marker(actual_publisher, "ready", profile=profile)
                 return {
                     "success": True,
                     "source": "institution",
@@ -473,6 +633,7 @@ class PipelineManager:
                     "version": "published",
                     "path": path,
                     "sha256": result.sha256,
+                    "publisher": actual_publisher,
                 }
             if result.valid_pdf and result.identity == "needs_review":
                 return {
@@ -485,6 +646,7 @@ class PipelineManager:
                     "sha256": result.sha256,
                     "role": result.role,
                     "title_similarity": result.title_similarity,
+                    "publisher": str(browser_result.get("publisher") or publisher),
                     "error": result.reason,
                 }
             path.unlink(missing_ok=True)
@@ -501,11 +663,33 @@ class PipelineManager:
         except LoginTimeoutError as exc:
             destination.unlink(missing_ok=True)
             destination.with_suffix(destination.suffix + ".part").unlink(missing_ok=True)
-            self._institution_login_failed = True
+            self._institution_ready_sessions.discard(session_key)
+            self._institution_login_failures.add(session_key)
+            marker = getattr(self.browser, "mark_institution_session", None)
+            if marker is not None:
+                marker(publisher, "expired", profile=profile)
             return {
                 "success": False,
                 "source": "institution",
                 "source_url": target,
+                "manual_action": {
+                    "reason": "session_expired",
+                    "publisher": publisher,
+                    "paper_id": paper_id,
+                    "page_url": target,
+                    "action": "continue_institution",
+                    "detail": str(exc),
+                },
+                "error": str(exc),
+            }
+        except NeedsManualInstitutionAction as exc:
+            destination.unlink(missing_ok=True)
+            destination.with_suffix(destination.suffix + ".part").unlink(missing_ok=True)
+            return {
+                "success": False,
+                "source": "institution",
+                "source_url": target,
+                "manual_action": exc.as_dict(),
                 "error": str(exc),
             }
         except TimeoutError as exc:
@@ -577,12 +761,17 @@ class PipelineManager:
                 "source_url": paper.get("source_url") or self._institution_entry(
                     doi=paper.get("doi"),
                     fallback=paper.get("metadata", {}).get("url") or "",
+                    profile=self._institution_profile_for_paper(paper),
                 ),
                 "version": "published",
                 "path": resolved,
                 "sha256": result.sha256,
                 "role": result.role,
                 "title_similarity": result.title_similarity,
+                "publisher": str(
+                    paper.get("institution_publisher")
+                    or publisher_key(paper.get("metadata", {}).get("url") or "")
+                ),
                 "error": result.reason,
             }
             if result.identity == "verified" and result.role == "main":
@@ -653,10 +842,25 @@ class PipelineManager:
                     needs_action="commit_endnote",
                     error=None,
                 )
+                if winner.get("source") == "institution":
+                    self.db.update_paper(
+                        paper_id,
+                        institution_publisher=str(
+                            winner.get("publisher")
+                            or paper.get("institution_publisher")
+                            or "generic"
+                        ),
+                        institution_state="ready",
+                    )
+                else:
+                    self.db.update_paper(paper_id, institution_state="unknown")
+                    detach = getattr(self.browser, "detach_institution_page", None)
+                    if detach is not None:
+                        detach(paper_id)
                 keep_path = winner_path
                 source_name = (
                     "开放获取" if winner.get("source") == "open_access"
-                    else self.settings.institution.name
+                    else self._institution_profile_for_batch(batch_id).name or "机构"
                 )
                 self.db.event(
                     batch_id,
@@ -686,6 +890,21 @@ class PipelineManager:
                         error=review.get("error") or "PDF 需要人工确认",
                         endnote_status="pending",
                     )
+                    if review.get("source") == "institution":
+                        self.db.update_paper(
+                            paper_id,
+                            institution_publisher=str(
+                                review.get("publisher")
+                                or paper.get("institution_publisher")
+                                or "generic"
+                            ),
+                            institution_state="ready",
+                        )
+                    else:
+                        self.db.update_paper(paper_id, institution_state="unknown")
+                        detach = getattr(self.browser, "detach_institution_page", None)
+                        if detach is not None:
+                            detach(paper_id)
                     keep_path = review_path
                     self.db.event(
                         batch_id,
@@ -696,6 +915,9 @@ class PipelineManager:
                 else:
                     candidate = next(
                         (item for item in outcomes if item.get("source_url")), {}
+                    )
+                    manual = next(
+                        (item for item in outcomes if item.get("manual_action")), None
                     )
                     errors = [
                         str(item.get("error"))
@@ -710,13 +932,32 @@ class PipelineManager:
                         source_url=candidate.get("source_url"),
                         pdf_path=None,
                         pdf_sha256=None,
-                        needs_action="manual_pdf",
+                        needs_action="manual_institution" if manual else "manual_pdf",
+                        institution_publisher=(
+                            str(
+                                manual.get("manual_action", {}).get("publisher")
+                                or "generic"
+                            )
+                            if manual
+                            else None
+                        ),
+                        institution_state=(
+                            "expired"
+                            if manual
+                            and manual.get("manual_action", {}).get("reason")
+                            == "session_expired"
+                            else "waiting" if manual else "unknown"
+                        ),
                         error="；".join(errors) or "两条自动获取路径均未取得可验证 PDF",
                         endnote_status="pending",
                     )
                     self.db.event(
                         batch_id,
-                        "开放获取与机构路径均未取得可验证 PDF，已转入人工队列",
+                        (
+                            "机构登录需要人工接管；其他自动路径未取得可验证 PDF"
+                            if manual
+                            else "开放获取与机构路径均未取得可验证 PDF，已转入人工队列"
+                        ),
                         level="warning",
                         paper_id=paper_id,
                     )
@@ -773,7 +1014,13 @@ class PipelineManager:
         self.db.event(paper["batch_id"], f"已接收本地 PDF：{result.reason}", paper_id=paper_id)
         return result.as_dict()
 
-    def _downgrade_remaining_institution(self, batch_id: str, error: str) -> None:
+    def _downgrade_remaining_institution(
+        self,
+        batch_id: str,
+        error: str,
+        *,
+        failed_key: tuple[str, str] | None = None,
+    ) -> None:
         batch = self.db.get_batch(batch_id)
         if not batch:
             return
@@ -781,23 +1028,53 @@ class PipelineManager:
         for paper in batch["papers"]:
             if paper["status"] != "institution_pending":
                 continue
+            if failed_key is not None:
+                profile = self._institution_profile_for_batch(batch_id)
+                fallback = paper.get("metadata", {}).get("url") or paper.get("source_url") or ""
+                paper_publisher = str(
+                    paper.get("institution_publisher") or publisher_key(fallback)
+                )
+                if (profile.id.casefold(), paper_publisher) != failed_key:
+                    continue
+            else:
+                fallback = paper.get("metadata", {}).get("url") or paper.get("source_url") or ""
+                paper_publisher = str(
+                    paper.get("institution_publisher") or publisher_key(fallback)
+                )
             self.db.update_paper(
                 paper["id"],
                 status="needs_pdf",
                 pdf_status="not_found",
-                needs_action="manual_pdf",
+                needs_action="manual_institution",
+                institution_publisher=paper_publisher,
+                institution_state="expired",
                 error=message,
             )
 
     async def _process_institution_paper(self, batch_id: str, paper: dict[str, Any]) -> None:
-        if not self._institution_session_ready:
-            entry = paper.get("source_url") or self._institution_entry(
-                doi=paper.get("doi"),
-                fallback=scholar_search_url(paper.get("title") or paper["input_text"]),
+        profile = self._institution_profile_for_batch(batch_id)
+        entry = paper.get("source_url") or self._institution_entry(
+            doi=paper.get("doi"),
+            fallback=scholar_search_url(paper.get("title") or paper["input_text"]),
+            profile=profile,
+        )
+        publisher = str(
+            paper.get("institution_publisher")
+            or publisher_key(paper.get("metadata", {}).get("url") or entry)
+        )
+        session_key = (profile.id.casefold(), publisher)
+        if (
+            profile_access_type(profile) == "ezproxy"
+            and session_key not in self._institution_ready_sessions
+        ):
+            await self.browser.ensure_logged_in(
+                entry, profile=profile, publisher=publisher
             )
-            await self.browser.ensure_logged_in(entry)
-            self._institution_session_ready = True
-            self.db.event(batch_id, f"{self.settings.institution.name} 会话已就绪，开始逐篇获取")
+            self._institution_ready_sessions.add(session_key)
+            marker = getattr(self.browser, "mark_institution_session", None)
+            if marker is not None:
+                marker(publisher, "ready", profile=profile)
+            self.db.event(batch_id, f"{profile.name or '机构'} 会话已就绪，开始逐篇获取")
         try:
             download_started = False
             async with asyncio.timeout(self.institution_discovery_timeout_seconds) as discovery_timeout:
@@ -839,6 +1116,20 @@ class PipelineManager:
             self.db.event(batch_id, message, level="warning", paper_id=paper["id"])
         except LoginTimeoutError:
             raise
+        except NeedsManualInstitutionAction as exc:
+            self.db.update_paper(
+                paper["id"],
+                status="needs_pdf",
+                pdf_status="not_found",
+                needs_action="manual_institution",
+                error=str(exc),
+            )
+            self.db.event(
+                batch_id,
+                "机构访问等待人工登录或导航；可从该论文继续检查",
+                level="warning",
+                paper_id=paper["id"],
+            )
         except PublisherBlockedError as exc:
             self.db.update_paper(
                 paper["id"], status="needs_pdf", pdf_status="not_found",
@@ -864,21 +1155,36 @@ class PipelineManager:
             raise KeyError(paper_id)
         if paper.get("metadata_status") != "verified":
             raise ValueError("请先确认题录，再通过机构获取 PDF")
-        target = paper.get("source_url")
-        if not target:
-            doi = paper.get("doi")
-            target = self._institution_entry(
-                doi=doi,
-                fallback=scholar_search_url(paper.get("title") or paper["input_text"]),
-            )
+        existing_pdf = self._intact_existing_pdf(paper)
+        if existing_pdf is not None:
+            return {
+                "path": str(existing_pdf),
+                "source_url": paper.get("source_url"),
+                "existing": True,
+            }
+        profile = self._institution_profile_for_paper(paper)
+        doi = paper.get("doi")
+        fallback = paper.get("metadata", {}).get("url") or paper.get("source_url") or (
+            scholar_search_url(paper.get("title") or paper["input_text"])
+        )
+        target = self._institution_entry(
+            doi=doi, fallback=fallback, profile=profile
+        )
+        publisher = str(
+            paper.get("institution_publisher") or publisher_key(fallback)
+        )
         self.db.event(
             paper["batch_id"],
-            f"正在使用已登录 Chrome 会话尝试单篇 {self.settings.institution.name} 获取",
+            f"正在使用专用 Chrome 会话尝试单篇 {profile.name or '机构'} 获取",
             paper_id=paper_id,
         )
         try:
             result = await self.browser.acquire_for_paper(
-                paper_id, target, on_download_started=on_download_started
+                paper_id,
+                target,
+                on_download_started=on_download_started,
+                publisher=publisher,
+                profile=profile,
             )
             updated = self.db.get_paper(paper_id)
             if not updated or updated.get("pdf_status") != "verified":
@@ -886,13 +1192,49 @@ class PipelineManager:
             self.db.update_paper(
                 paper_id, version="published", source_url=result.get("source_url") or target, error=None
             )
+            actual_publisher = self._resolved_publisher(result, publisher)
+            ready_key = (profile.id.casefold(), actual_publisher)
+            self._institution_login_failures.discard(ready_key)
+            self._institution_ready_sessions.add(ready_key)
+            marker = getattr(self.browser, "mark_institution_session", None)
+            if marker is not None:
+                marker(actual_publisher, "ready", profile=profile)
+            self.db.update_paper(
+                paper_id,
+                institution_publisher=actual_publisher,
+                institution_state="ready",
+            )
             self.db.event(paper["batch_id"], "机构正式版 PDF 已下载并通过身份校验", paper_id=paper_id)
             return result
         except LoginTimeoutError as exc:
             self.db.update_paper(
-                paper_id, status="needs_pdf", pdf_status="not_found", needs_action="manual_pdf", error=str(exc)
+                paper_id,
+                status="needs_pdf",
+                pdf_status="not_found",
+                needs_action="manual_institution",
+                institution_publisher=publisher,
+                institution_state="expired",
+                error=str(exc),
             )
             self.db.event(paper["batch_id"], f"等待登录超时：{exc}", level="warning", paper_id=paper_id)
+            raise
+        except NeedsManualInstitutionAction as exc:
+            self.db.update_paper(
+                paper_id,
+                status="needs_pdf",
+                pdf_status="not_found",
+                source_url=target,
+                needs_action="manual_institution",
+                institution_publisher=exc.publisher,
+                institution_state="expired" if exc.reason == "session_expired" else "waiting",
+                error=str(exc),
+            )
+            self.db.event(
+                paper["batch_id"],
+                "机构访问已打开，等待人工登录或导航后继续检查",
+                level="warning",
+                paper_id=paper_id,
+            )
             raise
         except Exception as exc:
             self.db.update_paper(
@@ -901,12 +1243,188 @@ class PipelineManager:
             self.db.event(paper["batch_id"], f"机构自动获取未完成：{exc}", level="warning", paper_id=paper_id)
             raise
 
-    async def open_institution_login(self) -> str:
-        url = self.settings.institution.ezproxy_login
-        if "{url}" in url:
-            url = url.replace("{url}", "https://doi.org/")
-        await self.browser.open_for_paper("institution-login", url)
-        return url
+    async def continue_institution_pdf(self, paper_id: str) -> dict[str, Any]:
+        """Continue a retained CARSI/manual page without creating another batch."""
+        self.db.assert_paper_writable(paper_id)
+        paper = self.db.get_paper(paper_id)
+        if not paper:
+            raise KeyError(paper_id)
+        if paper.get("metadata_status") != "verified":
+            raise ValueError("请先确认题录，再继续机构访问")
+        existing_pdf = self._intact_existing_pdf(paper)
+        if existing_pdf is not None:
+            return {
+                "status": "verified",
+                "path": str(existing_pdf),
+                "source_url": paper.get("source_url"),
+                "existing": True,
+            }
+        profile = self._institution_profile_for_paper(paper)
+        fallback = paper.get("metadata", {}).get("url") or paper.get("source_url") or (
+            scholar_search_url(paper.get("doi") or paper.get("title") or paper["input_text"])
+        )
+        target = self._institution_entry(
+            doi=paper.get("doi"), fallback=fallback, profile=profile
+        )
+        publisher = str(
+            paper.get("institution_publisher") or publisher_key(fallback)
+        )
+        download_started = False
+        try:
+            async with asyncio.timeout(
+                self.institution_discovery_timeout_seconds
+            ) as discovery_timeout:
+                def mark_download_started() -> None:
+                    nonlocal download_started
+                    if download_started:
+                        return
+                    download_started = True
+                    discovery_timeout.reschedule(None)
+
+                try:
+                    result = await self.browser.continue_institution_access(
+                        paper_id,
+                        target,
+                        publisher=publisher,
+                        profile=profile,
+                        on_download_started=mark_download_started,
+                    )
+                except NeedsManualInstitutionAction as exc:
+                    if exc.reason != "institution_entry_not_found":
+                        raise
+                    # A restart intentionally forgets in-memory session claims.
+                    # Reopen the same paper flow and ask the user to authenticate.
+                    result = await self.browser.acquire_for_paper(
+                        paper_id,
+                        target,
+                        publisher=publisher,
+                        profile=profile,
+                        on_download_started=mark_download_started,
+                    )
+            updated = self.db.get_paper(paper_id)
+            if not updated or updated.get("pdf_status") != "verified":
+                raise ValueError(updated.get("error") if updated else "PDF 下载后的身份核验未通过")
+            self.db.update_paper(
+                paper_id,
+                version="published",
+                source_url=result.get("source_url") or target,
+                needs_action="commit_endnote",
+                error=None,
+            )
+            actual_publisher = self._resolved_publisher(result, publisher)
+            ready_key = (profile.id.casefold(), actual_publisher)
+            self._institution_login_failures.discard(ready_key)
+            self._institution_ready_sessions.add(ready_key)
+            marker = getattr(self.browser, "mark_institution_session", None)
+            if marker is not None:
+                marker(actual_publisher, "ready", profile=profile)
+            self.db.update_paper(
+                paper_id,
+                institution_publisher=actual_publisher,
+                institution_state="ready",
+            )
+            self.db.event(
+                paper["batch_id"],
+                "继续机构访问后已取得并验证正式版 PDF",
+                paper_id=paper_id,
+            )
+            return {"status": "verified", **result}
+        except NeedsManualInstitutionAction as exc:
+            self.db.update_paper(
+                paper_id,
+                status="needs_pdf",
+                pdf_status="not_found",
+                source_url=target,
+                needs_action="manual_institution",
+                institution_publisher=exc.publisher,
+                institution_state="expired" if exc.reason == "session_expired" else "waiting",
+                error=str(exc),
+            )
+            return {"status": "waiting", "action": exc.as_dict()}
+        except TimeoutError as exc:
+            message = (
+                str(exc).strip() or "下载或 PDF 校验阶段超时"
+                if download_started
+                else f"机构 PDF 入口发现超过单篇 {self.institution_discovery_timeout_seconds:g} 秒上限"
+            )
+            self.db.update_paper(
+                paper_id,
+                status="needs_pdf",
+                pdf_status="not_found",
+                needs_action="manual_institution",
+                error=message,
+            )
+            raise TimeoutError(message) from exc
+        except PublisherBlockedError as exc:
+            self.db.update_paper(
+                paper_id,
+                status="needs_pdf",
+                pdf_status="not_found",
+                needs_action="manual_institution",
+                error=str(exc),
+            )
+            self.db.event(
+                paper["batch_id"],
+                f"机构继续检查被出版社拒绝：{exc}",
+                level="warning",
+                paper_id=paper_id,
+            )
+            raise
+
+    async def open_institution_login(
+        self,
+        *,
+        target_url: str | None = None,
+        publisher: str | None = None,
+        batch_id: str | None = None,
+    ) -> dict[str, Any]:
+        profile = (
+            self._institution_profile_for_batch(batch_id)
+            if batch_id
+            else self.settings.institution
+        )
+        if not profile.id:
+            raise ValueError("请先保存机构配置")
+        target = target_url or "https://doi.org/"
+        if profile_access_type(profile) == "ezproxy":
+            url = self._institution_entry(doi=None, fallback=target, profile=profile)
+            await self.browser.open_for_paper(None, url, profile=profile)
+            return {
+                "status": "opened",
+                "url": redact_url(url),
+                "publisher": publisher or publisher_key(target),
+            }
+        try:
+            result = await self.browser.open_institution_login(
+                target, publisher=publisher, profile=profile
+            )
+        except NeedsManualInstitutionAction as exc:
+            action = exc.as_dict()
+            return {
+                "status": "waiting",
+                "url": action.get("page_url") or redact_url(target),
+                "publisher": exc.publisher,
+                "action": action,
+            }
+        return {
+            "status": result.get("status") or "waiting",
+            "url": redact_url(result.get("page_url") or target),
+            **result,
+            "page_url": redact_url(result.get("page_url")),
+        }
+
+    async def test_institution_access(
+        self,
+        *,
+        target_url: str | None = None,
+        publisher: str | None = None,
+    ) -> dict[str, Any]:
+        """Open and inspect authentication state; never searches for or downloads a PDF."""
+        result = await self.open_institution_login(
+            target_url=target_url, publisher=publisher
+        )
+        result["download_attempted"] = False
+        return result
 
     async def _browser_downloaded(self, paper_id: str, path: Path) -> None:
         if self.db.is_batch_deleting_for_paper(paper_id):
@@ -917,11 +1435,45 @@ class PipelineManager:
         paper = self.db.get_paper(paper_id)
         if paper and paper.get("pdf_status") in {"verified", "accepted"}:
             existing = Path(paper["pdf_path"]) if paper.get("pdf_path") else None
-            if existing is None or existing.resolve() != path.resolve():
-                path.unlink(missing_ok=True)
-            return
+            if self._intact_existing_pdf(paper) is not None:
+                if existing is None or existing.resolve() != path.resolve():
+                    path.unlink(missing_ok=True)
+                return
         try:
-            await self.accept_local_pdf(paper_id, path)
+            waiting_for_institution = bool(
+                paper and paper.get("needs_action") == "manual_institution"
+            )
+            result = await self.accept_local_pdf(paper_id, path)
+            if (
+                waiting_for_institution
+                and result.get("valid_pdf")
+                and result.get("identity") == "verified"
+                and result.get("role") == "main"
+            ):
+                updated = self.db.get_paper(paper_id) or paper or {}
+                profile = self._institution_profile_for_paper(updated)
+                fallback = (
+                    updated.get("metadata", {}).get("url")
+                    or updated.get("source_url")
+                    or ""
+                )
+                publisher = str(
+                    updated.get("institution_publisher") or publisher_key(fallback)
+                )
+                ready_key = (profile.id.casefold(), publisher)
+                self._institution_login_failures.discard(ready_key)
+                self._institution_ready_sessions.add(ready_key)
+                marker = getattr(self.browser, "mark_institution_session", None)
+                if marker is not None:
+                    marker(publisher, "ready", profile=profile)
+                self.db.update_paper(
+                    paper_id,
+                    institution_publisher=publisher,
+                    institution_state="ready",
+                )
+                detach = getattr(self.browser, "detach_institution_page", None)
+                if detach is not None:
+                    detach(paper_id)
         except Exception as exc:
             paper = self.db.get_paper(paper_id)
             if paper:
@@ -935,18 +1487,19 @@ class PipelineManager:
         paper = self.db.get_paper(paper_id)
         if not paper:
             raise KeyError(paper_id)
+        profile = self._institution_profile_for_paper(paper)
         if resolver:
             doi = paper.get("doi")
             if not doi:
                 raise ValueError("没有 DOI，无法打开机构馆藏解析器")
-            url = institution_openurl(self.settings.institution, doi)
+            url = institution_openurl(profile, doi)
             if not url:
                 raise ValueError("当前机构没有配置 OpenURL/馆藏解析器")
         elif scholar:
             url = scholar_search_url(paper.get("doi") or paper.get("title") or paper["input_text"])
         else:
             url = paper.get("source_url") or scholar_search_url(paper.get("doi") or paper.get("title") or paper["input_text"])
-        await self.browser.open_for_paper(paper_id, url)
+        await self.browser.open_for_paper(paper_id, url, profile=profile)
 
     def commit(self, batch_id: str) -> None:
         self.db.assert_batch_writable(batch_id)
@@ -1021,7 +1574,15 @@ class PipelineManager:
                     "endnote_status": "verified",
                     "status": "complete" if has_full_text else "needs_pdf",
                     "record_number": result.get("record_number"),
-                    "needs_action": None if has_full_text else "manual_pdf",
+                    "needs_action": (
+                        None
+                        if has_full_text
+                        else (
+                            "manual_institution"
+                            if paper.get("needs_action") == "manual_institution"
+                            else "manual_pdf"
+                        )
+                    ),
                 }
                 if has_full_text:
                     fields["error"] = None

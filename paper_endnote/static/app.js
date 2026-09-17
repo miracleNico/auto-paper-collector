@@ -14,6 +14,9 @@ const state = {
   listRequestToken: 0,
   detailRequestToken: 0,
   detailController: null,
+  exportItems: [],
+  exportRequestToken: 0,
+  exportController: null,
   deletePreviewToken: 0,
   pendingDeleteIds: [],
   deleteOperationId: null,
@@ -283,12 +286,47 @@ function fillInstitution(institution, presets) {
     presets.map(preset => `<option value="${esc(preset.preset || preset.id)}">${esc(preset.name)}</option>`)
   ).join("");
   select.value = [...select.options].some(option => option.value === current) ? current : "";
+  $("#institution-access-type").value = institution.access_type || "ezproxy";
   $("#institution-id").value = institution.id || "";
   $("#institution-name").value = institution.name || "";
+  $("#institution-login-url").value = institution.login_url || "";
   $("#institution-login").value = institution.ezproxy_login || "";
   $("#institution-hosts").value = (institution.ezproxy_hosts || []).join(", ");
   $("#institution-openurl").value = institution.openurl || "";
   $("#institution-login-markers").value = (institution.login_url_markers || []).join(", ");
+  $("#institution-school-aliases").value = (institution.school_aliases || []).join(", ");
+  $("#institution-entity-id").value = institution.entity_id || "";
+  $("#institution-publisher-login-urls").value = Object.entries(institution.publisher_login_urls || {})
+    .map(([publisher, url]) => `${publisher}=${url}`)
+    .join("\n");
+  syncInstitutionFields();
+}
+
+function syncInstitutionFields() {
+  const accessType = $("#institution-access-type").value;
+  $$('[data-institution-types]').forEach(node => {
+    node.hidden = !node.dataset.institutionTypes.split(/\s+/).includes(accessType);
+  });
+  $("#carsi-experimental").hidden = accessType !== "carsi_saml";
+  const credentialFields = accessType === "ezproxy";
+  $("#credentials-form").hidden = !credentialFields;
+  $("#institution-username").disabled = !credentialFields;
+  $("#institution-password").disabled = !credentialFields;
+}
+
+function parsePublisherLoginUrls(value) {
+  const urls = {};
+  for (const rawLine of value.split(/\r?\n/)) {
+    const line = rawLine.trim();
+    if (!line) continue;
+    const separator = line.indexOf("=");
+    if (separator < 1) throw new Error(`出版社登录链接格式错误：${line}`);
+    const publisher = line.slice(0, separator).trim().toLowerCase();
+    const url = line.slice(separator + 1).trim();
+    if (!/^https?:\/\//i.test(url)) throw new Error(`${publisher} 必须填写完整的 http(s) URL`);
+    urls[publisher] = url;
+  }
+  return urls;
 }
 
 function renderBatchList() {
@@ -448,7 +486,9 @@ function renderBatchDetail(batch) {
   });
   $("[data-action='open-endnote-export']")?.addEventListener("click", () => batchAction("open-endnote-export"));
   $("[data-action='delete']")?.addEventListener("click", () => openDeleteDialog([batch.id]));
-  $("[data-action='institution-login']")?.addEventListener("click", openInstitutionLogin);
+  $("[data-action='institution-login']")?.addEventListener("click", event => (
+    openInstitutionLogin(event, {batch_id: batch.id})
+  ));
   $("[data-action='rename-pdfs']")?.addEventListener("click", async event => {
     const button = event.currentTarget;
     setButtonBusy(button, true, "重命名中…");
@@ -467,6 +507,7 @@ function renderBatchDetail(batch) {
     syncToolSource("export");
     $("#export-batch").value = batch.id;
     fillExportDestination();
+    await loadExportItems();
     $("#export-destination").focus();
   });
   $("[data-action='export-endnote']")?.addEventListener("click", async () => {
@@ -498,7 +539,8 @@ function paperActions(paper) {
   const primary = [];
   const secondary = [];
   if (paper.needs_action === "confirm_metadata") primary.push(`<button type="button" data-paper-action="metadata" data-paper="${esc(paper.id)}">确认题录</button>`);
-  const needsPdf = ["manual_pdf", "confirm_pdf"].includes(paper.needs_action) || paper.status === "institution_pending";
+  if (paper.needs_action === "manual_institution") primary.push(`<button type="button" data-paper-action="continue-institution" data-paper="${esc(paper.id)}">继续机构访问</button>`);
+  const needsPdf = ["manual_pdf", "confirm_pdf", "manual_institution"].includes(paper.needs_action) || paper.status === "institution_pending";
   if (needsPdf) {
     primary.push(`<button type="button" data-paper-action="open" data-paper="${esc(paper.id)}">获取 PDF</button>`);
     secondary.push(`<button type="button" data-paper-action="institution" data-paper="${esc(paper.id)}">机构自动获取</button>`);
@@ -534,14 +576,18 @@ function bindPaperActions(papers) {
     try {
       if (action === "metadata") return showCandidates(paper);
       if (action === "pdf") return showPdfReview(paper);
-      setButtonBusy(button, true, action === "institution" ? "获取中…" : "处理中…");
+      setButtonBusy(button, true, ["institution", "continue-institution"].includes(action) ? "获取中…" : "处理中…");
       if (["open", "scholar", "resolver"].includes(action)) {
         await api(`/api/papers/${encodeURIComponent(paper.id)}/open?scholar=${action === "scholar"}&resolver=${action === "resolver"}`, {method: "POST", body: "{}"});
         toast("已打开获取页面");
       }
       if (action === "institution") {
-        await api(`/api/papers/${encodeURIComponent(paper.id)}/acquire-institution`, {method: "POST", body: "{}"});
-        toast("机构 PDF 已下载并验证");
+        const result = await api(`/api/papers/${encodeURIComponent(paper.id)}/acquire-institution`, {method: "POST", body: "{}"});
+        toast(result?.status === "verified" ? "机构 PDF 已下载并验证" : "已打开机构页面，请完成登录后继续检查");
+      }
+      if (action === "continue-institution") {
+        const result = await api(`/api/papers/${encodeURIComponent(paper.id)}/continue-institution`, {method: "POST", body: "{}"});
+        toast(result?.status === "verified" ? "机构 PDF 已下载并验证" : "仍需在机构页面完成登录或导航");
       }
       if (["retry", "skip"].includes(action)) await api(`/api/papers/${encodeURIComponent(paper.id)}/${action}`, {method: "POST", body: "{}"});
       await renderBatch();
@@ -617,11 +663,11 @@ async function batchAction(action) {
   }
 }
 
-async function openInstitutionLogin(event) {
+async function openInstitutionLogin(event, context = {}) {
   const button = event?.currentTarget;
   setButtonBusy(button, true, "打开中…");
   try {
-    await api("/api/institution/login", {method: "POST", body: "{}"});
+    await api("/api/institution/login", {method: "POST", body: JSON.stringify(context)});
     toast("已打开机构登录页");
   } catch (error) {
     toast(error.message);
@@ -828,6 +874,84 @@ function syncToolSource(prefix) {
   if (prefix === "export") fillExportDestination();
 }
 
+function exportSourcePayload() {
+  return {
+    source: $("#export-source").value,
+    batch_id: $("#export-batch").value,
+    collection: $("#export-collection").value,
+  };
+}
+
+function selectedExportItemIds() {
+  return $$('[data-export-item]:checked').map(input => input.value);
+}
+
+function updateExportSelection() {
+  const available = $$('[data-export-item]:not(:disabled)');
+  const selected = available.filter(input => input.checked);
+  const selectAll = $("#export-select-all");
+  selectAll.disabled = available.length === 0;
+  selectAll.checked = available.length > 0 && selected.length === available.length;
+  selectAll.indeterminate = selected.length > 0 && selected.length < available.length;
+  $("#export-selection-count").textContent = `${selected.length} / ${available.length}`;
+  const submit = $("#export-pdfs-form button[type='submit']");
+  if (!submit.hasAttribute("aria-busy")) submit.disabled = selected.length === 0;
+}
+
+function renderExportItems(items) {
+  state.exportItems = items;
+  const list = $("#export-items");
+  if (!items.length) {
+    list.innerHTML = '<div class="picker-state">没有可选择的论文</div>';
+    updateExportSelection();
+    return;
+  }
+  list.innerHTML = items.map(item => {
+    const meta = [item.author, item.year, item.doi].filter(Boolean).join(" · ");
+    const availability = item.available
+      ? `${item.file_count || 1} 个 PDF · ${formatBytes(item.size)}`
+      : "没有可导出的 PDF";
+    return `<label class="export-item ${item.available ? "" : "unavailable"}">
+      <input type="checkbox" data-export-item value="${esc(item.id)}" ${item.available ? "checked" : "disabled"}>
+      <span class="export-item-copy"><strong>${esc(item.title || "未命名论文")}</strong><small>${esc(meta || availability)}</small></span>
+      <span class="export-item-size">${esc(availability)}</span>
+    </label>`;
+  }).join("");
+  $$('[data-export-item]').forEach(input => input.addEventListener("change", updateExportSelection));
+  updateExportSelection();
+}
+
+async function loadExportItems() {
+  const token = ++state.exportRequestToken;
+  state.exportController?.abort();
+  const controller = new AbortController();
+  state.exportController = controller;
+  const picker = $("#export-picker");
+  picker.setAttribute("aria-busy", "true");
+  $("#export-items").innerHTML = '<div class="picker-state"><span class="spinner" aria-hidden="true"></span><br>正在读取论文…</div>';
+  $("#export-select-all").disabled = true;
+  $("#export-pdfs-form button[type='submit']").disabled = true;
+  try {
+    const result = await api("/api/tools/export-pdfs/candidates", {
+      method: "POST",
+      body: JSON.stringify(exportSourcePayload()),
+      signal: controller.signal,
+    });
+    if (token !== state.exportRequestToken) return;
+    renderExportItems(result.items || []);
+  } catch (error) {
+    if (token !== state.exportRequestToken || error.name === "AbortError") return;
+    state.exportItems = [];
+    $("#export-items").innerHTML = `<div class="picker-state">${esc(error.message)}</div>`;
+    updateExportSelection();
+  } finally {
+    if (token === state.exportRequestToken) {
+      picker.setAttribute("aria-busy", "false");
+      state.exportController = null;
+    }
+  }
+}
+
 function fillExportDestination() {
   const sources = state.toolSources || {};
   const downloads = sources.downloads_dir || "";
@@ -870,10 +994,25 @@ async function loadToolSources() {
     $("#export-collection").innerHTML = collectionHtml;
     $("#endnote-collection").innerHTML = collectionHtml;
     $("#rename-endnote-library").value = sources.endnote_library || "";
+    $("#sync-endnote-library").value = sources.endnote_library || "";
+    $("#sync-zotero-collections").innerHTML = collections
+      .map(item => `<option value="${esc(item.name)}"></option>`)
+      .join("");
+    const syncCollection = $("#sync-zotero-collection");
+    if (!syncCollection.dataset.custom) {
+      const libraryName = String(sources.endnote_library || "").split(/[/\\]/).at(-1)?.replace(/\.enl$/i, "") || "";
+      syncCollection.value = libraryName;
+    }
+    const syncButton = $("#sync-endnote-zotero-form button[type='submit']");
+    syncButton.disabled = !sources.endnote_library || Boolean(sources.zotero_error);
+    $("#sync-endnote-result").textContent = !sources.endnote_library
+      ? "请先设置 EndNote 库"
+      : sources.zotero_error ? `Zotero：${sources.zotero_error}` : "";
     syncToolSource("rename");
     syncToolSource("export");
     fillExportDestination();
     fillEndnoteDestination();
+    await loadExportItems();
     if (sources.zotero_error) toast(`Zotero：${sources.zotero_error}`);
   } catch (error) {
     toast(error.message);
@@ -1002,6 +1141,7 @@ $("#settings-form").addEventListener("submit", async event => {
   if ($("#source-open-access").checked) sources.push("open_access");
   if ($("#source-institution").checked) sources.push("institution");
   const split = value => value.split(",").map(item => item.trim()).filter(Boolean);
+  const accessType = $("#institution-access-type").value;
   setButtonBusy(button, true, "保存中…");
   try {
     await api("/api/settings", {method: "POST", body: JSON.stringify({
@@ -1017,12 +1157,17 @@ $("#settings-form").addEventListener("submit", async event => {
       login_wait_seconds: Number($("#login-wait-seconds").value || 600),
       institution: {
         preset: $("#institution-preset").value,
+        access_type: accessType,
         id: $("#institution-id").value,
         name: $("#institution-name").value,
-        ezproxy_login: $("#institution-login").value,
-        ezproxy_hosts: split($("#institution-hosts").value),
+        login_url: $("#institution-login-url").value,
+        ezproxy_login: accessType === "ezproxy" ? $("#institution-login").value : "",
+        ezproxy_hosts: accessType === "ezproxy" ? split($("#institution-hosts").value) : [],
         openurl: $("#institution-openurl").value,
         login_url_markers: split($("#institution-login-markers").value),
+        school_aliases: accessType === "carsi_saml" ? split($("#institution-school-aliases").value) : [],
+        entity_id: accessType === "carsi_saml" ? $("#institution-entity-id").value : "",
+        publisher_login_urls: accessType === "carsi_saml" ? parsePublisherLoginUrls($("#institution-publisher-login-urls").value) : {},
       },
     })});
     toast("设置已保存");
@@ -1041,6 +1186,33 @@ $("#institution-preset").addEventListener("change", () => {
     fillInstitution(preset, state.system.presets || []);
     $("#source-institution").checked = true;
     $("#auto-institution").checked = true;
+  }
+});
+
+$("#institution-access-type").addEventListener("change", () => {
+  syncInstitutionFields();
+  $("#source-institution").checked = true;
+  $("#auto-institution").checked = true;
+});
+
+$("#open-institution-login-settings").addEventListener("click", openInstitutionLogin);
+
+$("#test-institution-access").addEventListener("click", async event => {
+  const button = event.currentTarget;
+  const resultNode = $("#institution-access-result");
+  setButtonBusy(button, true, "检查中…");
+  resultNode.textContent = "正在检查已保存的机构配置与登录状态…";
+  try {
+    const result = await api("/api/institution/test-access", {method: "POST", body: "{}"});
+    resultNode.textContent = typeof result === "string"
+      ? result
+      : result?.message || result?.detail || result?.status || "访问检查已完成";
+    toast("机构访问检查已完成");
+  } catch (error) {
+    resultNode.textContent = error.message;
+    toast(error.message);
+  } finally {
+    setButtonBusy(button, false);
   }
 });
 
@@ -1074,12 +1246,17 @@ $("#clear-credentials").addEventListener("click", async event => {
 
 $("#open-institution-login").addEventListener("click", openInstitutionLogin);
 $("#rename-source").addEventListener("change", () => syncToolSource("rename"));
-$("#export-source").addEventListener("change", () => syncToolSource("export"));
-$("#export-collection").addEventListener("change", fillExportDestination);
-$("#export-batch").addEventListener("change", fillExportDestination);
+$("#export-source").addEventListener("change", async () => { syncToolSource("export"); await loadExportItems(); });
+$("#export-collection").addEventListener("change", async () => { fillExportDestination(); await loadExportItems(); });
+$("#export-batch").addEventListener("change", async () => { fillExportDestination(); await loadExportItems(); });
 $("#export-destination").addEventListener("input", () => { $("#export-destination").dataset.custom = "1"; });
+$("#export-select-all").addEventListener("change", event => {
+  $$('[data-export-item]:not(:disabled)').forEach(input => { input.checked = event.currentTarget.checked; });
+  updateExportSelection();
+});
 $("#endnote-collection").addEventListener("change", fillEndnoteDestination);
 $("#endnote-destination").addEventListener("input", () => { $("#endnote-destination").dataset.custom = "1"; });
+$("#sync-zotero-collection").addEventListener("input", event => { event.currentTarget.dataset.custom = "1"; });
 
 $("#rename-pdfs-form").addEventListener("submit", event => {
   event.preventDefault();
@@ -1088,12 +1265,60 @@ $("#rename-pdfs-form").addEventListener("submit", event => {
 
 $("#export-pdfs-form").addEventListener("submit", event => {
   event.preventDefault();
-  submitToolForm(event.currentTarget, $("#export-result"), "正在导出…", () => api("/api/tools/export-pdfs", {method: "POST", body: JSON.stringify({source: $("#export-source").value, batch_id: $("#export-batch").value, collection: $("#export-collection").value, destination: $("#export-destination").value, open_folder: $("#export-open-folder").checked})}), result => `已复制 ${result.copied} 个 PDF · ${result.destination}`);
+  const itemIds = selectedExportItemIds();
+  if (!itemIds.length) {
+    toast("请至少选择一篇论文");
+    $("#export-items").focus?.();
+    return;
+  }
+  submitToolForm(event.currentTarget, $("#export-result"), "正在导出…", () => api("/api/tools/export-pdfs", {method: "POST", body: JSON.stringify({source: $("#export-source").value, batch_id: $("#export-batch").value, collection: $("#export-collection").value, destination: $("#export-destination").value, open_folder: $("#export-open-folder").checked, item_ids: itemIds})}), result => `已复制 ${result.copied} 个 PDF · ${result.destination}`);
 });
 
 $("#export-endnote-form").addEventListener("submit", event => {
   event.preventDefault();
   submitToolForm(event.currentTarget, $("#endnote-export-result"), "正在导出…", () => api("/api/tools/export-endnote", {method: "POST", body: JSON.stringify({collection: $("#endnote-collection").value, destination: $("#endnote-destination").value, open_folder: $("#endnote-open-folder").checked})}), result => `已导出 ${result.record_count} 篇题录、${result.pdf_count} 个 PDF`);
+});
+
+$("#sync-endnote-zotero-form").addEventListener("submit", async event => {
+  event.preventDefault();
+  const form = event.currentTarget;
+  const button = form.querySelector("button[type='submit']");
+  const resultNode = $("#sync-endnote-result");
+  const report = $("#sync-endnote-report");
+  const collection = $("#sync-zotero-collection").value.trim();
+  if (!collection) {
+    toast("请填写目标 Zotero collection");
+    $("#sync-zotero-collection").focus();
+    return;
+  }
+  report.hidden = true;
+  report.className = "sync-report";
+  resultNode.textContent = "正在从 EndNote 同步…";
+  setButtonBusy(button, true, "同步中…");
+  try {
+    const result = await api("/api/tools/sync-endnote-zotero", {
+      method: "POST",
+      body: JSON.stringify({collection}),
+    });
+    resultNode.textContent = `已同步 ${result.synced} 篇 · 新增 ${result.created} · 匹配 ${result.matched}`;
+    const skippedDetails = (result.records || [])
+      .filter(row => row.status === "skipped")
+      .slice(0, 3)
+      .map(row => `${row.title || row.id}${row.error ? `（${row.error}）` : ""}`)
+      .join("、");
+    report.hidden = false;
+    report.innerHTML = `<strong>PDF 新增 ${result.pdf_attached}，已有 ${result.pdf_existing}</strong>${result.skipped ? `<br>跳过 ${result.skipped} 篇${skippedDetails ? `：${esc(skippedDetails)}` : ""}` : ""}${result.failed ? `<br>失败 ${result.failed} 篇：${esc((result.errors || []).slice(0, 3).map(item => item.title).join("、"))}` : ""}`;
+    report.classList.toggle("error", result.failed > 0);
+    toast(resultNode.textContent);
+  } catch (error) {
+    resultNode.textContent = error.message;
+    report.hidden = false;
+    report.className = "sync-report error";
+    report.textContent = error.message;
+    toast(error.message);
+  } finally {
+    setButtonBusy(button, false);
+  }
 });
 
 $("#authorize-zotero").addEventListener("click", async event => {

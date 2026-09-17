@@ -87,6 +87,67 @@ def _review(source: str, path: Path, *, role: str = "main", score: float = 0.5) 
 
 
 class ParallelAcquisitionTests(unittest.IsolatedAsyncioTestCase):
+    async def test_manual_institution_action_survives_parallel_oa_miss(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            manager, db, batch_id, paper_id = _manager(Path(directory))
+
+            async def oa(_paper):
+                return {"success": False, "source": "open_access", "error": "oa miss"}
+
+            async def institution(_batch_id, _paper):
+                return {
+                    "success": False,
+                    "source": "institution",
+                    "source_url": "https://doi.org/10.1000/a",
+                    "manual_action": {
+                        "reason": "login_required",
+                        "publisher": "generic",
+                        "action": "continue_institution",
+                    },
+                    "error": "请完成机构登录",
+                }
+
+            manager._try_open_access_pdf = oa  # type: ignore[method-assign]
+            manager._try_institution_pdf = institution  # type: ignore[method-assign]
+            await manager._find_pdf(batch_id, db.get_paper(paper_id))
+            paper = db.get_paper(paper_id)
+            self.assertEqual(paper["needs_action"], "manual_institution")
+            self.assertEqual(paper["institution_publisher"], "generic")
+            self.assertEqual(paper["institution_state"], "waiting")
+            self.assertIn("机构登录", paper["error"])
+
+    async def test_oa_winner_releases_started_institution_login(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            manager, db, batch_id, paper_id = _manager(Path(directory))
+            detached: list[str] = []
+            manager.browser.detach_institution_page = detached.append  # type: ignore[attr-defined]
+
+            async def oa(_paper):
+                await asyncio.sleep(0.01)
+                return _success(
+                    "open_access",
+                    manager.settings.download_dir / paper_id / "open-access-main.pdf",
+                )
+
+            async def institution(_batch_id, _paper):
+                return {
+                    "success": False,
+                    "source": "institution",
+                    "manual_action": {
+                        "reason": "login_required",
+                        "publisher": "ieee",
+                        "action": "continue_institution",
+                    },
+                    "error": "login required",
+                }
+
+            manager._try_open_access_pdf = oa  # type: ignore[method-assign]
+            manager._try_institution_pdf = institution  # type: ignore[method-assign]
+            await manager._find_pdf(batch_id, db.get_paper(paper_id))
+
+            self.assertEqual(detached, [paper_id])
+            self.assertEqual(db.get_paper(paper_id)["pdf_status"], "verified")
+
     async def test_oa_wins_and_cancels_institution(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             manager, db, batch_id, paper_id = _manager(Path(directory))
@@ -321,9 +382,16 @@ class ParallelAcquisitionTests(unittest.IsolatedAsyncioTestCase):
         with tempfile.TemporaryDirectory() as directory:
             manager, db, batch_id, paper_id = _manager(Path(directory))
             destination = manager.settings.download_dir / paper_id / "institution-main.pdf"
-            manager._institution_session_ready = True
+            manager._institution_ready_sessions.add(("mcgill", "generic"))
 
-            async def acquire(_paper_id, _target, *, on_download_started=None):
+            async def acquire(
+                _paper_id,
+                _target,
+                *,
+                on_download_started=None,
+                publisher=None,
+                profile=None,
+            ):
                 destination.parent.mkdir(parents=True, exist_ok=True)
                 destination.write_bytes(b"%PDF-1.4\npartial\n%%EOF\n")
                 if on_download_started:

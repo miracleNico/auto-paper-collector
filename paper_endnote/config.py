@@ -6,6 +6,7 @@ from pathlib import Path
 
 from .user_config import (
     AcquisitionConfig,
+    DEFAULT_SOURCES,
     InstitutionProfile,
     OcrOptions,
     default_config_path,
@@ -29,13 +30,13 @@ class Settings:
     crossref_mailto: str
     unpaywall_email: str
     config_path: Path
-    acquisition_sources: tuple[str, ...] = ("open_access", "institution")
+    acquisition_sources: tuple[str, ...] = DEFAULT_SOURCES
     ocr: OcrOptions = field(default_factory=OcrOptions)
     institution: InstitutionProfile = field(default_factory=lambda: load_preset("mcgill"))
     max_pdf_bytes: int = 100 * 1024 * 1024
     request_timeout_seconds: float = 30.0
     crossref_min_interval_seconds: float = 0.25
-    auto_institution: bool = True
+    auto_institution: bool = False
     auto_commit: bool = True
     login_wait_seconds: int = 600
 

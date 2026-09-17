@@ -244,7 +244,7 @@ async function loadSystem() {
   $("#endnote-library").value = cfg.endnote_library || "";
   $("#source-open-access").checked = (cfg.acquisition_sources || []).includes("open_access");
   $("#source-institution").checked = (cfg.acquisition_sources || []).includes("institution");
-  $("#auto-institution").checked = cfg.auto_institution !== false;
+  $("#auto-institution").checked = cfg.auto_institution === true;
   $("#auto-commit").checked = cfg.auto_commit !== false;
   $("#login-wait-seconds").value = cfg.login_wait_seconds || 600;
   $("#ocr-enabled").checked = !!cfg.ocr_enabled;
@@ -1024,7 +1024,11 @@ $("#settings-form").addEventListener("submit", async event => {
 $("#institution-preset").addEventListener("change", () => {
   const selected = $("#institution-preset").value;
   const preset = (state.system?.presets || []).find(item => (item.preset || item.id) === selected);
-  if (preset) fillInstitution(preset, state.system.presets || []);
+  if (preset) {
+    fillInstitution(preset, state.system.presets || []);
+    $("#source-institution").checked = true;
+    $("#auto-institution").checked = true;
+  }
 });
 
 $("#credentials-form").addEventListener("submit", async event => {

@@ -42,7 +42,16 @@ from .library_files import (
 from .ocr import ocr_status
 from .pipeline import PipelineManager
 from .reporting import batch_csv
-from .user_config import ConfigError, OcrOptions, institution_from_payload, list_presets, load_preset, normalize_sources
+from .user_config import (
+    ALLOWED_SOURCES,
+    ConfigError,
+    DEFAULT_SOURCES,
+    OcrOptions,
+    institution_from_payload,
+    list_presets,
+    load_preset,
+    normalize_sources,
+)
 
 
 settings = Settings.load()
@@ -129,13 +138,13 @@ class SettingsUpdate(BaseModel):
     crossref_email: str = ""
     unpaywall_email: str = ""
     endnote_library: str = ""
-    acquisition_sources: list[str] = Field(default_factory=lambda: ["open_access", "institution"])
+    acquisition_sources: list[str] = Field(default_factory=lambda: list(DEFAULT_SOURCES))
     ocr_enabled: bool = True
     ocr_languages: str = "eng"
     ocr_max_pages: int = 2
     institution_preset: str = ""
     institution: InstitutionUpdate | None = None
-    auto_institution: bool = True
+    auto_institution: bool = False
     auto_commit: bool = True
     login_wait_seconds: int = 600
 
@@ -210,34 +219,75 @@ async def authorize_zotero() -> dict[str, Any]:
 
 @app.post("/api/settings")
 async def update_settings(payload: SettingsUpdate) -> dict[str, str]:
+    provided = payload.model_fields_set
+    acquisition_fields = {
+        "acquisition_sources",
+        "ocr_enabled",
+        "ocr_languages",
+        "ocr_max_pages",
+        "institution_preset",
+        "institution",
+        "auto_institution",
+        "auto_commit",
+        "login_wait_seconds",
+    }
     try:
-        sources = normalize_sources(payload.acquisition_sources)
-        if payload.institution_preset:
+        institution_specified = bool(
+            ("institution_preset" in provided and payload.institution_preset)
+            or ("institution" in provided and payload.institution)
+        )
+        sources = (
+            normalize_sources(payload.acquisition_sources)
+            if "acquisition_sources" in provided
+            else ALLOWED_SOURCES if institution_specified else settings.acquisition_sources
+        )
+        if "institution_preset" in provided and payload.institution_preset:
             institution = load_preset(payload.institution_preset)
-        elif payload.institution:
-            institution = institution_from_payload(payload.institution.model_dump())
+        elif "institution" in provided and payload.institution:
+            institution_data = settings.institution.as_dict()
+            for field_name in payload.institution.model_fields_set:
+                institution_data[field_name] = getattr(payload.institution, field_name)
+            institution = institution_from_payload(institution_data)
         else:
             institution = settings.institution
-        settings.ocr = OcrOptions(
-            enabled=payload.ocr_enabled,
-            languages=payload.ocr_languages.strip() or "eng",
-            max_pages=max(1, min(int(payload.ocr_max_pages), 5)),
+        ocr_languages = settings.ocr.languages
+        if "ocr_languages" in provided:
+            ocr_languages = payload.ocr_languages.strip() or "eng"
+        ocr_max_pages = settings.ocr.max_pages
+        if "ocr_max_pages" in provided:
+            ocr_max_pages = max(1, min(int(payload.ocr_max_pages), 5))
+        ocr = OcrOptions(
+            enabled=payload.ocr_enabled if "ocr_enabled" in provided else settings.ocr.enabled,
+            languages=ocr_languages,
+            max_pages=ocr_max_pages,
         )
-        settings.acquisition_sources = sources
-        settings.institution = institution
-        settings.auto_institution = payload.auto_institution
-        settings.auto_commit = payload.auto_commit
-        settings.login_wait_seconds = max(30, min(int(payload.login_wait_seconds), 1800))
-        settings.save_acquisition_config()
+        if provided & acquisition_fields:
+            settings.ocr = ocr
+            settings.acquisition_sources = sources
+            settings.institution = institution
+            if "auto_institution" in provided:
+                settings.auto_institution = payload.auto_institution
+            elif institution_specified:
+                settings.auto_institution = True
+            if "auto_commit" in provided:
+                settings.auto_commit = payload.auto_commit
+            if "login_wait_seconds" in provided:
+                settings.login_wait_seconds = max(30, min(int(payload.login_wait_seconds), 1800))
+            settings.save_acquisition_config()
     except ConfigError as exc:
         raise HTTPException(400, str(exc)) from exc
-    settings.crossref_mailto = payload.crossref_email.strip()
-    settings.unpaywall_email = payload.unpaywall_email.strip()
-    library = payload.endnote_library.strip()
-    settings.endnote_library = Path(library).expanduser() if library else None
-    database.set_setting("crossref_email", settings.crossref_mailto)
-    database.set_setting("unpaywall_email", settings.unpaywall_email)
-    database.set_setting("endnote_library", str(settings.endnote_library) if settings.endnote_library else "")
+    if "crossref_email" in provided:
+        settings.crossref_mailto = payload.crossref_email.strip()
+        database.set_setting("crossref_email", settings.crossref_mailto)
+    if "unpaywall_email" in provided:
+        settings.unpaywall_email = payload.unpaywall_email.strip()
+        database.set_setting("unpaywall_email", settings.unpaywall_email)
+    if "endnote_library" in provided:
+        library = payload.endnote_library.strip()
+        settings.endnote_library = Path(library).expanduser() if library else None
+        database.set_setting(
+            "endnote_library", str(settings.endnote_library) if settings.endnote_library else ""
+        )
     return {"status": "saved"}
 
 

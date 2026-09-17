@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import asyncio
+import tempfile
 import unittest
+from pathlib import Path
 
 from paper_endnote.browser import BrowserSession
 from paper_endnote.publishers import is_publisher_block, publisher_pdf_candidates
@@ -92,6 +95,140 @@ class BrowserSessionTests(unittest.TestCase):
         )
         self.assertIn("/pdfft?isDTMRedir=true&download=true", candidates[0]["href"])
         self.assertIn("S1570870523001234", candidates[0]["href"])
+
+
+class _FakePage:
+    def __init__(self) -> None:
+        self.url = "https://publisher.example/article/1"
+
+    async def wait_for_timeout(self, _milliseconds: int) -> None:
+        return None
+
+    async def title(self) -> str:
+        return "Example"
+
+    async def close(self) -> None:
+        return None
+
+
+class _FakeContext:
+    def __init__(self, page: _FakePage) -> None:
+        self.page = page
+
+    async def new_page(self) -> _FakePage:
+        return self.page
+
+
+class BrowserSessionAsyncTests(unittest.IsolatedAsyncioTestCase):
+    async def test_cancelled_download_wait_removes_partial_browser_file(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            session = BrowserSession.__new__(BrowserSession)
+            session.settings = type(
+                "Settings", (), {"download_dir": Path(directory)}
+            )()
+            session._blocked_papers = set()
+            session._download_callback = None
+            session._download_tasks = {}
+            started = asyncio.Event()
+
+            class SlowDownload:
+                suggested_filename = "late.pdf"
+
+                async def save_as(self, destination: str) -> None:
+                    Path(destination).write_bytes(b"partial")
+                    started.set()
+                    await asyncio.Event().wait()
+
+            download_task = asyncio.create_task(
+                session._save_download(SlowDownload(), "paper-1")
+            )
+            session._download_tasks["paper-1"] = {download_task}
+            waiter = asyncio.create_task(session.wait_for_downloads("paper-1"))
+            await started.wait()
+            waiter.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await waiter
+
+            destination = Path(directory) / "paper-1" / "manual-late.pdf"
+            self.assertTrue(download_task.cancelled())
+            self.assertFalse(destination.exists())
+
+    async def test_failed_download_save_removes_partial_browser_file(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            session = BrowserSession.__new__(BrowserSession)
+            session.settings = type(
+                "Settings", (), {"download_dir": Path(directory)}
+            )()
+            session._blocked_papers = set()
+            session._download_callback = None
+
+            class FailingDownload:
+                suggested_filename = "broken.pdf"
+
+                async def save_as(self, destination: str) -> None:
+                    Path(destination).write_bytes(b"partial")
+                    raise OSError("download save failed")
+
+            destination = Path(directory) / "paper-1" / "manual-broken.pdf"
+            with self.assertRaisesRegex(OSError, "download save failed"):
+                await session._save_download(FailingDownload(), "paper-1")
+
+            self.assertFalse(destination.exists())
+
+    async def test_download_start_callback_runs_before_slow_fetch(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            session = BrowserSession.__new__(BrowserSession)
+            page = _FakePage()
+            session.settings = type(
+                "Settings",
+                (),
+                {
+                    "download_dir": Path(directory),
+                    "institution": type("Institution", (), {"name": "Test Institution"})(),
+                },
+            )()
+            session._context = _FakeContext(page)
+            session._acquire_lock = asyncio.Lock()
+            session._active_paper_id = None
+            session._blocked_papers = set()
+            session._download_callback = None
+            session._bind_page = lambda *_args: None
+
+            async def open_entry(_page, url: str) -> str:
+                return url
+
+            async def reveal(_page) -> None:
+                return None
+
+            async def candidate_links(_page) -> list[dict[str, str]]:
+                return [{"text": "PDF", "href": "https://publisher.example/main.pdf"}]
+
+            events: list[str] = []
+
+            async def slow_fetch(_paper_id, _candidates, destination: Path) -> dict:
+                events.append("fetch")
+                await asyncio.sleep(0.05)
+                return {"source_url": "https://publisher.example/main.pdf", "path": str(destination)}
+
+            session._open_institution_entry = open_entry
+            session._reveal = reveal
+            session._is_login_url = lambda _url: False
+            session._candidate_links = candidate_links
+            session._fetch_pdf = slow_fetch
+
+            async with asyncio.timeout(0.01) as discovery_timeout:
+                def download_started() -> None:
+                    events.append("start")
+                    discovery_timeout.reschedule(None)
+
+                result = await session.acquire_for_paper(
+                    "paper-1",
+                    "https://publisher.example/article/1",
+                    on_download_started=download_started,
+                )
+
+            self.assertEqual(events, ["start", "fetch"])
+            self.assertIn("main.pdf", result["source_url"])
 
 
 if __name__ == "__main__":

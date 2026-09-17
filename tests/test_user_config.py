@@ -51,14 +51,106 @@ class UserConfigTests(unittest.TestCase):
             path = Path(directory) / "config.toml"
             original = load_acquisition_config(path, create=True)
             self.assertEqual(original.institution.id, "mcgill")
+            self.assertEqual(original.sources, ("open_access",))
+            self.assertFalse(original.auto_institution)
             path.write_text(dump_acquisition_config(original), encoding="utf-8")
             loaded = load_acquisition_config(path, create=False)
-            self.assertEqual(loaded.sources, ("open_access", "institution"))
+            self.assertEqual(loaded.sources, ("open_access",))
             self.assertEqual(loaded.institution.ezproxy_hosts[0], "proxy.library.mcgill.ca")
             self.assertTrue(loaded.ocr.enabled)
-            self.assertTrue(loaded.auto_institution)
+            self.assertFalse(loaded.auto_institution)
             self.assertTrue(loaded.auto_commit)
             self.assertEqual(loaded.login_wait_seconds, 600)
+
+    def test_existing_institution_choices_and_profile_are_preserved(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "config.toml"
+            path.write_text(
+                """[acquisition]
+sources = ["open_access", "institution"]
+auto_institution = true
+
+[institution]
+preset = "mcgill"
+""",
+                encoding="utf-8",
+            )
+
+            loaded = load_acquisition_config(path, create=False)
+
+            self.assertEqual(loaded.sources, ("open_access", "institution"))
+            self.assertTrue(loaded.auto_institution)
+            self.assertEqual(loaded.institution.id, "mcgill")
+            self.assertEqual(loaded.institution.name, "McGill University")
+
+    def test_saved_institution_enables_institution_defaults_when_switches_are_omitted(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "config.toml"
+            path.write_text(
+                """[institution]
+preset = "mcgill"
+""",
+                encoding="utf-8",
+            )
+
+            loaded = load_acquisition_config(path, create=False)
+
+            self.assertEqual(loaded.sources, ("open_access", "institution"))
+            self.assertTrue(loaded.auto_institution)
+            self.assertEqual(loaded.institution.id, "mcgill")
+
+    def test_explicit_acquisition_switches_override_saved_institution_defaults(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "config.toml"
+            path.write_text(
+                """[acquisition]
+sources = ["open_access"]
+auto_institution = false
+
+[institution]
+preset = "mcgill"
+""",
+                encoding="utf-8",
+            )
+
+            loaded = load_acquisition_config(path, create=False)
+
+            self.assertEqual(loaded.sources, ("open_access",))
+            self.assertFalse(loaded.auto_institution)
+            self.assertEqual(loaded.institution.id, "mcgill")
+
+    def test_saved_institution_infers_only_each_omitted_switch(self) -> None:
+        cases = (
+            (
+                """[acquisition]
+sources = ["open_access"]
+
+[institution]
+preset = "mcgill"
+""",
+                ("open_access",),
+                True,
+            ),
+            (
+                """[acquisition]
+auto_institution = false
+
+[institution]
+preset = "mcgill"
+""",
+                ("open_access", "institution"),
+                False,
+            ),
+        )
+        for contents, expected_sources, expected_auto in cases:
+            with self.subTest(contents=contents), tempfile.TemporaryDirectory() as directory:
+                path = Path(directory) / "config.toml"
+                path.write_text(contents, encoding="utf-8")
+
+                loaded = load_acquisition_config(path, create=False)
+
+                self.assertEqual(loaded.sources, expected_sources)
+                self.assertEqual(loaded.auto_institution, expected_auto)
 
 
 if __name__ == "__main__":

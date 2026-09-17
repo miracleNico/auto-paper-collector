@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import os
 import re
 from pathlib import Path
@@ -52,6 +53,9 @@ async def download_pdf(url: str, destination: Path, settings: Settings) -> dict[
                 raise DownloadError(f"下载内容不是 PDF（Content-Type: {content_type or 'unknown'}）")
         os.replace(temporary, destination)
         return {"path": str(destination), "bytes": size, "content_type": content_type}
+    except asyncio.CancelledError:
+        temporary.unlink(missing_ok=True)
+        raise
     except Exception:
         temporary.unlink(missing_ok=True)
         raise

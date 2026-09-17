@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import tempfile
 import unittest
 from pathlib import Path
@@ -62,12 +63,14 @@ class FakeBrowser:
         if self.fail_login:
             raise LoginTimeoutError("等待登录超时：请在 Chrome 中完成登录或 2FA")
 
-    async def acquire_for_paper(self, paper_id: str, url: str) -> dict:
+    async def acquire_for_paper(self, paper_id: str, url: str, *, on_download_started=None) -> dict:
         self.acquire_calls.append(paper_id)
         if self.fail_login:
             raise LoginTimeoutError("等待登录超时：请在 Chrome 中完成登录或 2FA")
         if self.fail_publisher:
             raise PublisherBlockedError("出版社拒绝：HTTP 403")
+        if on_download_started:
+            on_download_started()
         return {"source_url": url, "path": "institution-main.pdf"}
 
     async def close(self) -> None:
@@ -93,6 +96,7 @@ def _settings(root: Path) -> Settings:
         config_path=runtime / "config.toml",
         institution=load_preset("mcgill"),
         ocr=OcrOptions(),
+        acquisition_sources=("open_access", "institution"),
         auto_institution=True,
         auto_commit=True,
         login_wait_seconds=30,
@@ -133,9 +137,12 @@ class PipelineInstitutionTests(unittest.IsolatedAsyncioTestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             manager, db, browser, zotero = _pipeline(root)
+            manager.settings.acquisition_sources = ("institution",)
 
-            async def acquire(paper_id: str) -> dict:
+            async def acquire(paper_id: str, *, on_download_started=None) -> dict:
                 paper = db.get_paper(paper_id)
+                if on_download_started:
+                    on_download_started()
                 dest = manager.settings.download_dir / paper_id / "institution-main.pdf"
                 dest.parent.mkdir(parents=True, exist_ok=True)
                 dest.write_bytes(b"%PDF-1.4\n%%EOF\n")
@@ -216,6 +223,95 @@ class PipelineInstitutionTests(unittest.IsolatedAsyncioTestCase):
             paper = db.get_batch(batch_id)["papers"][0]
             self.assertEqual(paper["status"], "needs_pdf")
             self.assertIn("出版社拒绝", paper["error"] or "")
+            self.assertEqual(zotero.commits, ["10.1000/a"])
+
+    async def test_institution_discovery_timeout_goes_to_manual_queue(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            manager, db, _browser, zotero = _pipeline(Path(directory))
+            manager.settings.acquisition_sources = ("institution",)
+            manager.institution_discovery_timeout_seconds = 0.01
+
+            async def never_starts_download(_paper_id: str, *, on_download_started=None) -> dict:
+                await asyncio.sleep(60)
+                return {}
+
+            manager.acquire_institution_pdf = never_starts_download  # type: ignore[method-assign]
+            batch_id = db.create_batch(
+                name="t",
+                target_library="DTN",
+                library_mode="new",
+                items=[{"input_text": "10.1000/a", "doi": "10.1000/a", "title": "Example Paper"}],
+            )
+            await manager._run_batch(batch_id)
+            paper = db.get_batch(batch_id)["papers"][0]
+            self.assertEqual(paper["status"], "needs_pdf")
+            self.assertEqual(paper["needs_action"], "manual_pdf")
+            self.assertIn("PDF 入口发现", paper["error"] or "")
+            self.assertIn("0.01 秒上限", paper["error"] or "")
+            self.assertEqual(zotero.commits, ["10.1000/a"])
+
+    async def test_download_time_is_excluded_after_download_starts(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            manager, db, browser, zotero = _pipeline(Path(directory))
+            manager.settings.acquisition_sources = ("institution",)
+            manager.institution_discovery_timeout_seconds = 0.01
+
+            async def slow_download(paper_id: str, *, on_download_started=None) -> dict:
+                paper = db.get_paper(paper_id)
+                if on_download_started:
+                    on_download_started()
+                await asyncio.sleep(0.05)
+                dest = manager.settings.download_dir / paper_id / "institution-main.pdf"
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                dest.write_bytes(b"%PDF-1.4\n%%EOF\n")
+                db.update_paper(
+                    paper_id,
+                    pdf_status="verified",
+                    status="endnote_pending",
+                    pdf_path=str(dest),
+                    endnote_status="pending",
+                    needs_action="commit_endnote",
+                    error=None,
+                )
+                browser.acquire_calls.append(paper_id)
+                return {"source_url": paper.get("source_url"), "path": str(dest)}
+
+            manager.acquire_institution_pdf = slow_download  # type: ignore[method-assign]
+            batch_id = db.create_batch(
+                name="t",
+                target_library="DTN",
+                library_mode="new",
+                items=[{"input_text": "10.1000/a", "doi": "10.1000/a", "title": "Example Paper"}],
+            )
+            await manager._run_batch(batch_id)
+            paper = db.get_batch(batch_id)["papers"][0]
+            self.assertEqual(paper["status"], "complete")
+            self.assertEqual(browser.acquire_calls, [paper["id"]])
+            self.assertEqual(zotero.commits, ["10.1000/a"])
+
+    async def test_download_timeout_is_not_reported_as_discovery_timeout(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            manager, db, _browser, zotero = _pipeline(Path(directory))
+            manager.settings.acquisition_sources = ("institution",)
+            manager.institution_discovery_timeout_seconds = 0.01
+
+            async def download_times_out(_paper_id: str, *, on_download_started=None) -> dict:
+                if on_download_started:
+                    on_download_started()
+                raise TimeoutError("PDF response body timed out")
+
+            manager.acquire_institution_pdf = download_times_out  # type: ignore[method-assign]
+            batch_id = db.create_batch(
+                name="t",
+                target_library="DTN",
+                library_mode="new",
+                items=[{"input_text": "10.1000/a", "doi": "10.1000/a", "title": "Example Paper"}],
+            )
+            await manager._run_batch(batch_id)
+            paper = db.get_batch(batch_id)["papers"][0]
+            self.assertEqual(paper["status"], "needs_pdf")
+            self.assertEqual(paper["error"], "PDF response body timed out")
+            self.assertNotIn("PDF 入口发现", paper["error"] or "")
             self.assertEqual(zotero.commits, ["10.1000/a"])
 
 

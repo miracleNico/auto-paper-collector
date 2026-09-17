@@ -10,6 +10,7 @@ from .inputs import normalize_doi
 
 
 ALLOWED_SOURCES = ("open_access", "institution")
+DEFAULT_SOURCES = ("open_access",)
 DISALLOWED_SOURCE_TOKENS = ("scihub", "sci-hub", "sci_hub", "sci-hub.tw", "scihub.tw")
 PRESET_DIR = Path(__file__).resolve().parent / "presets"
 
@@ -60,10 +61,10 @@ def _clamp_login_wait(value: object) -> int:
 
 @dataclass(frozen=True)
 class AcquisitionConfig:
-    sources: tuple[str, ...] = ("open_access", "institution")
+    sources: tuple[str, ...] = DEFAULT_SOURCES
     ocr: OcrOptions = field(default_factory=OcrOptions)
     institution: InstitutionProfile = field(default_factory=lambda: load_preset("mcgill"))
-    auto_institution: bool = True
+    auto_institution: bool = False
     auto_commit: bool = True
     login_wait_seconds: int = 600
 
@@ -96,7 +97,7 @@ def institution_from_payload(data: dict[str, object]) -> InstitutionProfile:
 
 def normalize_sources(values: list[str] | tuple[str, ...] | None) -> tuple[str, ...]:
     if not values:
-        return ALLOWED_SOURCES
+        return DEFAULT_SOURCES
     seen: list[str] = []
     for raw in values:
         token = str(raw).strip().casefold().replace(" ", "_")
@@ -177,11 +178,27 @@ def load_acquisition_config(path: Path, *, create: bool = True) -> AcquisitionCo
         return config
     data = tomllib.loads(path.read_text(encoding="utf-8"))
     acquisition_raw = data.get("acquisition") if isinstance(data.get("acquisition"), dict) else {}
-    sources = normalize_sources(acquisition_raw.get("sources") if acquisition_raw else data.get("sources"))
     ocr = _ocr_from_mapping(data.get("ocr") if isinstance(data.get("ocr"), dict) else None)
-    institution_raw = data.get("institution") if isinstance(data.get("institution"), dict) else {"preset": "mcgill"}
+    has_explicit_institution = isinstance(data.get("institution"), dict)
+    institution_raw = data.get("institution") if has_explicit_institution else {"preset": "mcgill"}
     institution = _institution_from_mapping(institution_raw)
-    auto_institution = bool(acquisition_raw.get("auto_institution", True))
+
+    # A saved, valid institution profile is an opt-in signal for older or
+    # hand-written configuration files that omit the acquisition switches.
+    # Fresh installs remain neutral, and every explicitly stored switch wins.
+    if "sources" in acquisition_raw:
+        sources = normalize_sources(acquisition_raw["sources"])
+    elif "sources" in data:  # Legacy top-level setting.
+        sources = normalize_sources(data["sources"])
+    elif has_explicit_institution:
+        sources = ALLOWED_SOURCES
+    else:
+        sources = DEFAULT_SOURCES
+
+    if "auto_institution" in acquisition_raw:
+        auto_institution = bool(acquisition_raw["auto_institution"])
+    else:
+        auto_institution = has_explicit_institution
     auto_commit = bool(acquisition_raw.get("auto_commit", True))
     login_wait_seconds = _clamp_login_wait(acquisition_raw.get("login_wait_seconds", 600))
     return AcquisitionConfig(

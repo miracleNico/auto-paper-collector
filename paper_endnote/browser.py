@@ -18,6 +18,7 @@ from .user_config import extract_doi_from_ezproxy_url, institution_openurl
 
 
 DownloadCallback = Callable[[str, Path], Awaitable[None]]
+DownloadStartCallback = Callable[[], None]
 
 
 class BrowserError(RuntimeError):
@@ -157,12 +158,19 @@ class BrowserSession:
         name = safe_filename(download.suggested_filename or "paper.pdf")
         destination = self.settings.download_dir / paper_id / f"manual-{name}"
         destination.parent.mkdir(parents=True, exist_ok=True)
-        await download.save_as(str(destination))
-        if paper_id in self._blocked_papers:
+        try:
+            await download.save_as(str(destination))
+            if paper_id in self._blocked_papers:
+                destination.unlink(missing_ok=True)
+                return
+            if self._download_callback:
+                await self._download_callback(paper_id, destination)
+        except asyncio.CancelledError:
             destination.unlink(missing_ok=True)
-            return
-        if self._download_callback:
-            await self._download_callback(paper_id, destination)
+            raise
+        except Exception:
+            destination.unlink(missing_ok=True)
+            raise
 
     async def open_for_paper(self, paper_id: str, url: str) -> None:
         if paper_id in self._blocked_papers:
@@ -456,7 +464,13 @@ class BrowserSession:
         await page.goto(entry_url, wait_until="domcontentloaded", timeout=60_000)
         return entry_url
 
-    async def acquire_for_paper(self, paper_id: str, url: str) -> dict[str, Any]:
+    async def acquire_for_paper(
+        self,
+        paper_id: str,
+        url: str,
+        *,
+        on_download_started: DownloadStartCallback | None = None,
+    ) -> dict[str, Any]:
         """Retrieve one PDF through an already user-authenticated Chrome session."""
         if paper_id in self._blocked_papers:
             raise BrowserError("论文所属批次正在删除")
@@ -491,6 +505,8 @@ class BrowserSession:
                 if not candidates:
                     raise BrowserError(f"出版社页面没有可识别的 PDF 入口：{page.url}")
                 destination = self.settings.download_dir / paper_id / "institution-main.pdf"
+                if on_download_started:
+                    on_download_started()
                 try:
                     result = await self._fetch_pdf(paper_id, candidates, destination)
                 except PublisherBlockedError:
@@ -546,6 +562,18 @@ class BrowserSession:
             if not task.done()
         ]
         if downloads:
+            await asyncio.gather(*downloads, return_exceptions=True)
+
+    async def wait_for_downloads(self, paper_id: str) -> None:
+        """Drain downloads that were already started for one paper."""
+        while True:
+            downloads = [
+                task
+                for task in self._download_tasks.get(paper_id, set())
+                if not task.done()
+            ]
+            if not downloads:
+                return
             await asyncio.gather(*downloads, return_exceptions=True)
 
     async def close(self) -> None:

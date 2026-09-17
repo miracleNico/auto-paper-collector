@@ -4,7 +4,7 @@ import asyncio
 import shutil
 from contextlib import asynccontextmanager, suppress
 from pathlib import Path
-from typing import Any, AsyncIterator
+from typing import Any, AsyncIterator, Callable
 
 from .browser import BrowserSession, LoginTimeoutError, PublisherBlockedError
 from .clients import (
@@ -39,8 +39,13 @@ class PipelineManager:
         self._deleting_batches: set[str] = set()
         self._commit_lock = asyncio.Lock()
         self.institution_gap_seconds = 6.0
+        self.institution_discovery_timeout_seconds = 180.0
         self._institution_session_ready = False
         self._institution_login_failed = False
+        # Browser downloads normally update the paper immediately.  During a
+        # two-source race they must remain staged until the winner is chosen.
+        self._staged_browser_papers: set[str] = set()
+        self._staged_browser_downloads: dict[str, set[Path]] = {}
 
     async def close(self) -> None:
         tasks = [
@@ -268,6 +273,13 @@ class PipelineManager:
         self.db.update_paper(paper["id"], status="looking_for_pdf", pdf_status="searching", error=None)
         doi = paper.get("doi")
         sources = self.settings.acquisition_sources
+        if (
+            "open_access" in sources
+            and "institution" in sources
+            and self.settings.auto_institution
+        ):
+            await self._race_pdf_sources(batch_id, paper)
+            return
         if "open_access" in sources:
             location = await self.unpaywall.best_location(doi) if doi else None
             if location and location.version == "publishedVersion" and location.pdf_url:
@@ -346,6 +358,380 @@ class PipelineManager:
             endnote_status="pending",
         )
 
+    async def _try_open_access_pdf(self, paper: dict[str, Any]) -> dict[str, Any]:
+        """Download and validate OA into staging without changing paper state."""
+        doi = paper.get("doi")
+        if not doi:
+            return {"success": False, "source": "open_access", "error": "没有 DOI"}
+        destination = self.settings.download_dir / paper["id"] / "open-access-main.pdf"
+        try:
+            location = await self.unpaywall.best_location(doi)
+            if not location:
+                return {"success": False, "source": "open_access", "error": "未找到开放全文"}
+            if location.version != "publishedVersion" or not location.pdf_url:
+                return {
+                    "success": False,
+                    "source": "open_access",
+                    "source_url": location.url,
+                    "version": location.version,
+                    "error": "开放候选不是可自动采用的正式发表版 PDF",
+                }
+            await download_pdf(location.pdf_url, destination, self.settings)
+            result = self._validate_pdf(
+                destination, expected_doi=doi, expected_title=paper.get("title")
+            )
+            if result.identity == "verified" and result.role == "main":
+                return {
+                    "success": True,
+                    "source": "open_access",
+                    "source_url": location.url,
+                    "version": "published",
+                    "path": destination,
+                    "sha256": result.sha256,
+                }
+            if result.valid_pdf and result.identity == "needs_review":
+                return {
+                    "success": False,
+                    "review": True,
+                    "source": "open_access",
+                    "source_url": location.url,
+                    "version": "published",
+                    "path": destination,
+                    "sha256": result.sha256,
+                    "role": result.role,
+                    "title_similarity": result.title_similarity,
+                    "error": result.reason,
+                }
+            destination.unlink(missing_ok=True)
+            return {
+                "success": False,
+                "source": "open_access",
+                "source_url": location.url,
+                "error": result.reason,
+            }
+        except asyncio.CancelledError:
+            destination.unlink(missing_ok=True)
+            destination.with_suffix(destination.suffix + ".part").unlink(missing_ok=True)
+            raise
+        except Exception as exc:
+            destination.unlink(missing_ok=True)
+            return {"success": False, "source": "open_access", "error": str(exc)}
+
+    async def _try_institution_pdf(
+        self, batch_id: str, paper: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Acquire one institutional PDF into staging without committing it."""
+        paper_id = paper["id"]
+        doi = paper.get("doi")
+        fallback = paper.get("metadata", {}).get("url") or (
+            f"https://doi.org/{doi}"
+            if doi
+            else scholar_search_url(paper.get("title") or paper["input_text"])
+        )
+        target = self._institution_entry(doi=doi, fallback=fallback)
+        destination = self.settings.download_dir / paper_id / "institution-main.pdf"
+        if self._institution_login_failed:
+            return {
+                "success": False,
+                "source": "institution",
+                "source_url": target,
+                "error": "等待登录超时，本批剩余条目已转入人工队列",
+            }
+        download_started = False
+        try:
+            if not self._institution_session_ready:
+                await self.browser.ensure_logged_in(target)
+                self._institution_session_ready = True
+                self.db.event(
+                    batch_id,
+                    f"{self.settings.institution.name} 会话已就绪",
+                    paper_id=paper_id,
+                )
+
+            async with asyncio.timeout(
+                self.institution_discovery_timeout_seconds
+            ) as discovery_timeout:
+                def mark_download_started() -> None:
+                    nonlocal download_started
+                    if download_started:
+                        return
+                    download_started = True
+                    discovery_timeout.reschedule(None)
+
+                browser_result = await self.browser.acquire_for_paper(
+                    paper_id, target, on_download_started=mark_download_started
+                )
+            path = Path(browser_result.get("path") or destination)
+            result = self._validate_pdf(
+                path, expected_doi=doi, expected_title=paper.get("title")
+            )
+            if result.identity == "verified" and result.role == "main":
+                return {
+                    "success": True,
+                    "source": "institution",
+                    "source_url": browser_result.get("source_url") or target,
+                    "version": "published",
+                    "path": path,
+                    "sha256": result.sha256,
+                }
+            if result.valid_pdf and result.identity == "needs_review":
+                return {
+                    "success": False,
+                    "review": True,
+                    "source": "institution",
+                    "source_url": browser_result.get("source_url") or target,
+                    "version": "published",
+                    "path": path,
+                    "sha256": result.sha256,
+                    "role": result.role,
+                    "title_similarity": result.title_similarity,
+                    "error": result.reason,
+                }
+            path.unlink(missing_ok=True)
+            return {
+                "success": False,
+                "source": "institution",
+                "source_url": browser_result.get("source_url") or target,
+                "error": result.reason,
+            }
+        except asyncio.CancelledError:
+            destination.unlink(missing_ok=True)
+            destination.with_suffix(destination.suffix + ".part").unlink(missing_ok=True)
+            raise
+        except LoginTimeoutError as exc:
+            destination.unlink(missing_ok=True)
+            destination.with_suffix(destination.suffix + ".part").unlink(missing_ok=True)
+            self._institution_login_failed = True
+            return {
+                "success": False,
+                "source": "institution",
+                "source_url": target,
+                "error": str(exc),
+            }
+        except TimeoutError as exc:
+            destination.unlink(missing_ok=True)
+            destination.with_suffix(destination.suffix + ".part").unlink(missing_ok=True)
+            if download_started:
+                message = str(exc).strip() or "下载或 PDF 校验阶段超时"
+            else:
+                seconds = f"{self.institution_discovery_timeout_seconds:g}"
+                message = f"机构 PDF 入口发现超过单篇 {seconds} 秒上限"
+            return {
+                "success": False,
+                "source": "institution",
+                "source_url": target,
+                "error": message,
+            }
+        except Exception as exc:
+            destination.unlink(missing_ok=True)
+            destination.with_suffix(destination.suffix + ".part").unlink(missing_ok=True)
+            return {
+                "success": False,
+                "source": "institution",
+                "source_url": target,
+                "error": str(exc),
+            }
+
+    def _cleanup_race_files(self, paper_id: str, *, keep: Path | None = None) -> None:
+        """Remove only known per-paper staging files, preserving the selected candidate."""
+        paper_dir = (self.settings.download_dir / paper_id).resolve()
+        paths = {
+            paper_dir / "open-access-main.pdf",
+            paper_dir / "open-access-main.pdf.part",
+            paper_dir / "institution-main.pdf",
+            paper_dir / "institution-main.pdf.part",
+            *self._staged_browser_downloads.get(paper_id, set()),
+        }
+        keep_resolved = keep.resolve() if keep else None
+        for path in paths:
+            resolved = path.resolve()
+            try:
+                resolved.relative_to(paper_dir)
+            except ValueError:
+                continue
+            if keep_resolved is None or resolved != keep_resolved:
+                resolved.unlink(missing_ok=True)
+
+    def _browser_stage_outcomes(
+        self, paper: dict[str, Any], known: list[dict[str, Any]]
+    ) -> list[dict[str, Any]]:
+        """Validate browser downloads captured while a two-source race was active."""
+        paper_id = paper["id"]
+        known_paths = {
+            Path(item["path"]).resolve()
+            for item in known
+            if item.get("path")
+        }
+        outcomes: list[dict[str, Any]] = []
+        for path in self._staged_browser_downloads.get(paper_id, set()):
+            resolved = path.resolve()
+            if resolved in known_paths or not resolved.is_file():
+                continue
+            result = self._validate_pdf(
+                resolved,
+                expected_doi=paper.get("doi"),
+                expected_title=paper.get("title"),
+            )
+            base = {
+                "source": "institution",
+                "source_url": paper.get("source_url") or self._institution_entry(
+                    doi=paper.get("doi"),
+                    fallback=paper.get("metadata", {}).get("url") or "",
+                ),
+                "version": "published",
+                "path": resolved,
+                "sha256": result.sha256,
+                "role": result.role,
+                "title_similarity": result.title_similarity,
+                "error": result.reason,
+            }
+            if result.identity == "verified" and result.role == "main":
+                outcomes.append({**base, "success": True})
+            elif result.valid_pdf and result.identity == "needs_review":
+                outcomes.append({**base, "success": False, "review": True})
+            else:
+                resolved.unlink(missing_ok=True)
+                outcomes.append({**base, "success": False})
+        return outcomes
+
+    async def _race_pdf_sources(self, batch_id: str, paper: dict[str, Any]) -> None:
+        """Race OA and institution for one paper; commit exactly one winner."""
+        paper_id = paper["id"]
+        self._staged_browser_papers.add(paper_id)
+        self._staged_browser_downloads[paper_id] = set()
+        oa_task = asyncio.create_task(self._try_open_access_pdf(paper))
+        institution_task = asyncio.create_task(
+            self._try_institution_pdf(batch_id, paper)
+        )
+        pending: set[asyncio.Task] = {oa_task, institution_task}
+        outcomes: list[dict[str, Any]] = []
+        keep_path: Path | None = None
+        try:
+            winner: dict[str, Any] | None = None
+            while pending and winner is None:
+                done, pending = await asyncio.wait(
+                    pending, return_when=asyncio.FIRST_COMPLETED
+                )
+                for task in done:
+                    try:
+                        outcome = task.result()
+                    except asyncio.CancelledError:
+                        continue
+                    except Exception as exc:
+                        outcome = {"success": False, "error": str(exc)}
+                    outcomes.append(outcome)
+                    if outcome.get("success") and winner is None:
+                        winner = outcome
+                if winner is not None:
+                    for task in pending:
+                        task.cancel()
+                    if pending:
+                        await asyncio.gather(*pending, return_exceptions=True)
+                    pending.clear()
+
+            wait_for_downloads = getattr(self.browser, "wait_for_downloads", None)
+            if wait_for_downloads is not None:
+                await wait_for_downloads(paper_id)
+            staged_outcomes = self._browser_stage_outcomes(paper, outcomes)
+            outcomes.extend(staged_outcomes)
+            if winner is None:
+                winner = next(
+                    (item for item in staged_outcomes if item.get("success")), None
+                )
+
+            if winner is not None:
+                winner_path = Path(winner["path"])
+                self.db.update_paper(
+                    paper_id,
+                    pdf_status="verified",
+                    status="endnote_pending",
+                    version=winner.get("version") or "published",
+                    source_url=winner.get("source_url"),
+                    pdf_path=str(winner_path),
+                    pdf_sha256=winner.get("sha256"),
+                    endnote_status="pending",
+                    needs_action="commit_endnote",
+                    error=None,
+                )
+                keep_path = winner_path
+                source_name = (
+                    "开放获取" if winner.get("source") == "open_access"
+                    else self.settings.institution.name
+                )
+                self.db.event(
+                    batch_id,
+                    f"{source_name} 路径率先取得并验证正式版 PDF",
+                    paper_id=paper_id,
+                )
+            else:
+                review_candidates = [item for item in outcomes if item.get("review")]
+                if review_candidates:
+                    review = max(
+                        review_candidates,
+                        key=lambda item: (
+                            item.get("role") == "main",
+                            float(item.get("title_similarity") or 0.0),
+                        ),
+                    )
+                    review_path = Path(review["path"])
+                    self.db.update_paper(
+                        paper_id,
+                        pdf_status="needs_review",
+                        status="needs_pdf_review",
+                        version=review.get("version") or "published",
+                        source_url=review.get("source_url"),
+                        pdf_path=str(review_path),
+                        pdf_sha256=review.get("sha256"),
+                        needs_action="confirm_pdf",
+                        error=review.get("error") or "PDF 需要人工确认",
+                        endnote_status="pending",
+                    )
+                    keep_path = review_path
+                    self.db.event(
+                        batch_id,
+                        "两路均无自动验证结果；已保留最佳 PDF 候选等待确认",
+                        level="warning",
+                        paper_id=paper_id,
+                    )
+                else:
+                    candidate = next(
+                        (item for item in outcomes if item.get("source_url")), {}
+                    )
+                    errors = [
+                        str(item.get("error"))
+                        for item in outcomes
+                        if item.get("error")
+                    ]
+                    self.db.update_paper(
+                        paper_id,
+                        pdf_status="not_found",
+                        status="needs_pdf",
+                        version=None,
+                        source_url=candidate.get("source_url"),
+                        pdf_path=None,
+                        pdf_sha256=None,
+                        needs_action="manual_pdf",
+                        error="；".join(errors) or "两条自动获取路径均未取得可验证 PDF",
+                        endnote_status="pending",
+                    )
+                    self.db.event(
+                        batch_id,
+                        "开放获取与机构路径均未取得可验证 PDF，已转入人工队列",
+                        level="warning",
+                        paper_id=paper_id,
+                    )
+        except asyncio.CancelledError:
+            for task in pending:
+                task.cancel()
+            await asyncio.gather(*pending, return_exceptions=True)
+            raise
+        finally:
+            self._cleanup_race_files(paper_id, keep=keep_path)
+            self._staged_browser_downloads.pop(paper_id, None)
+            self._staged_browser_papers.discard(paper_id)
+        if self.institution_gap_seconds:
+            await asyncio.sleep(self.institution_gap_seconds)
+
     def confirm_metadata(self, paper_id: str, metadata: dict[str, Any]) -> None:
         self.db.assert_paper_writable(paper_id)
         paper = self.db.get_paper(paper_id)
@@ -413,7 +799,44 @@ class PipelineManager:
             self._institution_session_ready = True
             self.db.event(batch_id, f"{self.settings.institution.name} 会话已就绪，开始逐篇获取")
         try:
-            await self.acquire_institution_pdf(paper["id"])
+            download_started = False
+            async with asyncio.timeout(self.institution_discovery_timeout_seconds) as discovery_timeout:
+                def mark_download_started() -> None:
+                    nonlocal download_started
+                    if download_started:
+                        return
+                    download_started = True
+                    discovery_timeout.reschedule(None)
+                    self.db.event(
+                        batch_id,
+                        "已定位 PDF 入口；下载与校验阶段不计入发现超时",
+                        paper_id=paper["id"],
+                    )
+
+                await self.acquire_institution_pdf(
+                    paper["id"], on_download_started=mark_download_started
+                )
+        except TimeoutError as exc:
+            if not discovery_timeout.expired():
+                message = str(exc).strip() or "下载或 PDF 校验阶段超时"
+                self.db.update_paper(
+                    paper["id"], status="needs_pdf", pdf_status="not_found",
+                    needs_action="manual_pdf", error=message,
+                )
+                self.db.event(
+                    batch_id,
+                    f"机构自动获取未完成：{message}",
+                    level="warning",
+                    paper_id=paper["id"],
+                )
+                return
+            seconds = f"{self.institution_discovery_timeout_seconds:g}"
+            message = f"机构 PDF 入口发现超过单篇 {seconds} 秒上限，已转入人工队列"
+            self.db.update_paper(
+                paper["id"], status="needs_pdf", pdf_status="not_found",
+                needs_action="manual_pdf", error=message,
+            )
+            self.db.event(batch_id, message, level="warning", paper_id=paper["id"])
         except LoginTimeoutError:
             raise
         except PublisherBlockedError as exc:
@@ -429,7 +852,12 @@ class PipelineManager:
             )
             self.db.event(batch_id, f"机构自动获取未完成：{exc}", level="warning", paper_id=paper["id"])
 
-    async def acquire_institution_pdf(self, paper_id: str) -> dict[str, Any]:
+    async def acquire_institution_pdf(
+        self,
+        paper_id: str,
+        *,
+        on_download_started: Callable[[], None] | None = None,
+    ) -> dict[str, Any]:
         self.db.assert_paper_writable(paper_id)
         paper = self.db.get_paper(paper_id)
         if not paper:
@@ -449,7 +877,9 @@ class PipelineManager:
             paper_id=paper_id,
         )
         try:
-            result = await self.browser.acquire_for_paper(paper_id, target)
+            result = await self.browser.acquire_for_paper(
+                paper_id, target, on_download_started=on_download_started
+            )
             updated = self.db.get_paper(paper_id)
             if not updated or updated.get("pdf_status") != "verified":
                 raise ValueError(updated.get("error") if updated else "PDF 下载后的身份核验未通过")
@@ -480,6 +910,15 @@ class PipelineManager:
 
     async def _browser_downloaded(self, paper_id: str, path: Path) -> None:
         if self.db.is_batch_deleting_for_paper(paper_id):
+            return
+        if paper_id in self._staged_browser_papers:
+            self._staged_browser_downloads.setdefault(paper_id, set()).add(path)
+            return
+        paper = self.db.get_paper(paper_id)
+        if paper and paper.get("pdf_status") in {"verified", "accepted"}:
+            existing = Path(paper["pdf_path"]) if paper.get("pdf_path") else None
+            if existing is None or existing.resolve() != path.resolve():
+                path.unlink(missing_ok=True)
             return
         try:
             await self.accept_local_pdf(paper_id, path)

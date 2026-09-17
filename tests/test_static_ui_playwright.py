@@ -226,6 +226,8 @@ class StaticUiPlaywrightTests(unittest.IsolatedAsyncioTestCase):
                 "available_count": 1,
                 "available_size": 128,
             }
+        elif path == "/api/tools/rename-pdfs":
+            payload = {"renamed": 0, "skipped": 0, "files": []}
         else:
             await route.fulfill(
                 status=404,
@@ -303,6 +305,16 @@ class StaticUiPlaywrightTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(candidate_payloads[-1]["zotero_library_name"], "Lab Library")
         self.assertEqual(candidate_payloads[-1]["collection_key"], "GROUP001")
         self.assertFalse(candidate_payloads[-1]["whole_library"])
+
+        await self.page.locator("#rename-scheme").select_option("title_only")
+        await self.page.locator("#rename-pdfs-form button[type='submit']").click()
+        await expect(self.page.locator("#rename-result")).to_contain_text("已重命名 0 个")
+        rename_payloads = [
+            payload
+            for path, payload in self.api_requests
+            if path == "/api/tools/rename-pdfs"
+        ]
+        self.assertEqual(rename_payloads[-1]["rename_scheme"], "title_only")
 
         await self.page.locator("#export-source").select_option("endnote")
         await expect(self.page.locator("#endnote-library-paths option")).to_have_count(2)

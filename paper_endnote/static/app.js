@@ -1480,7 +1480,7 @@ $("#sync-zotero-collection").addEventListener("input", event => { event.currentT
 
 $("#rename-pdfs-form").addEventListener("submit", event => {
   event.preventDefault();
-  submitToolForm(event.currentTarget, $("#rename-result"), "正在重命名…", () => api("/api/tools/rename-pdfs", {method: "POST", body: JSON.stringify({source: $("#rename-source").value, batch_id: $("#rename-batch").value, endnote_library: $("#rename-endnote-library").value, ...selectedZoteroScope("rename")})}), result => `已重命名 ${result.renamed} 个，跳过 ${result.skipped} 个${(result.warnings || []).length ? `，${result.warnings.length} 个已回查确认` : ""}`);
+  submitToolForm(event.currentTarget, $("#rename-result"), "正在重命名…", () => api("/api/tools/rename-pdfs", {method: "POST", body: JSON.stringify({source: $("#rename-source").value, batch_id: $("#rename-batch").value, endnote_library: $("#rename-endnote-library").value, rename_scheme: $("#rename-scheme").value, ...selectedZoteroScope("rename")})}), result => `已重命名 ${result.renamed} 个，跳过 ${result.skipped} 个${(result.warnings || []).length ? `，${result.warnings.length} 个已回查确认` : ""}`);
 });
 
 $("#export-pdfs-form").addEventListener("submit", event => {

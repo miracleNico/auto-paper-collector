@@ -79,6 +79,10 @@ class PaperActionMenuTests(unittest.TestCase):
         self.assertIn('data-whole-library="true"', self.javascript)
         self.assertIn('id="rename-collection" disabled', self.html)
         self.assertIn('type="submit" disabled>开始重命名', self.html)
+        self.assertIn('id="rename-scheme"', self.html)
+        self.assertIn('value="year_author_title"', self.html)
+        self.assertIn('value="title_only"', self.html)
+        self.assertIn('rename_scheme: $("#rename-scheme").value', self.javascript)
 
     def test_pdf_export_ignores_stale_candidate_requests(self) -> None:
         self.assertIn("exportRequestToken: 0", self.javascript)

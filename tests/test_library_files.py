@@ -35,15 +35,27 @@ MINIMAL_PDF = b"%PDF-1.4\n1 0 obj<<>>endobj\ntrailer<<>>\n%%EOF\n"
 
 
 class LibraryFilesTests(unittest.TestCase):
-    def test_bibliographic_filename_uses_author_dash_title(self) -> None:
+    def test_bibliographic_filename_uses_year_last_first_and_full_title(self) -> None:
         name = bibliographic_filename(
             {"authors": ["Cao, Yue"], "year": 2013, "title": "Routing in DTN", "doi": "10.1109/surv.2012.042512.00053"}
         )
-        self.assertEqual(name, "Yue Cao - Routing in DTN.pdf")
+        self.assertEqual(name, "2013 - Cao, Yue - Routing in DTN.pdf")
         self.assertEqual(
-            bibliographic_filename({"authors": ["Anna Zhivtsova"], "title": "A Survey of Delay-Oriented Policies"}),
-            "Anna Zhivtsova - A Survey of Delay-Oriented Policies.pdf",
+            bibliographic_filename({"authors": ["Anna Zhivtsova"], "year": "2024", "title": "A Survey of Delay-Oriented Policies"}),
+            "2024 - Zhivtsova, Anna - A Survey of Delay-Oriented Policies.pdf",
         )
+        self.assertEqual(
+            bibliographic_filename(
+                {"authors": ["Cao, Yue"], "year": 2013, "title": "Routing in DTN"},
+                naming_scheme="title_only",
+            ),
+            "Routing in DTN.pdf",
+        )
+        long_name = bibliographic_filename(
+            {"authors": ["Cao, Yue"], "year": 2013, "title": "A" * 300}
+        )
+        self.assertEqual(len(long_name), 180)
+        self.assertTrue(long_name.endswith(".pdf"))
 
     def test_rename_and_export_batch_pdfs(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -73,13 +85,13 @@ class LibraryFilesTests(unittest.TestCase):
             paper = db.get_paper(paper_id)
             path = Path(paper["pdf_path"])
             self.assertTrue(path.is_file())
-            self.assertEqual(path.name, "Jane Doe - Example Paper.pdf")
+            self.assertEqual(path.name, "2024 - Doe, Jane - Example Paper.pdf")
             self.assertFalse(source.exists())
 
             destination = root / "export"
             exported = export_batch_pdfs(db, batch_id, destination)
             self.assertEqual(exported["copied"], 1)
-            self.assertTrue((destination / "Jane Doe - Example Paper.pdf").is_file())
+            self.assertTrue((destination / "2024 - Doe, Jane - Example Paper.pdf").is_file())
             self.assertTrue(path.is_file())
 
     def test_export_batch_pdfs_only_copies_selected_paper(self) -> None:
@@ -126,7 +138,7 @@ class LibraryFilesTests(unittest.TestCase):
             self.assertEqual(result["files"][0]["paper_id"], papers[1]["id"])
             self.assertEqual(
                 [path.name for path in destination.glob("*.pdf")],
-                ["Number 2 Author - Paper 2.pdf"],
+                ["Author, Number 2 - Paper 2.pdf"],
             )
 
     def test_export_batch_pdfs_rejects_empty_and_unknown_selection(self) -> None:
@@ -259,11 +271,24 @@ class LibraryFilesTests(unittest.TestCase):
 
     def test_rename_same_name_is_noop(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / "Jane Doe - Example.pdf"
+            path = Path(directory) / "2024 - Doe, Jane - Example.pdf"
             path.write_bytes(MINIMAL_PDF)
             result = rename_pdf_file(path, {"authors": ["Doe, Jane"], "year": 2024, "title": "Example"})
             self.assertFalse(result["renamed"])
             self.assertTrue(path.is_file())
+
+    def test_rename_pdf_file_supports_title_only_scheme(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "old.pdf"
+            source.write_bytes(MINIMAL_PDF)
+            result = rename_pdf_file(
+                source,
+                {"authors": ["Doe, Jane"], "year": 2024, "title": "Full Paper Title"},
+                naming_scheme="title_only",
+            )
+            self.assertTrue(result["renamed"])
+            self.assertEqual(result["filename"], "Full Paper Title.pdf")
+            self.assertTrue((source.parent / "Full Paper Title.pdf").is_file())
 
     def test_downloads_library_dir_uses_lib_name(self) -> None:
         path = downloads_library_dir("DTN")
@@ -343,7 +368,7 @@ class LibraryFilesTests(unittest.TestCase):
             self.assertEqual(result["files"][0]["item_id"], "ref:2")
             self.assertEqual(
                 [path.name for path in destination.glob("*.pdf")],
-                ["Bob Beta - Second EndNote Paper.pdf"],
+                ["2024 - Beta, Bob - Second EndNote Paper.pdf"],
             )
 
     def test_export_endnote_orphan_selection_without_sdb(self) -> None:
@@ -489,10 +514,15 @@ class LibraryFilesTests(unittest.TestCase):
             )
             connection.commit()
             connection.close()
+            pdb = sqlite3.connect(sdb_dir / "pdb.eni")
+            pdb.execute("CREATE TABLE pdf_index (refs_id INTEGER, subkey BLOB)")
+            pdb.execute("INSERT INTO pdf_index VALUES (1, 'old.pdf')")
+            pdb.commit()
+            pdb.close()
 
             result = rename_endnote_pdfs(library, require_closed=False)
             self.assertEqual(result["renamed"], 1)
-            renamed = pdf_dir / "Jane Doe - Example Paper.pdf"
+            renamed = pdf_dir / "2024 - Doe, Jane - Example Paper.pdf"
             self.assertTrue(renamed.is_file())
             self.assertFalse(source.exists())
             stored_db = sqlite3.connect(sdb_dir / "sdb.eni")
@@ -502,8 +532,79 @@ class LibraryFilesTests(unittest.TestCase):
                 ).fetchone()
             finally:
                 stored_db.close()
-            self.assertEqual(stored[0], "internal-pdf://12345/Jane Doe - Example Paper.pdf")
-            self.assertEqual(stored[1], "internal-pdf://12345/Jane Doe - Example Paper.pdf")
+            self.assertEqual(stored[0], "internal-pdf://12345/2024 - Doe, Jane - Example Paper.pdf")
+            self.assertEqual(stored[1], "internal-pdf://12345/2024 - Doe, Jane - Example Paper.pdf")
+            stored_pdb = sqlite3.connect(sdb_dir / "pdb.eni")
+            try:
+                self.assertEqual(
+                    stored_pdb.execute("SELECT subkey FROM pdf_index").fetchone()[0],
+                    "2024 - Doe, Jane - Example Paper.pdf",
+                )
+            finally:
+                stored_pdb.close()
+
+    def test_rename_endnote_25_relative_path_updates_sdb_and_pdb(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            library = root / "EndNote25.enl"
+            library.write_bytes(b"")
+            relative = "3608265384/A_Design_Framework_for_Invertible_Logic.pdf"
+            source = library.with_suffix(".Data") / "PDF" / Path(relative)
+            source.parent.mkdir(parents=True)
+            source.write_bytes(MINIMAL_PDF)
+            sdb_dir = library.with_suffix(".Data") / "sdb"
+            sdb_dir.mkdir()
+            sdb = sqlite3.connect(sdb_dir / "sdb.eni")
+            sdb.execute(
+                "CREATE TABLE refs (id INTEGER PRIMARY KEY, author TEXT, year TEXT, title TEXT, "
+                "secondary_title TEXT, electronic_resource_number TEXT, url TEXT)"
+            )
+            sdb.execute(
+                "CREATE TABLE file_res (refs_id INTEGER, file_path TEXT, file_type INTEGER, file_pos INTEGER)"
+            )
+            sdb.execute(
+                "INSERT INTO refs VALUES (1, 'Onizawa, Naoya', '2021', "
+                "'A Design Framework for Invertible Logic', '', '', "
+                "'https://publisher.example/A_Design_Framework_for_Invertible_Logic.pdf')"
+            )
+            sdb.execute("INSERT INTO file_res VALUES (1, ?, 1, 0)", (relative,))
+            sdb.commit()
+            sdb.close()
+            pdb = sqlite3.connect(sdb_dir / "pdb.eni")
+            pdb.execute(
+                "CREATE TABLE pdf_index (refs_id INTEGER, subkey BLOB)"
+            )
+            pdb.execute("INSERT INTO pdf_index VALUES (1, ?)", (relative,))
+            pdb.commit()
+            pdb.close()
+
+            result = rename_endnote_pdfs(library, require_closed=False)
+
+            expected_name = "2021 - Onizawa, Naoya - A Design Framework for Invertible Logic.pdf"
+            expected_relative = f"3608265384/{expected_name}"
+            self.assertEqual(result["renamed"], 1)
+            self.assertEqual(result["skipped"], 0)
+            self.assertTrue((source.parent / expected_name).is_file())
+            stored_sdb = sqlite3.connect(sdb_dir / "sdb.eni")
+            try:
+                self.assertEqual(
+                    stored_sdb.execute("SELECT file_path FROM file_res").fetchone()[0],
+                    expected_relative,
+                )
+                self.assertEqual(
+                    stored_sdb.execute("SELECT url FROM refs").fetchone()[0],
+                    "https://publisher.example/A_Design_Framework_for_Invertible_Logic.pdf",
+                )
+            finally:
+                stored_sdb.close()
+            stored_pdb = sqlite3.connect(sdb_dir / "pdb.eni")
+            try:
+                self.assertEqual(
+                    stored_pdb.execute("SELECT subkey FROM pdf_index").fetchone()[0],
+                    expected_relative,
+                )
+            finally:
+                stored_pdb.close()
 
     def test_rename_endnote_pdfs_skips_attachment_path_outside_pdf_root(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -583,7 +684,7 @@ class LibraryFilesTests(unittest.TestCase):
             self.assertEqual(result["renamed"], 0)
             self.assertEqual(result["skipped"], 1)
             self.assertTrue(document.is_file())
-            self.assertFalse((attachment_dir / "Jane Doe - Notes.pdf").exists())
+            self.assertFalse((attachment_dir / "2024 - Doe, Jane - Notes.pdf").exists())
 
     def test_rename_endnote_pdfs_rolls_back_prior_files_on_later_failure(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -622,12 +723,12 @@ class LibraryFilesTests(unittest.TestCase):
             connection.close()
             calls = 0
 
-            def fail_second_rename(path, metadata):
+            def fail_second_rename(path, metadata, **kwargs):
                 nonlocal calls
                 calls += 1
                 if calls == 2:
                     raise OSError("second rename failed")
-                return rename_pdf_file(path, metadata)
+                return rename_pdf_file(path, metadata, **kwargs)
 
             with (
                 patch(
@@ -639,7 +740,7 @@ class LibraryFilesTests(unittest.TestCase):
                 rename_endnote_pdfs(library, require_closed=False)
 
             self.assertTrue(all(path.is_file() for path in originals))
-            self.assertFalse((pdf_root / "ITEM1" / "Jane Doe - Paper 1.pdf").exists())
+            self.assertFalse((pdf_root / "ITEM1" / "2024 - Doe, Jane - Paper 1.pdf").exists())
             stored_db = sqlite3.connect(sdb_dir / "sdb.eni")
             try:
                 stored_paths = [
@@ -692,7 +793,7 @@ class LibraryFilesTests(unittest.TestCase):
 
             result = rename_endnote_pdfs(library, require_closed=False)
 
-            renamed = pdf_dir / "Jane Doe - Shared Paper.pdf"
+            renamed = pdf_dir / "2024 - Doe, Jane - Shared Paper.pdf"
             self.assertEqual(result["renamed"], 1)
             self.assertEqual(result["skipped"], 0)
             self.assertEqual(result["files"][0]["refs_ids"], [1, 2])
@@ -710,12 +811,12 @@ class LibraryFilesTests(unittest.TestCase):
                 rows,
                 [
                     (
-                        "internal-pdf://SHARED/Jane Doe - Shared Paper.pdf",
-                        "internal-pdf://SHARED/Jane Doe - Shared Paper.pdf",
+                        "internal-pdf://SHARED/2024 - Doe, Jane - Shared Paper.pdf",
+                        "internal-pdf://SHARED/2024 - Doe, Jane - Shared Paper.pdf",
                     ),
                     (
-                        "internal-pdf://SHARED/Jane Doe - Shared Paper.pdf",
-                        "internal-pdf://SHARED/Jane Doe - Shared Paper.pdf",
+                        "internal-pdf://SHARED/2024 - Doe, Jane - Shared Paper.pdf",
+                        "internal-pdf://SHARED/2024 - Doe, Jane - Shared Paper.pdf",
                     ),
                 ],
             )
@@ -755,7 +856,7 @@ class LibraryFilesTests(unittest.TestCase):
 
             result = rename_endnote_pdfs(library, require_closed=False)
 
-            expected_name = "Jane Doe - Multiple Files.pdf"
+            expected_name = "2024 - Doe, Jane - Multiple Files.pdf"
             self.assertEqual(result["renamed"], 2)
             self.assertTrue((pdf_root / "FIRST" / expected_name).is_file())
             self.assertTrue((pdf_root / "SECOND" / expected_name).is_file())
@@ -927,7 +1028,7 @@ class ZoteroEndNoteExportTests(unittest.IsolatedAsyncioTestCase):
                 **scope,
             )
             self.assertEqual(exported["copied"], 1)
-            self.assertTrue((destination / "Jane Doe - Scoped Paper.pdf").is_file())
+            self.assertTrue((destination / "2025 - Doe, Jane - Scoped Paper.pdf").is_file())
 
             renamed = await rename_zotero_pdfs(
                 zotero,
@@ -945,7 +1046,7 @@ class ZoteroEndNoteExportTests(unittest.IsolatedAsyncioTestCase):
             )
             self.assertEqual(
                 zotero.rename_calls,
-                [("GROUPATT", "Jane Doe - Scoped Paper.pdf", 7, "group:42")],
+                [("GROUPATT", "2025 - Doe, Jane - Scoped Paper.pdf", 7, "group:42")],
             )
 
     async def test_zotero_rename_restores_file_for_unexpected_failure_or_cancel(self) -> None:
@@ -974,7 +1075,7 @@ class ZoteroEndNoteExportTests(unittest.IsolatedAsyncioTestCase):
                         )
 
                     self.assertTrue(pdf.is_file())
-                    self.assertFalse((root / "Jane Doe - Scoped Paper.pdf").exists())
+                    self.assertFalse((root / "2025 - Doe, Jane - Scoped Paper.pdf").exists())
 
     async def test_zotero_rename_reconciles_lost_patch_response(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -986,7 +1087,7 @@ class ZoteroEndNoteExportTests(unittest.IsolatedAsyncioTestCase):
                 side_effect=RuntimeError("response lost")
             )
             zotero.attachment_filename = AsyncMock(
-                return_value="Jane Doe - Scoped Paper.pdf"
+                return_value="2025 - Doe, Jane - Scoped Paper.pdf"
             )
 
             result = await rename_zotero_pdfs(
@@ -999,7 +1100,7 @@ class ZoteroEndNoteExportTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(result["renamed"], 1)
             self.assertEqual(len(result["warnings"]), 1)
             self.assertFalse(pdf.exists())
-            self.assertTrue((root / "Jane Doe - Scoped Paper.pdf").is_file())
+            self.assertTrue((root / "2025 - Doe, Jane - Scoped Paper.pdf").is_file())
 
     async def test_zotero_rename_preserves_both_names_when_reconciliation_fails(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -1023,7 +1124,7 @@ class ZoteroEndNoteExportTests(unittest.IsolatedAsyncioTestCase):
                 )
 
             self.assertTrue(pdf.is_file())
-            self.assertTrue((root / "Jane Doe - Scoped Paper.pdf").is_file())
+            self.assertTrue((root / "2025 - Doe, Jane - Scoped Paper.pdf").is_file())
 
     async def test_zotero_rename_never_overwrites_reappeared_original(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -1049,7 +1150,7 @@ class ZoteroEndNoteExportTests(unittest.IsolatedAsyncioTestCase):
                 )
 
             self.assertEqual(pdf.read_bytes(), b"replacement created during PATCH")
-            self.assertTrue((root / "Jane Doe - Scoped Paper.pdf").is_file())
+            self.assertTrue((root / "2025 - Doe, Jane - Scoped Paper.pdf").is_file())
 
     async def test_zotero_rename_reports_prior_success_when_later_item_fails(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -1113,7 +1214,7 @@ class ZoteroEndNoteExportTests(unittest.IsolatedAsyncioTestCase):
                     collection_key="COLLKEY1",
                 )
 
-            self.assertTrue((root / "Jane Doe - Paper 1.pdf").is_file())
+            self.assertTrue((root / "Doe, Jane - Paper 1.pdf").is_file())
             self.assertTrue(pdfs["ITEM2"].is_file())
 
     async def test_zotero_rename_restores_file_when_attachment_key_is_missing(self) -> None:
@@ -1144,7 +1245,7 @@ class ZoteroEndNoteExportTests(unittest.IsolatedAsyncioTestCase):
                 )
 
             self.assertTrue(pdf.is_file())
-            self.assertFalse((root / "Jane Doe - Scoped Paper.pdf").exists())
+            self.assertFalse((root / "2025 - Doe, Jane - Scoped Paper.pdf").exists())
 
     async def test_export_zotero_pdfs_does_not_resolve_unselected_item(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -1177,7 +1278,7 @@ class ZoteroEndNoteExportTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(result["files"][0]["zotero_key"], "ITEM2")
             self.assertEqual(
                 [path.name for path in destination.glob("*.pdf")],
-                ["Zotero 2 Author - Zotero Paper 2.pdf"],
+                ["2022 - Author, Zotero 2 - Zotero Paper 2.pdf"],
             )
 
     async def test_export_zotero_pdfs_rolls_back_before_row_failure(self) -> None:

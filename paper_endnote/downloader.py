@@ -21,7 +21,9 @@ def safe_filename(value: str, fallback: str = "paper.pdf") -> str:
         name = fallback
     if not name.casefold().endswith(".pdf"):
         name += ".pdf"
-    return name[:180]
+    if len(name) > 180:
+        name = name[:-4][:176].rstrip(" .") + ".pdf"
+    return name
 
 
 def filename_from_url(url: str, fallback: str) -> str:

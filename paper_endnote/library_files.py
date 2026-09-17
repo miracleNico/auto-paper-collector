@@ -26,6 +26,9 @@ class LibraryFilesError(ValueError):
     pass
 
 
+RENAME_SCHEMES = {"year_author_title", "title_only"}
+
+
 def _plain(value: Any) -> str:
     if value is None:
         return ""
@@ -38,19 +41,32 @@ def _author_display_name(author: str) -> str:
         return ""
     if "," in name:
         last, first = (part.strip() for part in name.split(",", 1))
-        return " ".join(part for part in (first, last) if part)
+        return ", ".join(part for part in (last, first) if part)
+    parts = name.split()
+    if len(parts) > 1:
+        return f"{parts[-1]}, {' '.join(parts[:-1])}"
     return name
 
 
-def bibliographic_filename(metadata: dict[str, Any], fallback: str = "paper") -> str:
+def bibliographic_filename(
+    metadata: dict[str, Any],
+    fallback: str = "paper",
+    *,
+    naming_scheme: str = "year_author_title",
+) -> str:
+    if naming_scheme not in RENAME_SCHEMES:
+        raise LibraryFilesError("未知 PDF 命名格式")
     authors = metadata.get("authors") or []
     name = _author_display_name(authors[0]) if authors else ""
     title = re.sub(r"\s+", " ", _plain(metadata.get("title") or "")).strip()
+    year_match = re.search(r"\b(?:18|19|20|21)\d{2}\b", _plain(metadata.get("year")))
+    year = year_match.group(0) if year_match else ""
     doi = normalize_doi(metadata.get("doi")) or ""
-    if name and title:
-        stem = f"{name} - {title}"
+    if naming_scheme == "title_only":
+        stem = title or (doi.replace("/", "_") if doi else fallback)
     else:
-        stem = name or title or (doi.replace("/", "_") if doi else fallback)
+        parts = [part for part in (year, name, title) if part]
+        stem = " - ".join(parts) or (doi.replace("/", "_") if doi else fallback)
     return safe_filename(f"{stem}.pdf")
 
 
@@ -130,11 +146,20 @@ def paper_metadata(paper: dict[str, Any]) -> dict[str, Any]:
     return metadata
 
 
-def rename_pdf_file(path: Path, metadata: dict[str, Any]) -> dict[str, Any]:
+def rename_pdf_file(
+    path: Path,
+    metadata: dict[str, Any],
+    *,
+    naming_scheme: str = "year_author_title",
+) -> dict[str, Any]:
     source = Path(path)
     if not source.is_file():
         raise LibraryFilesError(f"PDF 不存在：{source}")
-    filename = bibliographic_filename(metadata, source.stem)
+    filename = bibliographic_filename(
+        metadata,
+        source.stem,
+        naming_scheme=naming_scheme,
+    )
     destination = unique_destination(source.parent, filename, ignore=source)
     if destination.resolve() == source.resolve():
         return {
@@ -570,7 +595,12 @@ def _endnote_pdf_metadata(library: Path) -> dict[Path, dict[str, Any]]:
     return mapping
 
 
-def rename_endnote_pdfs(library: Path, *, require_closed: bool = True) -> dict[str, Any]:
+def rename_endnote_pdfs(
+    library: Path,
+    *,
+    require_closed: bool = True,
+    naming_scheme: str = "year_author_title",
+) -> dict[str, Any]:
     library = _validate_endnote_library(library)
     if require_closed and endnote_desktop_running():
         raise LibraryFilesError("请先完全退出 EndNote，再重命名库内 PDF，否则附件链接会丢失")
@@ -608,10 +638,18 @@ def rename_endnote_pdfs(library: Path, *, require_closed: bool = True) -> dict[s
         current_urls: dict[int, str] = {}
         for row in rows:
             stored = str(row["file_path"] or "").replace("\\", "/")
-            if not stored.casefold().startswith("internal-pdf://"):
+            internal = stored.casefold().startswith("internal-pdf://")
+            external = stored.casefold().startswith("file:") or bool(
+                re.match(r"^[A-Za-z]:/", stored)
+            )
+            if not stored or external:
                 skipped += 1
                 continue
-            candidate = resolve_internal_attachment(library, stored)
+            if internal:
+                candidate = resolve_internal_attachment(library, stored)
+            else:
+                relative = Path(stored.replace("/", os.sep))
+                candidate = None if relative.is_absolute() else pdf_root / relative
             source = candidate.resolve() if candidate is not None else None
             if source is None or not source.is_relative_to(resolved_pdf_root):
                 skipped += 1
@@ -637,7 +675,11 @@ def rename_endnote_pdfs(library: Path, *, require_closed: bool = True) -> dict[s
 
         for source, shared_rows in attachment_rows.items():
             metadata = _metadata_from_endnote_ref(shared_rows[0])
-            result = rename_pdf_file(source, metadata)
+            result = rename_pdf_file(
+                source,
+                metadata,
+                naming_scheme=naming_scheme,
+            )
             reference_ids = [row["refs_id"] for row in shared_rows]
             files.append(
                 {
@@ -664,8 +706,20 @@ def rename_endnote_pdfs(library: Path, *, require_closed: bool = True) -> dict[s
                 )
                 refs_id = int(row["refs_id"])
                 url = current_urls.get(refs_id, str(row["url"] or ""))
-                if url and path_name in url:
-                    updated_url = _rewrite_endnote_path(url, path_name, new_name)
+                original_stored = str(row["file_path"] or "")
+                stored_candidates = [
+                    value
+                    for value in (original_stored, stored)
+                    if value and value in url
+                ]
+                if url and stored_candidates:
+                    old_url_path = stored_candidates[0]
+                    replacement_path = (
+                        new_path
+                        if old_url_path == original_stored
+                        else str(new_path).replace("\\", "/")
+                    )
+                    updated_url = url.replace(old_url_path, replacement_path)
                     connection.execute(
                         "UPDATE refs SET url = ? WHERE id = ?",
                         (
@@ -676,10 +730,18 @@ def rename_endnote_pdfs(library: Path, *, require_closed: bool = True) -> dict[s
                     current_urls[refs_id] = updated_url
                 if pdb_connection is not None:
                     try:
-                        pdb_connection.execute(
-                            "UPDATE pdf_index SET subkey = ? WHERE refs_id = ? AND subkey = ?",
-                            (new_name, row["refs_id"], old_name),
-                        )
+                        replacements = {
+                            old_name: new_name,
+                            str(row["file_path"] or ""): new_path,
+                            stored: str(new_path).replace("\\", "/"),
+                        }
+                        for old_subkey, new_subkey in replacements.items():
+                            if old_subkey and old_subkey != new_subkey:
+                                pdb_connection.execute(
+                                    "UPDATE pdf_index SET subkey = ? "
+                                    "WHERE refs_id = ? AND subkey = ?",
+                                    (new_subkey, row["refs_id"], old_subkey),
+                                )
                     except sqlite3.DatabaseError:
                         pass
             renamed += 1
@@ -733,7 +795,12 @@ def rename_endnote_pdfs(library: Path, *, require_closed: bool = True) -> dict[s
     }
 
 
-def rename_batch_pdfs(database: Database, batch_id: str) -> dict[str, Any]:
+def rename_batch_pdfs(
+    database: Database,
+    batch_id: str,
+    *,
+    naming_scheme: str = "year_author_title",
+) -> dict[str, Any]:
     batch = database.get_batch(batch_id)
     if not batch:
         raise LibraryFilesError("批次不存在")
@@ -745,7 +812,11 @@ def rename_batch_pdfs(database: Database, batch_id: str) -> dict[str, Any]:
         if not path or paper.get("pdf_status") not in {"verified", "accepted"}:
             skipped += 1
             continue
-        result = rename_pdf_file(Path(path), paper_metadata(paper))
+        result = rename_pdf_file(
+            Path(path),
+            paper_metadata(paper),
+            naming_scheme=naming_scheme,
+        )
         if result["renamed"]:
             database.update_paper(paper["id"], pdf_path=result["path"])
             renamed += 1
@@ -862,6 +933,7 @@ async def rename_zotero_pdfs(
     library_id: str = "user:0",
     collection_key: str = "",
     whole_library: bool = False,
+    naming_scheme: str = "year_author_title",
 ) -> dict[str, Any]:
     renamed = 0
     skipped = 0
@@ -916,7 +988,11 @@ async def rename_zotero_pdfs(
             skipped += 1
             continue
         try:
-            result = rename_pdf_file(Path(path), row["metadata"])
+            result = rename_pdf_file(
+                Path(path),
+                row["metadata"],
+                naming_scheme=naming_scheme,
+            )
         except Exception as exc:
             raise LibraryFilesError(
                 failure_message(f"重命名 Zotero 条目 {key} 的文件失败：{exc}")

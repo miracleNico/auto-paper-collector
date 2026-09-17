@@ -73,8 +73,9 @@
       <div class="tool-grid">
         <form id="rename-pdfs-form" class="panel tool-card">
           <div class="card-icon pink" aria-hidden="true">Aa</div>
-          <div class="card-heading"><h2>重命名 PDF</h2><button class="help-button" type="button" data-help="默认格式为“一作姓名 - 标题.pdf”。选择 EndNote 时请先完全退出 EndNote。" aria-label="重命名帮助">?</button></div>
+          <div class="card-heading"><h2>重命名 PDF</h2><button class="help-button" type="button" data-help="默认格式为“YYYY - Last, First - 完整标题.pdf”，也可只保留完整标题。选择 EndNote 时请先完全退出 EndNote。" aria-label="重命名帮助">?</button></div>
           <label><span class="field-label">数据区</span><select id="rename-source"><option value="zotero">Zotero 库 / collection</option><option value="batch">本机批次下载目录</option><option value="endnote">EndNote 库数据区</option></select></label>
+          <label><span class="field-label">命名格式</span><select id="rename-scheme"><option value="year_author_title">YYYY - Last, First - 完整标题</option><option value="title_only">仅完整标题</option></select></label>
           <label id="rename-zotero-library-wrap"><span class="field-label">Zotero 库</span><select id="rename-zotero-library" disabled><option>正在读取…</option></select></label>
           <label id="rename-collection-wrap"><span class="field-label">范围</span><select id="rename-collection" disabled><option>正在读取…</option></select></label>
           <label id="rename-batch-wrap" hidden><span class="field-label">本机批次</span><select id="rename-batch"></select></label>

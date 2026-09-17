@@ -213,12 +213,14 @@ class ToolApiTests(unittest.IsolatedAsyncioTestCase):
         ):
             result = await app_module.tool_rename_pdfs(
                 app_module.LibraryToolRequest(
-                    source="endnote", endnote_library=str(selected)
+                    source="endnote",
+                    endnote_library=str(selected),
+                    rename_scheme="title_only",
                 )
             )
 
         self.assertEqual(result, rename_result)
-        rename.assert_called_once_with(selected)
+        rename.assert_called_once_with(selected, naming_scheme="title_only")
         self.assertEqual(settings.endnote_library, configured)
 
     async def test_endnote_candidates_and_export_share_selected_library(self) -> None:
@@ -275,7 +277,10 @@ class ToolApiTests(unittest.IsolatedAsyncioTestCase):
             await app_module.tool_rename_pdfs(
                 app_module.LibraryToolRequest(source="endnote")
             )
-        rename.assert_called_once_with(configured)
+        rename.assert_called_once_with(
+            configured,
+            naming_scheme="year_author_title",
+        )
 
     async def test_endnote_tool_rejects_relative_per_request_library(self) -> None:
         from fastapi import HTTPException
@@ -317,6 +322,7 @@ class ToolApiTests(unittest.IsolatedAsyncioTestCase):
             library_id="group:42",
             collection_key="COLL0042",
             whole_library=False,
+            naming_scheme="year_author_title",
         )
         list_items.assert_awaited_once_with(
             pipeline.zotero,

@@ -204,6 +204,10 @@ class LibraryToolRequest(BaseModel):
     zotero_library_id: str = Field(default="user:0", max_length=64)
     zotero_library_name: str = Field(default="", max_length=512)
     endnote_library: str = Field(default="", max_length=32767)
+    rename_scheme: str = Field(
+        default="year_author_title",
+        pattern="^(year_author_title|title_only)$",
+    )
     destination: str = ""
     open_folder: bool = False
     item_ids: list[str] | None = Field(default=None, max_length=10000)
@@ -490,7 +494,11 @@ async def tool_rename_pdfs(payload: LibraryToolRequest) -> dict[str, Any]:
                 require_batch(batch_id, writable=True)
                 async with pipeline.track_batch_work(batch_id, cancellable=False):
                     async with pipeline.zotero_operation_guard():
-                        return rename_batch_pdfs(database, batch_id)
+                        return rename_batch_pdfs(
+                            database,
+                            batch_id,
+                            naming_scheme=payload.rename_scheme,
+                        )
             if payload.source == "zotero":
                 async with pipeline.zotero_operation_guard():
                     return await rename_zotero_pdfs(
@@ -499,9 +507,13 @@ async def tool_rename_pdfs(payload: LibraryToolRequest) -> dict[str, Any]:
                         library_id=payload.zotero_library_id.strip() or "user:0",
                         collection_key=payload.collection_key.strip(),
                         whole_library=payload.whole_library,
+                        naming_scheme=payload.rename_scheme,
                     )
             if payload.source == "endnote":
-                return rename_endnote_pdfs(selected_endnote_library(payload))
+                return rename_endnote_pdfs(
+                    selected_endnote_library(payload),
+                    naming_scheme=payload.rename_scheme,
+                )
             raise LibraryFilesError("未知数据区")
         except LibraryFilesError as exc:
             raise HTTPException(400, str(exc)) from exc

@@ -17,6 +17,9 @@ const state = {
   exportItems: [],
   exportRequestToken: 0,
   exportController: null,
+  toolSourcesRequestToken: 0,
+  toolSourcesController: null,
+  zoteroCollectionTokens: {rename: 0, export: 0},
   deletePreviewToken: 0,
   pendingDeleteIds: [],
   deleteOperationId: null,
@@ -867,18 +870,61 @@ function optionList(items, valueKey, labelFn) {
 
 function syncToolSource(prefix) {
   const source = $(`#${prefix}-source`).value;
+  const zoteroLibraryWrap = $(`#${prefix}-zotero-library-wrap`);
+  if (zoteroLibraryWrap) zoteroLibraryWrap.hidden = source !== "zotero";
   $(`#${prefix}-collection-wrap`).hidden = source !== "zotero";
   $(`#${prefix}-batch-wrap`).hidden = source !== "batch";
   const endnoteWrap = $(`#${prefix}-endnote-wrap`);
   if (endnoteWrap) endnoteWrap.hidden = source !== "endnote";
+  const submit = $(`#${prefix}-pdfs-form button[type='submit']`);
+  if (prefix === "rename" && submit) updateRenameSubmitState();
   if (prefix === "export") fillExportDestination();
+}
+
+function selectedZoteroScope(prefix) {
+  const collection = $(`#${prefix}-collection`);
+  const selected = collection?.selectedOptions?.[0];
+  const library = $(`#${prefix}-zotero-library`);
+  const selectedLibrary = library?.selectedOptions?.[0];
+  const wholeLibrary = selected?.dataset.wholeLibrary === "true";
+  const placeholder = selected?.dataset.scopePlaceholder === "true";
+  return {
+    zotero_library_id: library?.value || "user:0",
+    zotero_library_name: selectedLibrary?.dataset.name || selectedLibrary?.textContent || "",
+    collection_key: wholeLibrary || placeholder ? "" : collection?.value || "",
+    collection: wholeLibrary || placeholder ? "" : selected?.dataset.name || "",
+    collection_path: wholeLibrary || placeholder ? "" : selected?.dataset.path || selected?.dataset.name || "",
+    whole_library: Boolean(collection && !collection.disabled && wholeLibrary),
+  };
+}
+
+function toolSourceReady(prefix) {
+  const source = $(`#${prefix}-source`).value;
+  if (source === "batch") return Boolean($(`#${prefix}-batch`).value);
+  if (source === "endnote") return Boolean($(`#${prefix}-endnote-library`).value.trim());
+  if (source !== "zotero") return false;
+  const library = $(`#${prefix}-zotero-library`);
+  const collection = $(`#${prefix}-collection`);
+  const selected = collection?.selectedOptions?.[0];
+  return Boolean(
+    library && !library.disabled && library.value &&
+    collection && !collection.disabled && selected &&
+    selected.dataset.scopePlaceholder !== "true"
+  );
+}
+
+function updateRenameSubmitState() {
+  const submit = $("#rename-pdfs-form button[type='submit']");
+  if (!submit || submit.hasAttribute("aria-busy")) return;
+  submit.disabled = !toolSourceReady("rename");
 }
 
 function exportSourcePayload() {
   return {
     source: $("#export-source").value,
     batch_id: $("#export-batch").value,
-    collection: $("#export-collection").value,
+    endnote_library: $("#export-endnote-library").value,
+    ...selectedZoteroScope("export"),
   };
 }
 
@@ -931,6 +977,13 @@ async function loadExportItems() {
   $("#export-items").innerHTML = '<div class="picker-state"><span class="spinner" aria-hidden="true"></span><br>正在读取论文…</div>';
   $("#export-select-all").disabled = true;
   $("#export-pdfs-form button[type='submit']").disabled = true;
+  if (!toolSourceReady("export")) {
+    state.exportItems = [];
+    $("#export-items").innerHTML = '<div class="picker-state">请选择有效的数据区和范围</div>';
+    picker.setAttribute("aria-busy", "false");
+    state.exportController = null;
+    return;
+  }
   try {
     const result = await api("/api/tools/export-pdfs/candidates", {
       method: "POST",
@@ -957,17 +1010,107 @@ function fillExportDestination() {
   const downloads = sources.downloads_dir || "";
   const source = $("#export-source").value;
   let name = "";
-  if (source === "zotero") name = $("#export-collection").value;
+  if (source === "zotero") {
+    const scope = selectedZoteroScope("export");
+    const library = $("#export-zotero-library")?.selectedOptions?.[0];
+    name = scope.collection_path || scope.collection || library?.dataset.name || library?.textContent || "";
+  }
   if (source === "batch") {
     const batch = (sources.batches || []).find(item => item.id === $("#export-batch").value);
     name = batch?.target_library || batch?.name || "";
   }
-  if (source === "endnote" && sources.endnote_library) {
-    const parts = String(sources.endnote_library).split(/[/\\]/);
+  if (source === "endnote" && $("#export-endnote-library").value) {
+    const parts = String($("#export-endnote-library").value).split(/[/\\]/);
     name = (parts.at(-1) || "").replace(/\.enl$/i, "");
   }
-  if (downloads && name) $("#export-destination").placeholder = `${downloads}\\${name}`;
-  if (downloads && name && !$("#export-destination").dataset.custom) $("#export-destination").value = `${downloads}\\${name}`;
+  const safeName = String(name || "")
+    .replace(/[<>:"/\\|?*\x00-\x1f]/g, "_")
+    .replace(/[ .]+$/g, "")
+    .trim();
+  if (downloads && safeName) $("#export-destination").placeholder = `${downloads}\\${safeName}`;
+  if (downloads && safeName && !$("#export-destination").dataset.custom) $("#export-destination").value = `${downloads}\\${safeName}`;
+}
+
+function zoteroLibraryOptions(libraries) {
+  if (!libraries.length) return '<option value="user:0" data-name="My Library">My Library</option>';
+  return libraries.map(item => `<option value="${esc(item.id)}" data-name="${esc(item.name)}">${esc(item.name)}${item.type === "group" ? " · Group" : ""}</option>`).join("");
+}
+
+function zoteroCollectionOptions(collections) {
+  const options = [
+    '<option value="" data-scope-placeholder="true">请选择范围</option>',
+    '<option value="__whole_library__" data-whole-library="true" data-name="">整个库</option>',
+  ];
+  options.push(...collections.map(item => {
+    const label = item.path || item.name || item.key;
+    const count = item.numItems == null ? "" : ` · ${item.numItems}`;
+    return `<option value="${esc(item.key)}" data-name="${esc(item.name || label)}" data-path="${esc(label)}">${esc(label)}${esc(count)}</option>`;
+  }));
+  return options.join("");
+}
+
+async function loadZoteroCollections(prefix, supplied = null) {
+  const token = ++state.zoteroCollectionTokens[prefix];
+  const libraryId = $(`#${prefix}-zotero-library`).value || "user:0";
+  const select = $(`#${prefix}-collection`);
+  const submit = $(`#${prefix}-pdfs-form button[type='submit']`);
+  select.disabled = true;
+  select.innerHTML = '<option value="">正在读取…</option>';
+  if (submit && !submit.hasAttribute("aria-busy")) submit.disabled = true;
+  if (prefix === "export") {
+    state.exportRequestToken += 1;
+    state.exportController?.abort();
+    state.exportController = null;
+    state.exportItems = [];
+    $("#export-picker").setAttribute("aria-busy", "true");
+    $("#export-items").innerHTML = '<div class="picker-state"><span class="spinner" aria-hidden="true"></span><br>正在切换 Zotero 库…</div>';
+    $("#export-select-all").disabled = true;
+    $("#export-selection-count").textContent = "0 / 0";
+  }
+  try {
+    const collections = supplied ?? (await api(`/api/tools/zotero-collections?library_id=${encodeURIComponent(libraryId)}`)).collections ?? [];
+    if (token !== state.zoteroCollectionTokens[prefix]) return false;
+    select.innerHTML = zoteroCollectionOptions(collections);
+    if (collections.length) select.value = collections[0].key;
+    select.disabled = false;
+    if (prefix === "rename") updateRenameSubmitState();
+    return true;
+  } catch (error) {
+    if (token !== state.zoteroCollectionTokens[prefix]) return false;
+    select.innerHTML = '<option value="">无法读取库</option>';
+    if (prefix === "export") $("#export-picker").setAttribute("aria-busy", "false");
+    if (prefix === "rename") updateRenameSubmitState();
+    toast(error.message);
+    return false;
+  }
+}
+
+async function pickEndnoteLibrary(prefix) {
+  const input = $(`#${prefix}-endnote-library`);
+  const button = $(`#pick-${prefix}-endnote-library`);
+  setButtonBusy(button, true, "选择中…");
+  try {
+    const result = await api("/api/tools/pick-endnote-library", {
+      method: "POST",
+      body: JSON.stringify({initial_path: input.value}),
+    });
+    if (!result.path) return;
+    input.value = result.path;
+    const list = $("#endnote-library-paths");
+    if (![...list.options].some(option => option.value === result.path)) {
+      list.insertAdjacentHTML("beforeend", `<option value="${esc(result.path)}"></option>`);
+    }
+    if (prefix === "export") {
+      fillExportDestination();
+      await loadExportItems();
+    } else {
+      updateRenameSubmitState();
+    }
+  } catch (error) {
+    toast(error.message);
+  } finally {
+    setButtonBusy(button, false);
+  }
 }
 
 function fillEndnoteDestination() {
@@ -981,19 +1124,62 @@ function fillEndnoteDestination() {
 }
 
 async function loadToolSources() {
+  const token = ++state.toolSourcesRequestToken;
+  state.toolSourcesController?.abort();
+  const controller = new AbortController();
+  state.toolSourcesController = controller;
+  for (const prefix of ["rename", "export"]) {
+    const library = $(`#${prefix}-zotero-library`);
+    const collection = $(`#${prefix}-collection`);
+    if (library) library.disabled = true;
+    if (collection) {
+      collection.disabled = true;
+      collection.innerHTML = '<option value="">正在读取…</option>';
+    }
+    const submit = $(`#${prefix}-pdfs-form button[type='submit']`);
+    if (submit && !submit.hasAttribute("aria-busy")) submit.disabled = true;
+  }
+  state.exportRequestToken += 1;
+  state.exportController?.abort();
+  state.exportController = null;
+  state.exportItems = [];
+  $("#export-select-all").disabled = true;
+  $("#export-selection-count").textContent = "0 / 0";
+  $("#export-items").innerHTML = '<div class="picker-state"><span class="spinner" aria-hidden="true"></span><br>正在读取数据区…</div>';
   try {
-    const sources = await api("/api/tools/sources");
+    const sources = await api("/api/tools/sources", {signal: controller.signal});
+    if (token !== state.toolSourcesRequestToken) return;
     state.toolSources = sources;
     const batches = sources.batches || [];
     const collections = sources.collections || [];
+    const zoteroLibraries = sources.zotero_libraries || [{id: "user:0", name: "My Library", type: "user"}];
+    state.zoteroCollectionTokens.rename += 1;
+    state.zoteroCollectionTokens.export += 1;
     const batchHtml = optionList(batches, "id", item => `${item.name} · ${item.total || 0} 篇`);
-    const collectionHtml = optionList(collections, "name", item => item.numItems == null ? item.name : `${item.name} · ${item.numItems}`);
+    const namedCollectionHtml = optionList(collections, "name", item => item.numItems == null ? item.name : `${item.name} · ${item.numItems}`);
     $("#rename-batch").innerHTML = batchHtml;
     $("#export-batch").innerHTML = batchHtml;
-    $("#rename-collection").innerHTML = collectionHtml;
-    $("#export-collection").innerHTML = collectionHtml;
-    $("#endnote-collection").innerHTML = collectionHtml;
+    $("#rename-zotero-library").innerHTML = zoteroLibraryOptions(zoteroLibraries);
+    $("#export-zotero-library").innerHTML = zoteroLibraryOptions(zoteroLibraries);
+    for (const prefix of ["rename", "export"]) {
+      const library = $(`#${prefix}-zotero-library`);
+      const collection = $(`#${prefix}-collection`);
+      library.disabled = Boolean(sources.zotero_error);
+      if (sources.zotero_error) {
+        collection.innerHTML = '<option value="">无法读取 Zotero 范围</option>';
+        collection.disabled = true;
+      } else {
+        collection.innerHTML = zoteroCollectionOptions(collections);
+        if (collections.length) collection.value = collections[0].key;
+        collection.disabled = false;
+      }
+    }
+    $("#endnote-collection").innerHTML = namedCollectionHtml;
     $("#rename-endnote-library").value = sources.endnote_library || "";
+    $("#export-endnote-library").value = sources.endnote_library || "";
+    $("#endnote-library-paths").innerHTML = sources.endnote_library
+      ? `<option value="${esc(sources.endnote_library)}"></option>`
+      : "";
     $("#sync-endnote-library").value = sources.endnote_library || "";
     $("#sync-zotero-collections").innerHTML = collections
       .map(item => `<option value="${esc(item.name)}"></option>`)
@@ -1014,8 +1200,12 @@ async function loadToolSources() {
     fillEndnoteDestination();
     await loadExportItems();
     if (sources.zotero_error) toast(`Zotero：${sources.zotero_error}`);
+    else if (sources.zotero_library_error) toast(`Zotero 群组库：${sources.zotero_library_error}`);
   } catch (error) {
+    if (token !== state.toolSourcesRequestToken || error.name === "AbortError") return;
     toast(error.message);
+  } finally {
+    if (token === state.toolSourcesRequestToken) state.toolSourcesController = null;
   }
 }
 
@@ -1032,6 +1222,8 @@ async function submitToolForm(form, resultNode, busyText, request, successText) 
     toast(error.message);
   } finally {
     setButtonBusy(button, false);
+    if (form.id === "rename-pdfs-form") updateRenameSubmitState();
+    if (form.id === "export-pdfs-form") updateExportSelection();
   }
 }
 
@@ -1247,8 +1439,20 @@ $("#clear-credentials").addEventListener("click", async event => {
 $("#open-institution-login").addEventListener("click", openInstitutionLogin);
 $("#rename-source").addEventListener("change", () => syncToolSource("rename"));
 $("#export-source").addEventListener("change", async () => { syncToolSource("export"); await loadExportItems(); });
+$("#rename-zotero-library").addEventListener("change", async () => { await loadZoteroCollections("rename"); });
+$("#rename-collection").addEventListener("change", updateRenameSubmitState);
+$("#rename-batch").addEventListener("change", updateRenameSubmitState);
+$("#rename-endnote-library").addEventListener("input", updateRenameSubmitState);
+$("#export-zotero-library").addEventListener("change", async () => {
+  if (!await loadZoteroCollections("export")) return;
+  fillExportDestination();
+  await loadExportItems();
+});
 $("#export-collection").addEventListener("change", async () => { fillExportDestination(); await loadExportItems(); });
 $("#export-batch").addEventListener("change", async () => { fillExportDestination(); await loadExportItems(); });
+$("#export-endnote-library").addEventListener("change", async () => { fillExportDestination(); await loadExportItems(); });
+$("#pick-rename-endnote-library").addEventListener("click", () => pickEndnoteLibrary("rename"));
+$("#pick-export-endnote-library").addEventListener("click", () => pickEndnoteLibrary("export"));
 $("#export-destination").addEventListener("input", () => { $("#export-destination").dataset.custom = "1"; });
 $("#export-select-all").addEventListener("change", event => {
   $$('[data-export-item]:not(:disabled)').forEach(input => { input.checked = event.currentTarget.checked; });
@@ -1260,7 +1464,7 @@ $("#sync-zotero-collection").addEventListener("input", event => { event.currentT
 
 $("#rename-pdfs-form").addEventListener("submit", event => {
   event.preventDefault();
-  submitToolForm(event.currentTarget, $("#rename-result"), "正在重命名…", () => api("/api/tools/rename-pdfs", {method: "POST", body: JSON.stringify({source: $("#rename-source").value, batch_id: $("#rename-batch").value, collection: $("#rename-collection").value})}), result => `已重命名 ${result.renamed} 个，跳过 ${result.skipped} 个`);
+  submitToolForm(event.currentTarget, $("#rename-result"), "正在重命名…", () => api("/api/tools/rename-pdfs", {method: "POST", body: JSON.stringify({source: $("#rename-source").value, batch_id: $("#rename-batch").value, endnote_library: $("#rename-endnote-library").value, ...selectedZoteroScope("rename")})}), result => `已重命名 ${result.renamed} 个，跳过 ${result.skipped} 个${(result.warnings || []).length ? `，${result.warnings.length} 个已回查确认` : ""}`);
 });
 
 $("#export-pdfs-form").addEventListener("submit", event => {
@@ -1271,7 +1475,7 @@ $("#export-pdfs-form").addEventListener("submit", event => {
     $("#export-items").focus?.();
     return;
   }
-  submitToolForm(event.currentTarget, $("#export-result"), "正在导出…", () => api("/api/tools/export-pdfs", {method: "POST", body: JSON.stringify({source: $("#export-source").value, batch_id: $("#export-batch").value, collection: $("#export-collection").value, destination: $("#export-destination").value, open_folder: $("#export-open-folder").checked, item_ids: itemIds})}), result => `已复制 ${result.copied} 个 PDF · ${result.destination}`);
+  submitToolForm(event.currentTarget, $("#export-result"), "正在导出…", () => api("/api/tools/export-pdfs", {method: "POST", body: JSON.stringify({...exportSourcePayload(), destination: $("#export-destination").value, open_folder: $("#export-open-folder").checked, item_ids: itemIds})}), result => `已复制 ${result.copied} 个 PDF · ${result.destination}`);
 });
 
 $("#export-endnote-form").addEventListener("submit", event => {

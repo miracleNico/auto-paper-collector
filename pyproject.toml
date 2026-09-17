@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "paper-endnote"
-version = "0.5.0"
+version = "0.6.0"
 description = "Local Windows workflow: resolve papers, acquire PDFs, write Zotero, then export an EndNote import package."
 requires-python = ">=3.12"
 dependencies = [

@@ -71,19 +71,22 @@
         <form id="rename-pdfs-form" class="panel tool-card">
           <div class="card-icon pink" aria-hidden="true">Aa</div>
           <div class="card-heading"><h2>重命名 PDF</h2><button class="help-button" type="button" data-help="默认格式为“一作姓名 - 标题.pdf”。选择 EndNote 时请先完全退出 EndNote。" aria-label="重命名帮助">?</button></div>
-          <label><span class="field-label">数据区</span><select id="rename-source"><option value="zotero">Zotero collection</option><option value="batch">本机批次下载目录</option><option value="endnote">EndNote 库数据区</option></select></label>
-          <label id="rename-collection-wrap"><span class="field-label">Zotero collection</span><select id="rename-collection"></select></label>
+          <label><span class="field-label">数据区</span><select id="rename-source"><option value="zotero">Zotero 库 / collection</option><option value="batch">本机批次下载目录</option><option value="endnote">EndNote 库数据区</option></select></label>
+          <label id="rename-zotero-library-wrap"><span class="field-label">Zotero 库</span><select id="rename-zotero-library" disabled><option>正在读取…</option></select></label>
+          <label id="rename-collection-wrap"><span class="field-label">范围</span><select id="rename-collection" disabled><option>正在读取…</option></select></label>
           <label id="rename-batch-wrap" hidden><span class="field-label">本机批次</span><select id="rename-batch"></select></label>
-          <label id="rename-endnote-wrap" hidden><span class="field-label">EndNote 库</span><input id="rename-endnote-library" readonly placeholder="请先在设置中填写 .enl 路径"></label>
-          <div class="card-footer"><p id="rename-result" class="result-text" role="status"></p><button class="primary" type="submit">开始重命名</button></div>
+          <div id="rename-endnote-wrap" hidden><label class="field-label" for="rename-endnote-library">EndNote 库</label><span class="path-input"><input id="rename-endnote-library" list="endnote-library-paths" placeholder="选择或粘贴 .enl 的绝对路径"><button id="pick-rename-endnote-library" type="button">选择…</button></span></div>
+          <div class="card-footer"><p id="rename-result" class="result-text" role="status"></p><button class="primary" type="submit" disabled>开始重命名</button></div>
         </form>
 
         <form id="export-pdfs-form" class="panel tool-card">
           <div class="card-icon blue" aria-hidden="true">PDF</div>
           <div class="card-heading"><h2>导出 PDF</h2><button class="help-button" type="button" data-help="目标文件夹留空时，使用 Downloads 下以库名命名的文件夹。" aria-label="PDF 导出帮助">?</button></div>
-          <label><span class="field-label">数据区</span><select id="export-source"><option value="zotero">Zotero collection</option><option value="batch">本机批次</option><option value="endnote">EndNote 库数据区</option></select></label>
-          <label id="export-collection-wrap"><span class="field-label">Zotero collection</span><select id="export-collection"></select></label>
+          <label><span class="field-label">数据区</span><select id="export-source"><option value="zotero">Zotero 库 / collection</option><option value="batch">本机批次</option><option value="endnote">EndNote 库数据区</option></select></label>
+          <label id="export-zotero-library-wrap"><span class="field-label">Zotero 库</span><select id="export-zotero-library" disabled><option>正在读取…</option></select></label>
+          <label id="export-collection-wrap"><span class="field-label">范围</span><select id="export-collection" disabled><option>正在读取…</option></select></label>
           <label id="export-batch-wrap" hidden><span class="field-label">本机批次</span><select id="export-batch"></select></label>
+          <div id="export-endnote-wrap" hidden><label class="field-label" for="export-endnote-library">EndNote 库</label><span class="path-input"><input id="export-endnote-library" list="endnote-library-paths" placeholder="选择或粘贴 .enl 的绝对路径"><button id="pick-export-endnote-library" type="button">选择…</button></span></div>
           <div id="export-picker" class="export-picker" aria-busy="false">
             <div class="export-picker-head">
               <label class="check compact"><input id="export-select-all" type="checkbox" disabled> <span>全选可导出论文</span></label>
@@ -95,8 +98,10 @@
           </div>
           <label><span class="field-label">目标文件夹</span><input id="export-destination" placeholder="C:\Users\...\Downloads\DTN"></label>
           <label class="check"><input id="export-open-folder" type="checkbox" checked> 完成后打开文件夹</label>
-          <div class="card-footer"><p id="export-result" class="result-text" role="status"></p><button class="primary" type="submit">导出 PDF</button></div>
+          <div class="card-footer"><p id="export-result" class="result-text" role="status"></p><button class="primary" type="submit" disabled>导出 PDF</button></div>
         </form>
+
+        <datalist id="endnote-library-paths"></datalist>
 
         <form id="export-endnote-form" class="panel tool-card">
           <div class="card-icon lilac" aria-hidden="true">EN</div>

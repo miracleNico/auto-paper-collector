@@ -7,10 +7,24 @@ from pathlib import Path
 
 import httpx
 
-from paper_endnote.zotero import ZoteroAdapter, item_payload, match_items
+from paper_endnote.zotero import (
+    ZoteroAdapter,
+    ZoteroError,
+    item_payload,
+    match_items,
+    normalize_library_id,
+)
 
 
 class ZoteroTests(unittest.TestCase):
+    def test_normalize_library_id_accepts_only_supported_forms(self) -> None:
+        self.assertEqual(normalize_library_id(), "user:0")
+        self.assertEqual(normalize_library_id("group:42"), "group:42")
+        for library_id in ("group:0", "group:01", "group:42/items", None):
+            with self.subTest(library_id=library_id):
+                with self.assertRaises(ZoteroError):
+                    normalize_library_id(library_id)  # type: ignore[arg-type]
+
     def test_item_payload_and_creator_conversion(self) -> None:
         payload = item_payload(
             {
@@ -48,6 +62,322 @@ class ZoteroTests(unittest.TestCase):
 
 
 class ZoteroAsyncTests(unittest.IsolatedAsyncioTestCase):
+    async def test_list_libraries_includes_personal_and_group_libraries(self) -> None:
+        requests: list[tuple[str, str]] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            requests.append((request.method, request.url.path))
+            headers = {
+                "Zotero-Server-ID": "SERVER123",
+                "Zotero-API-Version": "3",
+                "X-Zotero-Version": "10.0.2",
+            }
+            if request.url.path == "/api/":
+                return httpx.Response(200, headers=headers, json={})
+            if request.url.path == "/api/users/0/groups":
+                return httpx.Response(
+                    200,
+                    headers=headers,
+                    json=[{"data": {"id": 42, "name": "DTN Group"}}],
+                )
+            return httpx.Response(404, headers=headers, text=request.url.path)
+
+        adapter = ZoteroAdapter(api_key="test-key")
+        await adapter.client.aclose()
+        adapter.client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        try:
+            libraries = await adapter.list_libraries()
+        finally:
+            await adapter.close()
+
+        self.assertEqual(libraries[0]["id"], "user:0")
+        self.assertEqual(libraries[0]["type"], "user")
+        self.assertEqual(libraries[1]["id"], "group:42")
+        self.assertEqual(libraries[1]["library_id"], "group:42")
+        self.assertEqual(libraries[1]["name"], "DTN Group")
+        self.assertEqual(
+            requests,
+            [("GET", "/api/"), ("GET", "/api/users/0/groups")],
+        )
+
+    async def test_list_libraries_falls_back_when_group_endpoint_is_unsupported(self) -> None:
+        def handler(request: httpx.Request) -> httpx.Response:
+            headers = {
+                "Zotero-Server-ID": "SERVER123",
+                "Zotero-API-Version": "3",
+                "X-Zotero-Version": "10.0.2",
+            }
+            if request.url.path == "/api/":
+                return httpx.Response(200, headers=headers, json={})
+            if request.url.path == "/api/users/0/groups":
+                return httpx.Response(501, headers=headers)
+            return httpx.Response(404, headers=headers)
+
+        adapter = ZoteroAdapter(api_key="test-key")
+        await adapter.client.aclose()
+        adapter.client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        try:
+            libraries = await adapter.list_libraries()
+        finally:
+            await adapter.close()
+
+        self.assertEqual(
+            libraries,
+            [
+                {
+                    "id": "user:0",
+                    "library_id": "user:0",
+                    "name": "My Library",
+                    "type": "user",
+                }
+            ],
+        )
+
+    async def test_group_library_collections_and_item_iteration_use_group_paths(self) -> None:
+        requests: list[tuple[str, str]] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            requests.append((request.method, request.url.path))
+            headers = {
+                "Zotero-Server-ID": "SERVER123",
+                "Zotero-API-Version": "3",
+                "X-Zotero-Version": "10.0.2",
+            }
+            path = request.url.path
+            if path == "/api/":
+                return httpx.Response(200, headers=headers, json={})
+            if path == "/api/groups/42/collections":
+                return httpx.Response(
+                    200,
+                    headers=headers,
+                    json=[
+                        {
+                            "data": {"key": "COLL1234", "name": "DTN"},
+                            "meta": {"numItems": 1},
+                        }
+                    ],
+                )
+            if path == "/api/groups/42/items/top":
+                return httpx.Response(
+                    200, headers=headers, json=[{"data": {"key": "ALL12345"}}]
+                )
+            if path == "/api/groups/42/collections/COLL1234/items/top":
+                return httpx.Response(
+                    200, headers=headers, json=[{"data": {"key": "ONE12345"}}]
+                )
+            return httpx.Response(404, headers=headers, text=path)
+
+        adapter = ZoteroAdapter(api_key="test-key")
+        await adapter.client.aclose()
+        adapter.client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        try:
+            collections = await adapter.list_collections("group:42")
+            all_items = [
+                item async for item in adapter.iter_library_items("group:42")
+            ]
+            collection_items = [
+                item
+                async for item in adapter.iter_library_items(
+                    "group:42", "COLL1234"
+                )
+            ]
+        finally:
+            await adapter.close()
+
+        self.assertEqual(
+            collections,
+            [
+                {
+                    "key": "COLL1234",
+                    "name": "DTN",
+                    "parentCollection": "",
+                    "numItems": 1,
+                    "path": "DTN",
+                }
+            ],
+        )
+        self.assertEqual(all_items[0]["data"]["key"], "ALL12345")
+        self.assertEqual(collection_items[0]["data"]["key"], "ONE12345")
+        self.assertIn(("GET", "/api/groups/42/items/top"), requests)
+        self.assertIn(
+            ("GET", "/api/groups/42/collections/COLL1234/items/top"),
+            requests,
+        )
+
+    async def test_collection_paths_distinguish_nested_duplicate_names(self) -> None:
+        def handler(request: httpx.Request) -> httpx.Response:
+            headers = {
+                "Zotero-Server-ID": "SERVER123",
+                "Zotero-API-Version": "3",
+                "X-Zotero-Version": "10.0.2",
+            }
+            if request.url.path == "/api/":
+                return httpx.Response(200, headers=headers, json={})
+            if request.url.path == "/api/users/0/collections":
+                return httpx.Response(
+                    200,
+                    headers=headers,
+                    json=[
+                        {
+                            "data": {
+                                "key": "ROOT0001",
+                                "name": "Project A",
+                                "parentCollection": False,
+                            },
+                            "meta": {"numItems": 1},
+                        },
+                        {
+                            "data": {
+                                "key": "ROOT0002",
+                                "name": "Project B",
+                                "parentCollection": False,
+                            },
+                            "meta": {"numItems": 1},
+                        },
+                        {
+                            "data": {
+                                "key": "CHILD001",
+                                "name": "Papers",
+                                "parentCollection": "ROOT0001",
+                            },
+                            "meta": {"numItems": 2},
+                        },
+                        {
+                            "data": {
+                                "key": "CHILD002",
+                                "name": "Papers",
+                                "parentCollection": "ROOT0002",
+                            },
+                            "meta": {"numItems": 3},
+                        },
+                    ],
+                )
+            return httpx.Response(404, headers=headers)
+
+        adapter = ZoteroAdapter(api_key="test-key")
+        await adapter.client.aclose()
+        adapter.client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        try:
+            collections = await adapter.list_collections()
+        finally:
+            await adapter.close()
+
+        paths = {item["key"]: item["path"] for item in collections}
+        self.assertEqual(paths["CHILD001"], "Project A / Papers")
+        self.assertEqual(paths["CHILD002"], "Project B / Papers")
+
+    async def test_group_export_and_rename_resolve_attachments_in_group(self) -> None:
+        requests: list[tuple[str, str]] = []
+        pdf_path = None
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            requests.append((request.method, request.url.path))
+            headers = {
+                "Zotero-Server-ID": "SERVER123",
+                "Zotero-API-Version": "3",
+                "X-Zotero-Version": "10.0.2",
+            }
+            path = request.url.path
+            if path == "/api/":
+                return httpx.Response(200, headers=headers, json={})
+            if path == "/api/groups/42/items/ITEM1234":
+                return httpx.Response(
+                    200,
+                    headers=headers,
+                    json={
+                        "data": {
+                            "key": "ITEM1234",
+                            "title": "Group Paper",
+                            "date": "2024",
+                        }
+                    },
+                )
+            if path == "/api/groups/42/items/ITEM1234/children":
+                return httpx.Response(
+                    200,
+                    headers=headers,
+                    json=[
+                        {
+                            "data": {
+                                "key": "FILE1234",
+                                "version": 7,
+                                "contentType": "application/pdf",
+                            }
+                        }
+                    ],
+                )
+            if path == "/api/groups/42/items/FILE1234/file/view/url":
+                return httpx.Response(200, headers=headers, text=pdf_path.as_uri())
+            if path == "/api/groups/42/items/FILE1234" and request.method == "GET":
+                return httpx.Response(
+                    200,
+                    headers=headers,
+                    json={"data": {"key": "FILE1234", "filename": "renamed.pdf"}},
+                )
+            if path == "/api/groups/42/items/FILE1234" and request.method == "PATCH":
+                return httpx.Response(204, headers=headers)
+            return httpx.Response(404, headers=headers, text=path)
+
+        with tempfile.TemporaryDirectory() as directory:
+            pdf_path = Path(directory) / "paper.pdf"
+            pdf_path.write_bytes(
+                b"%PDF-1.4\n1 0 obj<<>>endobj\ntrailer<<>>\n%%EOF\n"
+            )
+            adapter = ZoteroAdapter(api_key="test-key")
+            await adapter.client.aclose()
+            adapter.client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+            try:
+                row = await adapter.export_row(
+                    "ITEM1234", library_id="group:42"
+                )
+                await adapter.rename_attachment_filename(
+                    "FILE1234", "renamed.pdf", 7, library_id="group:42"
+                )
+                filename = await adapter.attachment_filename(
+                    "FILE1234", library_id="group:42"
+                )
+            finally:
+                await adapter.close()
+
+        self.assertEqual(row["attachment_key"], "FILE1234")
+        self.assertEqual(row["pdf_path"], pdf_path)
+        self.assertEqual(filename, "renamed.pdf")
+        self.assertIn(
+            ("GET", "/api/groups/42/items/FILE1234/file/view/url"), requests
+        )
+        self.assertIn(("PATCH", "/api/groups/42/items/FILE1234"), requests)
+
+    async def test_invalid_library_ids_are_rejected_before_network_request(self) -> None:
+        adapter = ZoteroAdapter(api_key="test-key")
+        try:
+            for library_id in (
+                "",
+                "user:1",
+                "group:0",
+                "group:-1",
+                "group:01",
+                "group:42/items",
+                "group:42?x=1",
+            ):
+                with self.subTest(library_id=library_id):
+                    with self.assertRaisesRegex(ZoteroError, "library ID"):
+                        await adapter.list_collections(library_id)
+        finally:
+            await adapter.close()
+
+    async def test_invalid_collection_key_is_rejected_before_network_request(self) -> None:
+        adapter = ZoteroAdapter(api_key="test-key")
+        try:
+            with self.assertRaisesRegex(ZoteroError, "collection key"):
+                _ = [
+                    item
+                    async for item in adapter.iter_library_items(
+                        "group:42", "COLL/../../items"
+                    )
+                ]
+        finally:
+            await adapter.close()
+
     async def test_candidate_items_falls_back_to_title_year_after_doi_miss(self) -> None:
         queries: list[str] = []
 

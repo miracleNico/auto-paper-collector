@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import os
 import sqlite3
 import subprocess
@@ -8,7 +9,7 @@ import threading
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 from paper_endnote.db import Database
 from paper_endnote.library_files import (
@@ -26,6 +27,7 @@ from paper_endnote.library_files import (
     rename_batch_pdfs,
     rename_endnote_pdfs,
     rename_pdf_file,
+    rename_zotero_pdfs,
     resolve_export_dir,
 )
 
@@ -503,6 +505,284 @@ class LibraryFilesTests(unittest.TestCase):
             self.assertEqual(stored[0], "internal-pdf://12345/Jane Doe - Example Paper.pdf")
             self.assertEqual(stored[1], "internal-pdf://12345/Jane Doe - Example Paper.pdf")
 
+    def test_rename_endnote_pdfs_skips_attachment_path_outside_pdf_root(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            library = root / "Boundary.enl"
+            library.write_bytes(b"")
+            pdf_root = library.with_suffix(".Data") / "PDF"
+            pdf_root.mkdir(parents=True)
+            outside = root / "outside.pdf"
+            outside.write_bytes(MINIMAL_PDF)
+            sdb_dir = library.with_suffix(".Data") / "sdb"
+            sdb_dir.mkdir()
+            connection = sqlite3.connect(sdb_dir / "sdb.eni")
+            connection.execute(
+                "CREATE TABLE refs (id INTEGER PRIMARY KEY, author TEXT, year TEXT, title TEXT, "
+                "secondary_title TEXT, electronic_resource_number TEXT, url TEXT)"
+            )
+            connection.execute(
+                "CREATE TABLE file_res (refs_id INTEGER, file_path TEXT, file_type TEXT, file_pos INTEGER)"
+            )
+            escaped = "internal-pdf://../../outside.pdf"
+            connection.execute(
+                "INSERT INTO refs VALUES (1, 'Doe, Jane', '2024', 'Outside Paper', 'A Journal', "
+                "'10.1000/outside', ?)",
+                (escaped,),
+            )
+            connection.execute(
+                "INSERT INTO file_res VALUES (1, ?, 'pdf', 0)",
+                (escaped,),
+            )
+            connection.commit()
+            connection.close()
+
+            result = rename_endnote_pdfs(library, require_closed=False)
+
+            self.assertEqual(result["renamed"], 0)
+            self.assertEqual(result["skipped"], 1)
+            self.assertTrue(outside.is_file())
+            self.assertEqual(outside.read_bytes(), MINIMAL_PDF)
+            stored_db = sqlite3.connect(sdb_dir / "sdb.eni")
+            try:
+                stored = stored_db.execute("SELECT file_path FROM file_res").fetchone()[0]
+            finally:
+                stored_db.close()
+            self.assertEqual(stored, escaped)
+
+    def test_rename_endnote_pdfs_skips_non_pdf_attachments(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            library = root / "Mixed.enl"
+            library.write_bytes(b"")
+            attachment_dir = library.with_suffix(".Data") / "PDF" / "ITEM1"
+            attachment_dir.mkdir(parents=True)
+            document = attachment_dir / "notes.docx"
+            document.write_bytes(b"not a PDF")
+            sdb_dir = library.with_suffix(".Data") / "sdb"
+            sdb_dir.mkdir()
+            connection = sqlite3.connect(sdb_dir / "sdb.eni")
+            connection.execute(
+                "CREATE TABLE refs (id INTEGER PRIMARY KEY, author TEXT, year TEXT, title TEXT, "
+                "secondary_title TEXT, electronic_resource_number TEXT, url TEXT)"
+            )
+            connection.execute(
+                "CREATE TABLE file_res (refs_id INTEGER, file_path TEXT, file_type TEXT, file_pos INTEGER)"
+            )
+            connection.execute(
+                "INSERT INTO refs VALUES (1, 'Doe, Jane', '2024', 'Notes', '', '', '')"
+            )
+            connection.execute(
+                "INSERT INTO file_res VALUES (1, 'internal-pdf://ITEM1/notes.docx', 'docx', 0)"
+            )
+            connection.commit()
+            connection.close()
+
+            result = rename_endnote_pdfs(library, require_closed=False)
+
+            self.assertEqual(result["renamed"], 0)
+            self.assertEqual(result["skipped"], 1)
+            self.assertTrue(document.is_file())
+            self.assertFalse((attachment_dir / "Jane Doe - Notes.pdf").exists())
+
+    def test_rename_endnote_pdfs_rolls_back_prior_files_on_later_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            library = root / "Rollback.enl"
+            library.write_bytes(b"")
+            pdf_root = library.with_suffix(".Data") / "PDF"
+            originals: list[Path] = []
+            for index in (1, 2):
+                folder = pdf_root / f"ITEM{index}"
+                folder.mkdir(parents=True)
+                source = folder / f"old-{index}.pdf"
+                source.write_bytes(MINIMAL_PDF)
+                originals.append(source)
+            sdb_dir = library.with_suffix(".Data") / "sdb"
+            sdb_dir.mkdir()
+            connection = sqlite3.connect(sdb_dir / "sdb.eni")
+            connection.execute(
+                "CREATE TABLE refs (id INTEGER PRIMARY KEY, author TEXT, year TEXT, title TEXT, "
+                "secondary_title TEXT, electronic_resource_number TEXT, url TEXT)"
+            )
+            connection.execute(
+                "CREATE TABLE file_res (refs_id INTEGER, file_path TEXT, file_type TEXT, file_pos INTEGER)"
+            )
+            for index in (1, 2):
+                stored = f"internal-pdf://ITEM{index}/old-{index}.pdf"
+                connection.execute(
+                    "INSERT INTO refs VALUES (?, 'Doe, Jane', '2024', ?, '', '', ?)",
+                    (index, f"Paper {index}", stored),
+                )
+                connection.execute(
+                    "INSERT INTO file_res VALUES (?, ?, 'pdf', 0)",
+                    (index, stored),
+                )
+            connection.commit()
+            connection.close()
+            calls = 0
+
+            def fail_second_rename(path, metadata):
+                nonlocal calls
+                calls += 1
+                if calls == 2:
+                    raise OSError("second rename failed")
+                return rename_pdf_file(path, metadata)
+
+            with (
+                patch(
+                    "paper_endnote.library_files.rename_pdf_file",
+                    side_effect=fail_second_rename,
+                ),
+                self.assertRaisesRegex(OSError, "second rename failed"),
+            ):
+                rename_endnote_pdfs(library, require_closed=False)
+
+            self.assertTrue(all(path.is_file() for path in originals))
+            self.assertFalse((pdf_root / "ITEM1" / "Jane Doe - Paper 1.pdf").exists())
+            stored_db = sqlite3.connect(sdb_dir / "sdb.eni")
+            try:
+                stored_paths = [
+                    row[0]
+                    for row in stored_db.execute(
+                        "SELECT file_path FROM file_res ORDER BY rowid"
+                    ).fetchall()
+                ]
+            finally:
+                stored_db.close()
+            self.assertEqual(
+                stored_paths,
+                [
+                    "internal-pdf://ITEM1/old-1.pdf",
+                    "internal-pdf://ITEM2/old-2.pdf",
+                ],
+            )
+
+    def test_rename_endnote_pdfs_updates_all_rows_sharing_one_file(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            library = root / "Shared.enl"
+            library.write_bytes(b"")
+            pdf_dir = library.with_suffix(".Data") / "PDF" / "SHARED"
+            pdf_dir.mkdir(parents=True)
+            source = pdf_dir / "old.pdf"
+            source.write_bytes(MINIMAL_PDF)
+            sdb_dir = library.with_suffix(".Data") / "sdb"
+            sdb_dir.mkdir()
+            connection = sqlite3.connect(sdb_dir / "sdb.eni")
+            connection.execute(
+                "CREATE TABLE refs (id INTEGER PRIMARY KEY, author TEXT, year TEXT, title TEXT, "
+                "secondary_title TEXT, electronic_resource_number TEXT, url TEXT)"
+            )
+            connection.execute(
+                "CREATE TABLE file_res (refs_id INTEGER, file_path TEXT, file_type TEXT, file_pos INTEGER)"
+            )
+            stored = "internal-pdf://SHARED/old.pdf"
+            for ref_id in (1, 2):
+                connection.execute(
+                    "INSERT INTO refs VALUES (?, 'Doe, Jane', '2024', 'Shared Paper', '', '', ?)",
+                    (ref_id, stored),
+                )
+                connection.execute(
+                    "INSERT INTO file_res VALUES (?, ?, 'pdf', 0)",
+                    (ref_id, stored),
+                )
+            connection.commit()
+            connection.close()
+
+            result = rename_endnote_pdfs(library, require_closed=False)
+
+            renamed = pdf_dir / "Jane Doe - Shared Paper.pdf"
+            self.assertEqual(result["renamed"], 1)
+            self.assertEqual(result["skipped"], 0)
+            self.assertEqual(result["files"][0]["refs_ids"], [1, 2])
+            self.assertTrue(renamed.is_file())
+            self.assertFalse(source.exists())
+            stored_db = sqlite3.connect(sdb_dir / "sdb.eni")
+            try:
+                rows = stored_db.execute(
+                    "SELECT file_path, url FROM file_res "
+                    "JOIN refs ON refs.id = file_res.refs_id ORDER BY refs.id"
+                ).fetchall()
+            finally:
+                stored_db.close()
+            self.assertEqual(
+                rows,
+                [
+                    (
+                        "internal-pdf://SHARED/Jane Doe - Shared Paper.pdf",
+                        "internal-pdf://SHARED/Jane Doe - Shared Paper.pdf",
+                    ),
+                    (
+                        "internal-pdf://SHARED/Jane Doe - Shared Paper.pdf",
+                        "internal-pdf://SHARED/Jane Doe - Shared Paper.pdf",
+                    ),
+                ],
+            )
+
+    def test_rename_endnote_pdfs_keeps_all_url_links_for_multiple_attachments(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            library = root / "Multiple.enl"
+            library.write_bytes(b"")
+            pdf_root = library.with_suffix(".Data") / "PDF"
+            for folder, filename in (("FIRST", "first.pdf"), ("SECOND", "second.pdf")):
+                attachment = pdf_root / folder / filename
+                attachment.parent.mkdir(parents=True)
+                attachment.write_bytes(MINIMAL_PDF)
+            sdb_dir = library.with_suffix(".Data") / "sdb"
+            sdb_dir.mkdir()
+            connection = sqlite3.connect(sdb_dir / "sdb.eni")
+            connection.execute(
+                "CREATE TABLE refs (id INTEGER PRIMARY KEY, author TEXT, year TEXT, title TEXT, "
+                "secondary_title TEXT, electronic_resource_number TEXT, url TEXT)"
+            )
+            # Deliberately omit legacy optional file_res columns such as
+            # file_type to cover older/variant EndNote databases.
+            connection.execute(
+                "CREATE TABLE file_res (refs_id INTEGER, file_path TEXT)"
+            )
+            first = "internal-pdf://FIRST/first.pdf"
+            second = "internal-pdf://SECOND/second.pdf"
+            connection.execute(
+                "INSERT INTO refs VALUES (1, 'Doe, Jane', '2024', 'Multiple Files', '', '', ?)",
+                (f"{first};{second}",),
+            )
+            connection.execute("INSERT INTO file_res VALUES (1, ?)", (first,))
+            connection.execute("INSERT INTO file_res VALUES (1, ?)", (second,))
+            connection.commit()
+            connection.close()
+
+            result = rename_endnote_pdfs(library, require_closed=False)
+
+            expected_name = "Jane Doe - Multiple Files.pdf"
+            self.assertEqual(result["renamed"], 2)
+            self.assertTrue((pdf_root / "FIRST" / expected_name).is_file())
+            self.assertTrue((pdf_root / "SECOND" / expected_name).is_file())
+            stored_db = sqlite3.connect(sdb_dir / "sdb.eni")
+            try:
+                stored_paths = [
+                    row[0]
+                    for row in stored_db.execute(
+                        "SELECT file_path FROM file_res ORDER BY rowid"
+                    ).fetchall()
+                ]
+                url = stored_db.execute("SELECT url FROM refs WHERE id = 1").fetchone()[0]
+            finally:
+                stored_db.close()
+            self.assertEqual(
+                stored_paths,
+                [
+                    f"internal-pdf://FIRST/{expected_name}",
+                    f"internal-pdf://SECOND/{expected_name}",
+                ],
+            )
+            self.assertEqual(
+                url,
+                f"internal-pdf://FIRST/{expected_name};"
+                f"internal-pdf://SECOND/{expected_name}",
+            )
+
 
 class _FakeZoteroExport:
     def __init__(self, pdf: Path) -> None:
@@ -557,7 +837,315 @@ class _FakeSelectiveZoteroExport:
         }
 
 
+class _FakeScopedZoteroExport:
+    def __init__(self, pdf: Path) -> None:
+        self.pdf = pdf
+        self.iter_calls: list[tuple[str, str]] = []
+        self.export_calls: list[tuple[str, str]] = []
+        self.rename_calls: list[tuple[str, str, int | None, str]] = []
+
+    async def iter_library_items(self, *, library_id: str, collection_key: str):
+        self.iter_calls.append((library_id, collection_key))
+        yield {"data": {"key": "GROUPITEM", "itemType": "journalArticle"}}
+        yield {"data": {"key": "GROUPNOTE", "itemType": "note"}}
+
+    async def iter_collection_items(self, name: str):
+        raise AssertionError(f"legacy collection lookup used unexpectedly: {name}")
+
+    async def export_row(self, key: str, fallback_metadata=None, *, library_id: str = "user:0"):
+        self.export_calls.append((key, library_id))
+        return {
+            "zotero_key": key,
+            "attachment_key": "GROUPATT",
+            "attachment_version": 7,
+            "metadata": {
+                "title": "Scoped Paper",
+                "doi": "10.1000/scoped",
+                "year": 2025,
+                "authors": ["Doe, Jane"],
+                "journal": "A Journal",
+            },
+            "pdf_path": self.pdf,
+        }
+
+    async def rename_attachment_filename(
+        self,
+        attachment_key: str,
+        filename: str,
+        version: int | None,
+        *,
+        library_id: str = "user:0",
+    ) -> None:
+        self.rename_calls.append((attachment_key, filename, version, library_id))
+
+    async def attachment_filename(
+        self, attachment_key: str, *, library_id: str = "user:0"
+    ) -> str:
+        return self.pdf.name
+
+
 class ZoteroEndNoteExportTests(unittest.IsolatedAsyncioTestCase):
+    async def test_zotero_whole_library_scope_must_be_explicit(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            pdf = Path(directory) / "paper.pdf"
+            pdf.write_bytes(MINIMAL_PDF)
+            zotero = _FakeScopedZoteroExport(pdf)
+            with self.assertRaisesRegex(LibraryFilesError, "明确选择整个库"):
+                await list_zotero_pdf_items(zotero, "")
+
+            items = await list_zotero_pdf_items(
+                zotero,
+                "",
+                library_id="user:0",
+                whole_library=True,
+            )
+
+        self.assertEqual([item["id"] for item in items], ["GROUPITEM"])
+        self.assertEqual(zotero.iter_calls, [("user:0", "")])
+
+    async def test_zotero_pdf_tools_use_explicit_library_and_collection_key(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            pdf = root / "group-paper.pdf"
+            pdf.write_bytes(MINIMAL_PDF)
+            zotero = _FakeScopedZoteroExport(pdf)
+            scope = {"library_id": "group:42", "collection_key": "COLLKEY1"}
+
+            items = await list_zotero_pdf_items(
+                zotero,
+                "Group Collection",
+                **scope,
+            )
+            self.assertEqual([item["id"] for item in items], ["GROUPITEM"])
+
+            destination = root / "exported"
+            exported = await export_zotero_pdfs(
+                zotero,
+                "Group Collection",
+                destination,
+                item_ids={"GROUPITEM"},
+                **scope,
+            )
+            self.assertEqual(exported["copied"], 1)
+            self.assertTrue((destination / "Jane Doe - Scoped Paper.pdf").is_file())
+
+            renamed = await rename_zotero_pdfs(
+                zotero,
+                "Group Collection",
+                **scope,
+            )
+            self.assertEqual(renamed["renamed"], 1)
+            self.assertEqual(
+                zotero.iter_calls,
+                [("group:42", "COLLKEY1")] * 3,
+            )
+            self.assertEqual(
+                zotero.export_calls,
+                [("GROUPITEM", "group:42")] * 3,
+            )
+            self.assertEqual(
+                zotero.rename_calls,
+                [("GROUPATT", "Jane Doe - Scoped Paper.pdf", 7, "group:42")],
+            )
+
+    async def test_zotero_rename_restores_file_for_unexpected_failure_or_cancel(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for label, error, expected_error in (
+                (
+                    "runtime",
+                    RuntimeError("transport failed"),
+                    LibraryFilesError,
+                ),
+                ("cancel", asyncio.CancelledError(), asyncio.CancelledError),
+            ):
+                with self.subTest(error=label):
+                    pdf = root / f"{label}.pdf"
+                    pdf.write_bytes(MINIMAL_PDF)
+                    zotero = _FakeScopedZoteroExport(pdf)
+                    zotero.rename_attachment_filename = AsyncMock(side_effect=error)
+
+                    with self.assertRaises(expected_error):
+                        await rename_zotero_pdfs(
+                            zotero,
+                            "Group Collection",
+                            library_id="group:42",
+                            collection_key="COLLKEY1",
+                        )
+
+                    self.assertTrue(pdf.is_file())
+                    self.assertFalse((root / "Jane Doe - Scoped Paper.pdf").exists())
+
+    async def test_zotero_rename_reconciles_lost_patch_response(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            pdf = root / "paper.pdf"
+            pdf.write_bytes(MINIMAL_PDF)
+            zotero = _FakeScopedZoteroExport(pdf)
+            zotero.rename_attachment_filename = AsyncMock(
+                side_effect=RuntimeError("response lost")
+            )
+            zotero.attachment_filename = AsyncMock(
+                return_value="Jane Doe - Scoped Paper.pdf"
+            )
+
+            result = await rename_zotero_pdfs(
+                zotero,
+                "Group Collection",
+                library_id="group:42",
+                collection_key="COLLKEY1",
+            )
+
+            self.assertEqual(result["renamed"], 1)
+            self.assertEqual(len(result["warnings"]), 1)
+            self.assertFalse(pdf.exists())
+            self.assertTrue((root / "Jane Doe - Scoped Paper.pdf").is_file())
+
+    async def test_zotero_rename_preserves_both_names_when_reconciliation_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            pdf = root / "paper.pdf"
+            pdf.write_bytes(MINIMAL_PDF)
+            zotero = _FakeScopedZoteroExport(pdf)
+            zotero.rename_attachment_filename = AsyncMock(
+                side_effect=RuntimeError("response lost")
+            )
+            zotero.attachment_filename = AsyncMock(
+                side_effect=RuntimeError("lookup failed")
+            )
+
+            with self.assertRaisesRegex(LibraryFilesError, "保留新旧两个文件名"):
+                await rename_zotero_pdfs(
+                    zotero,
+                    "Group Collection",
+                    library_id="group:42",
+                    collection_key="COLLKEY1",
+                )
+
+            self.assertTrue(pdf.is_file())
+            self.assertTrue((root / "Jane Doe - Scoped Paper.pdf").is_file())
+
+    async def test_zotero_rename_never_overwrites_reappeared_original(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            pdf = root / "paper.pdf"
+            pdf.write_bytes(MINIMAL_PDF)
+            zotero = _FakeScopedZoteroExport(pdf)
+
+            async def recreate_original_then_fail(*_args, **_kwargs):
+                pdf.write_bytes(b"replacement created during PATCH")
+                raise RuntimeError("transport failed")
+
+            zotero.rename_attachment_filename = AsyncMock(
+                side_effect=recreate_original_then_fail
+            )
+
+            with self.assertRaisesRegex(LibraryFilesError, "原路径已重新出现"):
+                await rename_zotero_pdfs(
+                    zotero,
+                    "Group Collection",
+                    library_id="group:42",
+                    collection_key="COLLKEY1",
+                )
+
+            self.assertEqual(pdf.read_bytes(), b"replacement created during PATCH")
+            self.assertTrue((root / "Jane Doe - Scoped Paper.pdf").is_file())
+
+    async def test_zotero_rename_reports_prior_success_when_later_item_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            pdfs = {
+                "ITEM1": root / "one.pdf",
+                "ITEM2": root / "two.pdf",
+            }
+            for path in pdfs.values():
+                path.write_bytes(MINIMAL_PDF)
+
+            class PartialFailureZotero:
+                async def iter_library_items(
+                    self, *, library_id: str, collection_key: str
+                ):
+                    for key in pdfs:
+                        yield {"data": {"key": key, "itemType": "journalArticle"}}
+
+                async def export_row(
+                    self,
+                    key: str,
+                    fallback_metadata=None,
+                    *,
+                    library_id: str = "user:0",
+                ):
+                    index = 1 if key == "ITEM1" else 2
+                    return {
+                        "attachment_key": f"ATT{index}",
+                        "attachment_version": index,
+                        "metadata": {
+                            "title": f"Paper {index}",
+                            "authors": ["Doe, Jane"],
+                        },
+                        "pdf_path": pdfs[key],
+                    }
+
+                async def rename_attachment_filename(
+                    self,
+                    attachment_key: str,
+                    filename: str,
+                    version: int | None,
+                    *,
+                    library_id: str = "user:0",
+                ):
+                    if attachment_key == "ATT2":
+                        raise RuntimeError("second PATCH failed")
+
+                async def attachment_filename(
+                    self, attachment_key: str, *, library_id: str = "user:0"
+                ) -> str:
+                    return "two.pdf"
+
+            with self.assertRaisesRegex(
+                LibraryFilesError,
+                "操作部分完成：已成功重命名 1 个文件",
+            ):
+                await rename_zotero_pdfs(
+                    PartialFailureZotero(),
+                    "Collection",
+                    library_id="group:42",
+                    collection_key="COLLKEY1",
+                )
+
+            self.assertTrue((root / "Jane Doe - Paper 1.pdf").is_file())
+            self.assertTrue(pdfs["ITEM2"].is_file())
+
+    async def test_zotero_rename_restores_file_when_attachment_key_is_missing(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            pdf = root / "paper.pdf"
+            pdf.write_bytes(MINIMAL_PDF)
+            zotero = _FakeScopedZoteroExport(pdf)
+            zotero.export_row = AsyncMock(
+                return_value={
+                    "zotero_key": "GROUPITEM",
+                    "attachment_key": None,
+                    "attachment_version": None,
+                    "metadata": {
+                        "title": "Scoped Paper",
+                        "authors": ["Doe, Jane"],
+                    },
+                    "pdf_path": pdf,
+                }
+            )
+
+            with self.assertRaisesRegex(LibraryFilesError, "缺少标识"):
+                await rename_zotero_pdfs(
+                    zotero,
+                    "Group Collection",
+                    library_id="group:42",
+                    collection_key="COLLKEY1",
+                )
+
+            self.assertTrue(pdf.is_file())
+            self.assertFalse((root / "Jane Doe - Scoped Paper.pdf").exists())
+
     async def test_export_zotero_pdfs_does_not_resolve_unselected_item(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

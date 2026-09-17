@@ -1,4 +1,6 @@
 interface:
-  display_name: "论文清单整理"
+  display_name: "auto-paper-find"
   short_description: "将模糊论文清单或研究要求核实并整理为项目可导入的 TXT/CSV"
   default_prompt: "使用 $auto-paper-find-skill，把我提供的模糊论文清单或研究要求整理成 auto-paper-collector 可直接导入的 TXT/CSV，并列出未确认项。"
+policy:
+  allow_implicit_invocation: false

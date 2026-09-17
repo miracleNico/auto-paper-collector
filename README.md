@@ -22,7 +22,7 @@
 - 可选使用 Tesseract OCR 辅助识别扫描件。
 - 使用 Zotero 本地 API 创建 collection、去重、写入题录并关联 PDF。
 - 从 Zotero 导出 EndNote 可导入的 RIS、XML 和 PDF 包。
-- 提供 PDF 重命名与逐篇勾选导出，支持批次、Zotero 和 EndNote 三种来源。
+- 提供 PDF 重命名与逐篇勾选导出，可为每次操作选择现有 EndNote 库，或选择当前 Zotero 配置中的个人/群组库与 collection。
 - 将 EndNote 题录与 PDF 单向合并到指定 Zotero collection。
 - 粉蓝白响应式界面，包含新建任务、批次、工具和设置四个页面，当然要有一点猫娘审美！
 - 支持单个或多个批次预览、停止并删除及磁盘清理。
@@ -79,6 +79,8 @@
 ### 投喂格式
 
 可以使用仓库内的 [auto-paper-find-skill](skills/auto-paper-find-skill/SKILL.md)，把模糊论文清单、论文简称或研究要求整理为经过核实的 TXT/CSV。将 `skills/auto-paper-find-skill` 文件夹复制到 `$CODEX_HOME/skills`（未设置时为 `~/.codex/skills`）后，在支持 skills 的会话中调用，例如：
+
+该 skill 已关闭隐式触发；普通的“帮我找论文”请求不会自动调用它。请在请求中显式写出 `$auto-paper-find-skill`，或先在界面的技能选择器中选中 `auto-paper-find`。
 
 > 使用 $auto-paper-find-skill，找近五年关于延迟容忍网络路由的 10 篇论文，生成本项目可导入的 CSV；不确定的论文单独列出。
 
@@ -188,7 +190,9 @@ GET  /api/batch-deletions/{operation_id}
 
 Zotero 写入会优先使用 DOI 去重，并以规范化题名与年份补充判断。已有且身份匹配的主文 PDF 会复用，不覆盖附件或批注。
 
-“工具”页的 PDF 导出会先列出当前来源中的论文；默认勾选所有可用 PDF，也可以只保留需要的文章。EndNote → Zotero 同步会跳过 EndNote 垃圾箱中的题录，复用同样的去重规则，并按内容避免重复上传 PDF。当前安全同步期刊文章，其他 EndNote 题录类型会在结果中明确列为跳过。同步前请完全退出 EndNote。
+“工具”页的重命名与 PDF 导出不再绑定设置中的默认库：EndNote 可以为每次操作选择或粘贴任意现有 `.enl` 路径；Zotero 可以先选择当前运行配置中的 `My Library` 或 Group Library，再选择整个库或一个 collection。“整个库”必须在范围下拉框中明确选择，加载中或读取失败时不会自动退化为整库操作。网页文件上传无法同时访问 `.enl` 的配套 `.Data`，所以“选择…”按钮调用仅限本机的原生文件选择器；也可以直接粘贴绝对路径。Zotero 使用正在运行的桌面客户端 Local API，不会直接修改 `zotero.sqlite`；若要使用另一个 Zotero profile，请先用该 profile 启动 Zotero，再刷新工具页。PDF 导出默认勾选所有可用文件，也可以逐篇取消。重命名 EndNote 附件前必须完全退出 EndNote。
+
+EndNote → Zotero 同步仍使用设置页保存的默认 EndNote 库，并会跳过 EndNote 垃圾箱中的题录，复用同样的去重规则，按内容避免重复上传 PDF。当前安全同步期刊文章，其他 EndNote 题录类型会在结果中明确列为跳过。同步前请完全退出 EndNote。
 
 EndNote 不使用桌面鼠标或菜单自动化。在“工具”中从 Zotero 导出后，默认目录
 `Downloads\<库名>` 包含：
@@ -282,7 +286,7 @@ DOI、論文タイトル、または CSV を渡していただければ、書誌
 - Tesseract OCR によるスキャン PDF の補助判定
 - Zotero ローカル API による collection 作成、重複排除、書誌・PDF 登録
 - Zotero から EndNote 用 RIS、XML、PDF パッケージを出力
-- PDF 名変更と論文単位の選択出力（バッチ、Zotero、EndNote に対応）
+- PDF 名変更と論文単位の選択出力。操作ごとに既存の EndNote ライブラリ、または現在の Zotero プロファイル内の個人／グループライブラリと collection を選択できます。
 - EndNote の書誌と PDF を指定した Zotero collection へ一方向に統合
 - 猫娘らしいピンク・ブルー・ホワイトのレスポンシブ UI
 - 単一または複数バッチの選択、削除前確認、安全なディスク整理
@@ -439,7 +443,9 @@ GET  /api/batch-deletions/{operation_id}
 
 Zotero では DOI を優先して重複を判定し、必要に応じて正規化したタイトルと発行年も使います。既存の一致する本文 PDF は再利用し、添付ファイルや注釈を上書きしません。
 
-「ツール」の PDF 出力では、現在のデータ元にある論文を一覧表示します。利用可能な PDF は最初からすべて選択され、必要な論文だけに絞れます。EndNote → Zotero 同期は EndNote のゴミ箱を除外し、同じ重複判定で指定 collection に統合します。現在はジャーナル論文を安全に同期し、その他の EndNote レコード形式は結果でスキップ理由を表示します。同期前に EndNote を完全に終了してください、にゃ。
+「ツール」の名前変更と PDF 出力は、設定の既定ライブラリに固定されません。EndNote は操作ごとに既存の `.enl` を選択または絶対パスで指定できます。Zotero は、起動中のプロファイルにある `My Library` または Group Library を選び、ライブラリ全体または 1 つの collection を範囲にできます。ライブラリ全体は範囲メニューで明示的に選択する必要があり、読み込み中や取得失敗時に自動で全体操作へ切り替わることはありません。ブラウザーのファイルアップロードでは `.enl` と隣接する `.Data` を一緒に扱えないため、「選択…」はローカルのネイティブファイル選択画面を開きます。Zotero は Local API を使い、`zotero.sqlite` を直接変更しません。別プロファイルを使う場合は、そのプロファイルで Zotero を起動してからツール画面を更新してください。出力候補は PDF のある論文を初期選択し、個別に解除できます。EndNote 内の PDF 名を変更する前に EndNote を完全に終了してください。
+
+EndNote → Zotero 同期は引き続き設定に保存された既定の EndNote ライブラリを使い、ゴミ箱を除外して指定 collection に統合します。現在はジャーナル論文を安全に同期し、その他のレコード形式はスキップ理由を表示します。同期前に EndNote を完全に終了してください、にゃ。
 
 EndNote の画面操作は自動化しません。「ツール」から出力した
 `Downloads\<ライブラリ名>` には次が含まれます。
@@ -527,7 +533,7 @@ Everything runs locally on Windows and listens only on `127.0.0.1` by default. T
 - Optional Tesseract OCR support for scanned PDFs
 - Zotero collection creation, deduplication, metadata writes, and PDF attachment upload
 - EndNote-compatible RIS, XML, and PDF export packages
-- PDF renaming and per-paper export selection for Zotero, local batches, and EndNote data
+- PDF renaming and per-paper export selection with a per-operation EndNote library or a personal/group library and collection from the active Zotero profile
 - One-way synchronization of EndNote records and PDFs into a selected Zotero collection
 - Catgirl-approved pink, blue, and white responsive interface with keyboard-accessible help
 - Single and multi-batch deletion with previews and safe disk cleanup
@@ -680,7 +686,9 @@ GET  /api/batch-deletions/{operation_id}
 
 Zotero records are deduplicated primarily by DOI, with normalized title and year as fallback signals. Existing matching primary PDFs are reused without overwriting attachments or annotations.
 
-The PDF export tool lists papers from the selected source and selects every available PDF by default; individual papers can be unchecked before copying. EndNote-to-Zotero sync excludes trashed EndNote records, applies the same deduplication rules, and avoids uploading duplicate PDF content. It currently syncs journal articles safely and reports other EndNote reference types as skipped. Close EndNote before starting a sync.
+The rename and PDF export tools are no longer tied to the configured default library. For each operation, choose or paste the absolute path of an existing EndNote `.enl`, or select `My Library`/a Group Library from the running Zotero profile and then target the whole library or one collection. Whole-library scope must be selected explicitly; loading or lookup failures never fall back to a whole-library operation. A browser upload cannot provide the `.enl` together with its sibling `.Data`, so “Choose…” opens a local native file picker instead. Zotero access goes through the desktop Local API and never edits `zotero.sqlite` directly. To use another Zotero profile, launch Zotero with that profile and refresh the Tools page. Export candidates with available PDFs are selected by default and can be unchecked individually. Close EndNote before renaming its attachments.
+
+EndNote-to-Zotero sync still uses the default EndNote library saved in Settings. It excludes trashed records, applies the same deduplication rules, avoids duplicate PDF uploads, safely syncs journal articles, and reports other reference types as skipped. Close EndNote before starting a sync.
 
 The project does not automate EndNote desktop menus. An export created from the Tools page is written to `Downloads\<library-name>` by default and contains:
 

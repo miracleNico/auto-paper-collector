@@ -288,7 +288,7 @@ def endnote_desktop_running() -> bool:
             check=False,
             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
-    except OSError:
+    except (OSError, RuntimeError):
         return False
     return "EndNote.exe" in (completed.stdout or "")
 
@@ -370,6 +370,10 @@ def _validate_endnote_library(library: Path) -> Path:
     library = Path(library).expanduser()
     if library.suffix.casefold() != ".enl":
         raise LibraryFilesError("EndNote 库必须是 .enl 文件")
+    try:
+        library = library.resolve(strict=True)
+    except OSError:
+        raise LibraryFilesError(f"EndNote 库不存在：{library}")
     if not library.is_file():
         raise LibraryFilesError(f"EndNote 库不存在：{library}")
     return library
@@ -542,6 +546,7 @@ def _endnote_pdf_metadata(library: Path) -> dict[Path, dict[str, Any]]:
                    refs.electronic_resource_number AS electronic_resource_number
             FROM file_res
             JOIN refs ON refs.id = file_res.refs_id
+            ORDER BY file_res.rowid
             """
         ).fetchall()
     except sqlite3.DatabaseError:
@@ -566,11 +571,7 @@ def _endnote_pdf_metadata(library: Path) -> dict[Path, dict[str, Any]]:
 
 
 def rename_endnote_pdfs(library: Path, *, require_closed: bool = True) -> dict[str, Any]:
-    library = Path(library).expanduser()
-    if library.suffix.casefold() != ".enl":
-        raise LibraryFilesError("EndNote 库必须是 .enl 文件")
-    if not library.is_file():
-        raise LibraryFilesError(f"EndNote 库不存在：{library}")
+    library = _validate_endnote_library(library)
     if require_closed and endnote_desktop_running():
         raise LibraryFilesError("请先完全退出 EndNote，再重命名库内 PDF，否则附件链接会丢失")
     pdf_root = library.with_suffix(".Data") / "PDF"
@@ -588,6 +589,8 @@ def rename_endnote_pdfs(library: Path, *, require_closed: bool = True) -> dict[s
     renamed = 0
     skipped = 0
     files: list[dict[str, Any]] = []
+    moved_files: list[tuple[Path, Path]] = []
+    primary_committed = False
     try:
         rows = connection.execute(
             """
@@ -597,53 +600,127 @@ def rename_endnote_pdfs(library: Path, *, require_closed: bool = True) -> dict[s
                    refs.electronic_resource_number AS electronic_resource_number, refs.url AS url
             FROM file_res
             JOIN refs ON refs.id = file_res.refs_id
+            ORDER BY file_res.rowid
             """
         ).fetchall()
+        resolved_pdf_root = pdf_root.resolve()
+        attachment_rows: dict[Path, list[sqlite3.Row]] = {}
+        current_urls: dict[int, str] = {}
         for row in rows:
             stored = str(row["file_path"] or "").replace("\\", "/")
-            relative = stored.split("internal-pdf://")[-1].lstrip("/")
-            source = pdf_root / Path(relative)
+            if not stored.casefold().startswith("internal-pdf://"):
+                skipped += 1
+                continue
+            candidate = resolve_internal_attachment(library, stored)
+            source = candidate.resolve() if candidate is not None else None
+            if source is None or not source.is_relative_to(resolved_pdf_root):
+                skipped += 1
+                continue
             if not source.is_file():
-                matches = list(pdf_root.rglob(Path(relative).name)) if Path(relative).name else []
+                matches = (
+                    [
+                        match.resolve()
+                        for match in pdf_root.rglob(source.name)
+                        if match.resolve().is_relative_to(resolved_pdf_root)
+                    ]
+                    if source.name
+                    else []
+                )
                 source = matches[0] if len(matches) == 1 else None
             if source is None or not source.is_file():
                 skipped += 1
                 continue
-            metadata = _metadata_from_endnote_ref(row)
+            if source.suffix.casefold() != ".pdf":
+                skipped += 1
+                continue
+            attachment_rows.setdefault(source, []).append(row)
+
+        for source, shared_rows in attachment_rows.items():
+            metadata = _metadata_from_endnote_ref(shared_rows[0])
             result = rename_pdf_file(source, metadata)
-            files.append({"refs_id": row["refs_id"], **result})
+            reference_ids = [row["refs_id"] for row in shared_rows]
+            files.append(
+                {
+                    "refs_id": reference_ids[0],
+                    "refs_ids": reference_ids,
+                    **result,
+                }
+            )
             if not result["renamed"]:
                 continue
+            moved_files.append((Path(result["path"]), source))
             new_name = result["filename"]
             old_name = result["previous"]
-            new_path = _rewrite_endnote_path(row["file_path"], old_name, new_name)
-            connection.execute(
-                "UPDATE file_res SET file_path = ? WHERE rowid = ?",
-                (new_path, row["file_rowid"]),
-            )
-            url = row["url"]
-            if url and old_name in str(url):
-                connection.execute(
-                    "UPDATE refs SET url = ? WHERE id = ?",
-                    (_rewrite_endnote_path(str(url), old_name, new_name), row["refs_id"]),
+            for row in shared_rows:
+                stored = str(row["file_path"] or "").replace("\\", "/")
+                stored_name = Path(stored.split("internal-pdf://", 1)[-1]).name
+                path_name = stored_name or old_name
+                new_path = _rewrite_endnote_path(
+                    row["file_path"], path_name, new_name
                 )
-            if pdb_connection is not None:
-                try:
-                    pdb_connection.execute(
-                        "UPDATE pdf_index SET subkey = ? WHERE refs_id = ? AND subkey = ?",
-                        (new_name, row["refs_id"], old_name),
+                connection.execute(
+                    "UPDATE file_res SET file_path = ? WHERE rowid = ?",
+                    (new_path, row["file_rowid"]),
+                )
+                refs_id = int(row["refs_id"])
+                url = current_urls.get(refs_id, str(row["url"] or ""))
+                if url and path_name in url:
+                    updated_url = _rewrite_endnote_path(url, path_name, new_name)
+                    connection.execute(
+                        "UPDATE refs SET url = ? WHERE id = ?",
+                        (
+                            updated_url,
+                            refs_id,
+                        ),
                     )
-                except sqlite3.DatabaseError:
-                    pass
+                    current_urls[refs_id] = updated_url
+                if pdb_connection is not None:
+                    try:
+                        pdb_connection.execute(
+                            "UPDATE pdf_index SET subkey = ? WHERE refs_id = ? AND subkey = ?",
+                            (new_name, row["refs_id"], old_name),
+                        )
+                    except sqlite3.DatabaseError:
+                        pass
             renamed += 1
         connection.commit()
+        primary_committed = True
         if pdb_connection is not None:
-            pdb_connection.commit()
-    except sqlite3.DatabaseError as exc:
-        connection.rollback()
+            try:
+                pdb_connection.commit()
+            except sqlite3.DatabaseError:
+                # The PDB is a secondary PDF index. Keep the authoritative SDB
+                # and files consistent even if EndNote needs to rebuild it.
+                pdb_connection.rollback()
+    except BaseException as exc:
+        rollback_errors: list[str] = []
+        if not primary_committed:
+            try:
+                connection.rollback()
+            except sqlite3.DatabaseError as rollback_exc:
+                rollback_errors.append(str(rollback_exc))
         if pdb_connection is not None:
-            pdb_connection.rollback()
-        raise LibraryFilesError(f"更新 EndNote 附件路径失败：{exc}") from exc
+            try:
+                pdb_connection.rollback()
+            except sqlite3.DatabaseError as rollback_exc:
+                rollback_errors.append(str(rollback_exc))
+        if not primary_committed:
+            for destination, original in reversed(moved_files):
+                try:
+                    if destination.exists() and not original.exists():
+                        destination.replace(original)
+                    elif destination.exists() and original.exists():
+                        rollback_errors.append(f"原文件与新文件同时存在：{original}")
+                except OSError as rollback_exc:
+                    rollback_errors.append(f"{destination} -> {original}: {rollback_exc}")
+        if rollback_errors:
+            raise LibraryFilesError(
+                "EndNote 重命名失败，且无法完全还原文件："
+                + "; ".join(rollback_errors)
+            ) from exc
+        if isinstance(exc, sqlite3.DatabaseError):
+            raise LibraryFilesError(f"更新 EndNote 附件路径失败：{exc}") from exc
+        raise
     finally:
         connection.close()
         if pdb_connection is not None:
@@ -742,41 +819,251 @@ def export_batch_pdfs(
     }
 
 
-async def rename_zotero_pdfs(zotero: ZoteroAdapter, collection: str) -> dict[str, Any]:
+async def _iter_zotero_source_items(
+    zotero: ZoteroAdapter,
+    collection: str,
+    *,
+    library_id: str,
+    collection_key: str,
+    whole_library: bool,
+):
+    """Iterate an explicitly scoped Zotero source, with legacy name lookup support."""
+
+    if whole_library:
+        if collection_key or collection:
+            raise LibraryFilesError("Zotero 整库范围不能同时指定 collection")
+        async for item in zotero.iter_library_items(
+            library_id=library_id,
+            collection_key="",
+        ):
+            yield item
+        return
+    if collection_key:
+        async for item in zotero.iter_library_items(
+            library_id=library_id,
+            collection_key=collection_key,
+        ):
+            yield item
+        return
+    if not collection:
+        raise LibraryFilesError("请选择 Zotero collection，或明确选择整个库")
+    if library_id != "user:0":
+        async for item in zotero.iter_collection_items(collection, library_id=library_id):
+            yield item
+        return
+    async for item in zotero.iter_collection_items(collection):
+        yield item
+
+
+async def rename_zotero_pdfs(
+    zotero: ZoteroAdapter,
+    collection: str,
+    *,
+    library_id: str = "user:0",
+    collection_key: str = "",
+    whole_library: bool = False,
+) -> dict[str, Any]:
     renamed = 0
     skipped = 0
     files: list[dict[str, Any]] = []
-    async for item in zotero.iter_collection_items(collection):
-        key = item.get("data", item).get("key") or item.get("key")
-        row = await zotero.export_row(key)
-        path = row.get("pdf_path")
-        if not path:
-            skipped += 1
-            continue
-        result = rename_pdf_file(Path(path), row["metadata"])
-        if result["renamed"] and row.get("attachment_key"):
-            try:
-                await zotero.rename_attachment_filename(
-                    row["attachment_key"], result["filename"], row.get("attachment_version")
-                )
-            except ZoteroError as exc:
-                Path(result["path"]).replace(Path(path))
-                raise LibraryFilesError(f"已还原文件名；Zotero 未能更新附件：{exc}") from exc
-            renamed += 1
-        files.append({"zotero_key": key, **result})
-    return {"renamed": renamed, "skipped": skipped, "files": files, "source": collection}
+    warnings: list[str] = []
+    scoped = bool(collection_key or whole_library or library_id != "user:0")
+    source_items = _iter_zotero_source_items(
+        zotero,
+        collection,
+        library_id=library_id,
+        collection_key=collection_key,
+        whole_library=whole_library,
+    )
 
+    def failure_message(message: str) -> str:
+        if renamed:
+            return f"操作部分完成：已成功重命名 {renamed} 个文件；{message}"
+        return message
 
-async def list_zotero_pdf_items(zotero: ZoteroAdapter, collection: str) -> list[dict[str, Any]]:
-    items: list[dict[str, Any]] = []
-    async for item in zotero.iter_collection_items(collection):
+    iterator = aiter(source_items)
+    while True:
+        try:
+            item = await anext(iterator)
+        except StopAsyncIteration:
+            break
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            raise LibraryFilesError(
+                failure_message(f"读取 Zotero 范围失败：{exc}")
+            ) from exc
         data = item.get("data", item)
         if str(data.get("itemType") or "") in {"attachment", "note", "annotation"}:
             continue
         key = data.get("key") or item.get("key")
         if not key:
             continue
-        row = await zotero.export_row(key)
+        try:
+            row = (
+                await zotero.export_row(key, library_id=library_id)
+                if scoped
+                else await zotero.export_row(key)
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            raise LibraryFilesError(
+                failure_message(f"读取 Zotero 条目 {key} 失败：{exc}")
+            ) from exc
+        path = row.get("pdf_path")
+        if not path:
+            skipped += 1
+            continue
+        try:
+            result = rename_pdf_file(Path(path), row["metadata"])
+        except Exception as exc:
+            raise LibraryFilesError(
+                failure_message(f"重命名 Zotero 条目 {key} 的文件失败：{exc}")
+            ) from exc
+        if result["renamed"]:
+            renamed_path = Path(result["path"])
+            original_path = Path(path)
+
+            def restore_original() -> None:
+                if original_path.exists():
+                    raise LibraryFilesError(
+                        failure_message(
+                            "无法安全还原 Zotero 文件名：原路径已重新出现；已保留两个文件"
+                        )
+                    )
+                if not renamed_path.exists():
+                    raise LibraryFilesError(
+                        failure_message("无法安全还原 Zotero 文件名：新路径也已不存在")
+                    )
+                try:
+                    renamed_path.replace(original_path)
+                except OSError as rollback_exc:
+                    raise LibraryFilesError(
+                        failure_message(
+                            "Zotero 附件更新失败，且无法还原本地文件名："
+                            f"{rollback_exc}"
+                        )
+                    ) from rollback_exc
+
+            if not row.get("attachment_key"):
+                restore_original()
+                raise LibraryFilesError(
+                    failure_message("Zotero 附件缺少标识，已还原本地文件名")
+                )
+            warning = ""
+            try:
+                if scoped:
+                    await zotero.rename_attachment_filename(
+                        row["attachment_key"],
+                        result["filename"],
+                        row.get("attachment_version"),
+                        library_id=library_id,
+                    )
+                else:
+                    await zotero.rename_attachment_filename(
+                        row["attachment_key"], result["filename"], row.get("attachment_version")
+                    )
+            except BaseException as exc:
+                if isinstance(exc, ZoteroError):
+                    restore_original()
+                    raise LibraryFilesError(
+                        failure_message(f"已还原文件名；Zotero 未能更新附件：{exc}")
+                    ) from exc
+
+                committed_filename = ""
+                try:
+                    if scoped:
+                        committed_filename = await asyncio.shield(
+                            zotero.attachment_filename(
+                                row["attachment_key"], library_id=library_id
+                            )
+                        )
+                    else:
+                        committed_filename = await asyncio.shield(
+                            zotero.attachment_filename(row["attachment_key"])
+                        )
+                except BaseException:
+                    committed_filename = ""
+
+                normalized_committed = committed_filename.casefold()
+                if normalized_committed == result["filename"].casefold():
+                    # The PATCH reached Zotero even though its response was
+                    # lost. Keep the new filename so the attachment stays valid.
+                    if isinstance(exc, asyncio.CancelledError):
+                        raise
+                    warning = "Zotero 已提交新文件名，但更新响应丢失；已通过回查确认"
+                elif normalized_committed in {
+                    original_path.name.casefold(),
+                    str(result["previous"]).casefold(),
+                }:
+                    restore_original()
+                    if isinstance(exc, asyncio.CancelledError):
+                        raise
+                    raise LibraryFilesError(
+                        failure_message(
+                            f"已还原当前文件名；Zotero 未能确认附件更新：{exc}"
+                        )
+                    ) from exc
+                else:
+                    try:
+                        if renamed_path.exists() and not original_path.exists():
+                            shutil.copy2(renamed_path, original_path)
+                    except OSError as rollback_exc:
+                        raise LibraryFilesError(
+                            failure_message(
+                                "Zotero 附件更新结果不确定，且无法保留兼容副本："
+                                f"{rollback_exc}"
+                            )
+                        ) from exc
+                    if isinstance(exc, asyncio.CancelledError):
+                        raise
+                    raise LibraryFilesError(
+                        failure_message(
+                            "Zotero 附件更新结果无法确认；为避免断链，已暂时保留新旧两个文件名"
+                        )
+                    ) from exc
+            if warning:
+                warnings.append(f"{key}: {warning}")
+            renamed += 1
+        files.append({"zotero_key": key, **result})
+    return {
+        "renamed": renamed,
+        "skipped": skipped,
+        "files": files,
+        "warnings": warnings,
+        "source": collection or collection_key or library_id,
+    }
+
+
+async def list_zotero_pdf_items(
+    zotero: ZoteroAdapter,
+    collection: str,
+    *,
+    library_id: str = "user:0",
+    collection_key: str = "",
+    whole_library: bool = False,
+) -> list[dict[str, Any]]:
+    items: list[dict[str, Any]] = []
+    scoped = bool(collection_key or whole_library or library_id != "user:0")
+    async for item in _iter_zotero_source_items(
+        zotero,
+        collection,
+        library_id=library_id,
+        collection_key=collection_key,
+        whole_library=whole_library,
+    ):
+        data = item.get("data", item)
+        if str(data.get("itemType") or "") in {"attachment", "note", "annotation"}:
+            continue
+        key = data.get("key") or item.get("key")
+        if not key:
+            continue
+        row = (
+            await zotero.export_row(key, library_id=library_id)
+            if scoped
+            else await zotero.export_row(key)
+        )
         path = Path(row["pdf_path"]) if row.get("pdf_path") else None
         items.append(_pdf_item(key, row.get("metadata") or {}, [path] if path else []))
     return items
@@ -788,6 +1075,9 @@ async def export_zotero_pdfs(
     destination: Path,
     *,
     item_ids: set[str] | None = None,
+    library_id: str = "user:0",
+    collection_key: str = "",
+    whole_library: bool = False,
 ) -> dict[str, Any]:
     if item_ids is not None and not item_ids:
         raise LibraryFilesError("请至少选择一篇论文")
@@ -796,7 +1086,14 @@ async def export_zotero_pdfs(
     files: list[dict[str, Any]] = []
     known_ids: set[str] = set()
     source_items: list[tuple[str, dict[str, Any]]] = []
-    async for item in zotero.iter_collection_items(collection):
+    scoped = bool(collection_key or whole_library or library_id != "user:0")
+    async for item in _iter_zotero_source_items(
+        zotero,
+        collection,
+        library_id=library_id,
+        collection_key=collection_key,
+        whole_library=whole_library,
+    ):
         data = item.get("data", item)
         if str(data.get("itemType") or "") in {"attachment", "note", "annotation"}:
             continue
@@ -812,7 +1109,11 @@ async def export_zotero_pdfs(
         for key, _item in source_items:
             if item_ids is not None and key not in item_ids:
                 continue
-            row = await zotero.export_row(key)
+            row = (
+                await zotero.export_row(key, library_id=library_id)
+                if scoped
+                else await zotero.export_row(key)
+            )
             path = row.get("pdf_path")
             if not path:
                 skipped += 1
@@ -830,7 +1131,7 @@ async def export_zotero_pdfs(
         "selected": len(item_ids) if item_ids is not None else None,
         "files": files,
         "destination": str(destination),
-        "source": collection,
+        "source": collection or collection_key or library_id,
     }
 
 

@@ -71,6 +71,13 @@ class PipelineManager:
         await self.browser.close()
         await self.zotero.close()
 
+    @asynccontextmanager
+    async def zotero_operation_guard(self) -> AsyncIterator[None]:
+        """Serialize library tools with automatic Zotero commits and exports."""
+
+        async with self._commit_lock:
+            yield
+
     def institution_session_states(self) -> list[dict[str, str]]:
         getter = getattr(self.browser, "institution_session_states", None)
         return getter() if getter is not None else []
@@ -1517,24 +1524,25 @@ class PipelineManager:
                 await self._commit_zotero_batch(batch)
 
     async def export_endnote(self, batch_id: str) -> dict[str, Any]:
-        self.db.assert_batch_writable(batch_id)
-        batch = self.db.get_batch(batch_id)
-        if not batch:
-            raise KeyError(batch_id)
-        collection_name = batch["target_library"].strip()
-        destination = downloads_library_dir(collection_name)
-        try:
-            manifest = await export_zotero_endnote_package(self.zotero, collection_name, destination)
-        except Exception as exc:
-            self.db.event(batch_id, f"EndNote 导出失败：{exc}", level="error")
-            raise
-        self.db.update_batch(batch_id, endnote_export_path=str(destination))
-        copied = manifest.get("pdf_count", 0)
-        self.db.event(
-            batch_id,
-            f"已从 Zotero 导出 EndNote 导入包：{destination}（{manifest.get('record_count', 0)} 篇，{copied} 个 PDF）",
-        )
-        return manifest
+        async with self.zotero_operation_guard():
+            self.db.assert_batch_writable(batch_id)
+            batch = self.db.get_batch(batch_id)
+            if not batch:
+                raise KeyError(batch_id)
+            collection_name = batch["target_library"].strip()
+            destination = downloads_library_dir(collection_name)
+            try:
+                manifest = await export_zotero_endnote_package(self.zotero, collection_name, destination)
+            except Exception as exc:
+                self.db.event(batch_id, f"EndNote 导出失败：{exc}", level="error")
+                raise
+            self.db.update_batch(batch_id, endnote_export_path=str(destination))
+            copied = manifest.get("pdf_count", 0)
+            self.db.event(
+                batch_id,
+                f"已从 Zotero 导出 EndNote 导入包：{destination}（{manifest.get('record_count', 0)} 篇，{copied} 个 PDF）",
+            )
+            return manifest
 
     async def _commit_zotero_batch(self, batch: dict[str, Any]) -> None:
         batch_id = batch["id"]

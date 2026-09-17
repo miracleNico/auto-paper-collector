@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import re
 import secrets
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -20,6 +21,43 @@ class ZoteroError(RuntimeError):
 
 class ZoteroAuthorizationRequired(ZoteroError):
     pass
+
+
+_GROUP_LIBRARY_ID = re.compile(r"group:([1-9][0-9]*)\Z")
+_COLLECTION_KEY = re.compile(r"[A-Za-z0-9]{1,64}\Z")
+
+
+def normalize_library_id(library_id: str = "user:0") -> str:
+    """Validate and canonicalize a selectable Zotero library ID."""
+
+    if not isinstance(library_id, str):
+        raise ZoteroError(
+            "无效的 Zotero library ID；仅支持 user:0 或 group:<正整数>"
+        )
+    if library_id == "user:0":
+        return library_id
+    match = _GROUP_LIBRARY_ID.fullmatch(library_id)
+    if match:
+        return f"group:{match.group(1)}"
+    raise ZoteroError(
+        "无效的 Zotero library ID；仅支持 user:0 或 group:<正整数>"
+    )
+
+
+def _library_path(library_id: str) -> str:
+    """Return a safe Zotero API library prefix for a supported library ID."""
+
+    normalized = normalize_library_id(library_id)
+    if normalized == "user:0":
+        return "/users/0"
+    return f"/groups/{normalized.removeprefix('group:')}"
+
+
+def _collection_path_key(collection_key: str) -> str:
+    key = str(collection_key or "").strip()
+    if not _COLLECTION_KEY.fullmatch(key):
+        raise ZoteroError("无效的 Zotero collection key")
+    return key
 
 
 def _data(item: dict[str, Any]) -> dict[str, Any]:
@@ -101,6 +139,12 @@ class ZoteroAdapter:
         self.client = httpx.AsyncClient(timeout=30.0, follow_redirects=False, trust_env=False)
         self._sync_lock = asyncio.Lock()
 
+    @staticmethod
+    def normalize_library_id(library_id: str = "user:0") -> str:
+        """Public adapter entry point used by API request validation."""
+
+        return normalize_library_id(library_id)
+
     @asynccontextmanager
     async def sync_guard(self) -> AsyncIterator[None]:
         """Serialize complete library syncs that share this adapter instance."""
@@ -174,12 +218,21 @@ class ZoteroAdapter:
             headers["Zotero-API-Key"] = self.api_key
         return headers
 
-    async def _request(self, method: str, path: str, **kwargs: Any) -> httpx.Response:
+    async def _request(
+        self,
+        method: str,
+        path: str,
+        *,
+        allowed_statuses: set[int] | None = None,
+        **kwargs: Any,
+    ) -> httpx.Response:
         headers = {**self._headers(write=method.upper() != "GET"), **kwargs.pop("headers", {})}
         response = await self.client.request(method, f"{self.base_url}{path}", headers=headers, **kwargs)
         if response.status_code == 401:
             self.api_key = ""
             raise ZoteroAuthorizationRequired("Zotero 写入授权已失效，请重新授权")
+        if response.status_code in (allowed_statuses or set()):
+            return response
         try:
             response.raise_for_status()
         except httpx.HTTPStatusError as exc:
@@ -195,9 +248,61 @@ class ZoteroAdapter:
         first = successful[sorted(successful, key=str)[0]]
         return first.get("key") or first.get("data", {}).get("key")
 
-    async def ensure_collection(self, name: str, *, create: bool) -> str:
+    async def list_libraries(self) -> list[dict[str, Any]]:
+        """List the personal library and locally available group libraries."""
+
         await self._ensure_server()
-        response = await self._request("GET", "/users/0/collections")
+        result: list[dict[str, Any]] = [
+            {
+                "id": "user:0",
+                "library_id": "user:0",
+                "name": "My Library",
+                "type": "user",
+            }
+        ]
+        groups: list[dict[str, Any]] = []
+        start = 0
+        while True:
+            response = await self._request(
+                "GET",
+                "/users/0/groups",
+                allowed_statuses={404, 501},
+                params={"limit": 100, "start": start},
+            )
+            if response.status_code in {404, 501}:
+                return result
+            page = response.json()
+            groups.extend(page)
+            if len(page) < 100:
+                break
+            start += 100
+        for item in groups:
+            data = _data(item)
+            group_id = data.get("id", item.get("id"))
+            try:
+                numeric_id = int(group_id)
+            except (TypeError, ValueError):
+                continue
+            if numeric_id <= 0:
+                continue
+            library_id = f"group:{numeric_id}"
+            result.append(
+                {
+                    "id": library_id,
+                    "library_id": library_id,
+                    "name": data.get("name") or f"Group {numeric_id}",
+                    "type": "group",
+                    "group_id": numeric_id,
+                }
+            )
+        return result
+
+    async def ensure_collection(
+        self, name: str, *, create: bool, library_id: str = "user:0"
+    ) -> str:
+        library_path = _library_path(library_id)
+        await self._ensure_server()
+        response = await self._request("GET", f"{library_path}/collections")
         matches = [item for item in response.json() if _data(item).get("name", "").casefold() == name.casefold()]
         if len(matches) == 1:
             return _data(matches[0]).get("key") or matches[0].get("key")
@@ -207,18 +312,21 @@ class ZoteroAdapter:
             raise ZoteroError(f"Zotero collection 不存在：{name}")
         response = await self._request(
             "POST",
-            "/users/0/collections",
+            f"{library_path}/collections",
             json=[{"name": name, "parentCollection": False, "relations": {}}],
             headers={"Zotero-Write-Token": secrets.token_hex(16)},
         )
         return self._successful_key(response)
 
-    async def _candidate_items(self, metadata: dict[str, Any]) -> list[dict[str, Any]]:
+    async def _candidate_items(
+        self, metadata: dict[str, Any], library_id: str = "user:0"
+    ) -> list[dict[str, Any]]:
+        library_path = _library_path(library_id)
         doi = normalize_doi(metadata.get("doi"))
         title = str(metadata.get("title") or "").strip()
         if doi:
             response = await self._request(
-                "GET", "/users/0/items/top", params={"q": doi, "qmode": "everything"}
+                "GET", f"{library_path}/items/top", params={"q": doi, "qmode": "everything"}
             )
             exact = [
                 item
@@ -229,7 +337,7 @@ class ZoteroAdapter:
                 return exact
 
             response = await self._request(
-                "GET", "/users/0/items/top", params={"q": title, "qmode": "everything"}
+                "GET", f"{library_path}/items/top", params={"q": title, "qmode": "everything"}
             )
             title_matches = match_items(
                 response.json(), {**metadata, "doi": None}
@@ -242,11 +350,13 @@ class ZoteroAdapter:
             ]
 
         response = await self._request(
-            "GET", "/users/0/items/top", params={"q": title, "qmode": "everything"}
+            "GET", f"{library_path}/items/top", params={"q": title, "qmode": "everything"}
         )
         return match_items(response.json(), metadata)
 
-    async def _add_to_collection(self, item: dict[str, Any], collection_key: str) -> None:
+    async def _add_to_collection(
+        self, item: dict[str, Any], collection_key: str, library_id: str = "user:0"
+    ) -> None:
         data = _data(item)
         collections = list(data.get("collections") or [])
         if collection_key in collections:
@@ -254,17 +364,23 @@ class ZoteroAdapter:
         collections.append(collection_key)
         await self._request(
             "PATCH",
-            f"/users/0/items/{data.get('key') or item.get('key')}",
+            f"{_library_path(library_id)}/items/{data.get('key') or item.get('key')}",
             json={"version": data.get("version", item.get("version")), "collections": collections},
         )
 
-    async def _children(self, item_key: str) -> list[dict[str, Any]]:
-        response = await self._request("GET", f"/users/0/items/{item_key}/children")
+    async def _children(
+        self, item_key: str, library_id: str = "user:0"
+    ) -> list[dict[str, Any]]:
+        response = await self._request(
+            "GET", f"{_library_path(library_id)}/items/{item_key}/children"
+        )
         return response.json()
 
-    async def _attachment_path(self, attachment_key: str) -> Path | None:
+    async def _attachment_path(
+        self, attachment_key: str, library_id: str = "user:0"
+    ) -> Path | None:
         response = await self.client.get(
-            f"{self.base_url}/users/0/items/{attachment_key}/file/view/url",
+            f"{self.base_url}{_library_path(library_id)}/items/{attachment_key}/file/view/url",
             headers=self._headers(),
         )
         if response.status_code != 200:
@@ -278,19 +394,26 @@ class ZoteroAdapter:
             path = path[1:]
         return Path(path)
 
-    async def _existing_main_pdf(self, item_key: str, metadata: dict[str, Any]) -> tuple[bool, list[dict[str, Any]]]:
-        children = await self._children(item_key)
+    async def _existing_main_pdf(
+        self,
+        item_key: str,
+        metadata: dict[str, Any],
+        library_id: str = "user:0",
+    ) -> tuple[bool, list[dict[str, Any]]]:
+        children = await self._children(item_key, library_id)
         pdfs = [item for item in children if _data(item).get("contentType") == "application/pdf"]
         for item in pdfs:
             key = _data(item).get("key") or item.get("key")
-            path = await self._attachment_path(key)
+            path = await self._attachment_path(key, library_id)
             if path and path.is_file():
                 result = validate_pdf(path, expected_doi=metadata.get("doi"), expected_title=metadata.get("title"))
                 if result.valid_pdf and result.identity == "verified" and result.role == "main":
                     return True, pdfs
         return False, pdfs
 
-    async def _create_attachment(self, item_key: str, pdf_path: Path) -> str:
+    async def _create_attachment(
+        self, item_key: str, pdf_path: Path, library_id: str = "user:0"
+    ) -> str:
         payload = {
             "itemType": "attachment",
             "parentItem": item_key,
@@ -306,11 +429,16 @@ class ZoteroAdapter:
             "filename": pdf_path.name,
         }
         response = await self._request(
-            "POST", "/users/0/items", json=[payload], headers={"Zotero-Write-Token": secrets.token_hex(16)}
+            "POST",
+            f"{_library_path(library_id)}/items",
+            json=[payload],
+            headers={"Zotero-Write-Token": secrets.token_hex(16)},
         )
         return self._successful_key(response)
 
-    async def _upload_file(self, attachment_key: str, pdf_path: Path) -> None:
+    async def _upload_file(
+        self, attachment_key: str, pdf_path: Path, library_id: str = "user:0"
+    ) -> None:
         digest = hashlib.md5(pdf_path.read_bytes(), usedforsecurity=False).hexdigest()
         form = {
             "md5": digest,
@@ -320,7 +448,10 @@ class ZoteroAdapter:
         }
         condition = {"If-None-Match": "*"}
         response = await self._request(
-            "POST", f"/users/0/items/{attachment_key}/file", data=form, headers=condition
+            "POST",
+            f"{_library_path(library_id)}/items/{attachment_key}/file",
+            data=form,
+            headers=condition,
         )
         authorization = response.json()
         if not authorization.get("exists"):
@@ -332,20 +463,23 @@ class ZoteroAdapter:
                 raise ZoteroError(f"Zotero PDF 上传失败：HTTP {upload.status_code}")
             await self._request(
                 "POST",
-                f"/users/0/items/{attachment_key}/file",
+                f"{_library_path(library_id)}/items/{attachment_key}/file",
                 data={"upload": authorization["uploadKey"]},
                 headers=condition,
             )
 
-    async def attach_pdf(self, item_key: str, pdf_path: Path) -> dict[str, Any]:
+    async def attach_pdf(
+        self, item_key: str, pdf_path: Path, library_id: str = "user:0"
+    ) -> dict[str, Any]:
         """Attach one local PDF unless the same bytes are already attached."""
 
+        _library_path(library_id)
         await self._ensure_server()
         pdf_path = Path(pdf_path)
         if not pdf_path.is_file():
             raise ZoteroError(f"PDF 不存在：{pdf_path}")
         wanted_md5 = hashlib.md5(pdf_path.read_bytes(), usedforsecurity=False).hexdigest()
-        children = await self._children(item_key)
+        children = await self._children(item_key, library_id)
         incomplete_key = None
         for child in children:
             data = _data(child)
@@ -355,7 +489,7 @@ class ZoteroAdapter:
             if data.get("md5") == wanted_md5:
                 return {"attached": False, "attachment_key": key, "existing": True}
             if key and not data.get("md5"):
-                existing_path = await self._attachment_path(key)
+                existing_path = await self._attachment_path(key, library_id)
                 if existing_path and existing_path.is_file():
                     existing_md5 = hashlib.md5(
                         existing_path.read_bytes(), usedforsecurity=False
@@ -369,36 +503,45 @@ class ZoteroAdapter:
                     and data.get("linkMode") in {None, "imported_file", "imported_url"}
                 ):
                     incomplete_key = key
-        attachment_key = incomplete_key or await self._create_attachment(item_key, pdf_path)
-        await self._upload_file(attachment_key, pdf_path)
-        final_children = await self._children(item_key)
+        attachment_key = incomplete_key or await self._create_attachment(
+            item_key, pdf_path, library_id
+        )
+        await self._upload_file(attachment_key, pdf_path, library_id)
+        final_children = await self._children(item_key, library_id)
         if not any(_data(item).get("md5") == wanted_md5 for item in final_children):
             raise ZoteroError("Zotero 写入后未找到匹配的 PDF 附件")
         return {"attached": True, "attachment_key": attachment_key, "existing": False}
 
     async def commit_paper(
-        self, collection_key: str, metadata: dict[str, Any], pdf_path: Path | None
+        self,
+        collection_key: str,
+        metadata: dict[str, Any],
+        pdf_path: Path | None,
+        library_id: str = "user:0",
     ) -> dict[str, Any]:
+        library_path = _library_path(library_id)
         await self._ensure_server()
-        matches = await self._candidate_items(metadata)
+        matches = await self._candidate_items(metadata, library_id)
         if len(matches) > 1:
             raise ZoteroError("Zotero 中有多个匹配题录，需要人工处理")
         created = False
         if matches:
             item = matches[0]
-            await self._add_to_collection(item, collection_key)
+            await self._add_to_collection(item, collection_key, library_id)
             item_key = _data(item).get("key") or item.get("key")
         else:
             response = await self._request(
                 "POST",
-                "/users/0/items",
+                f"{library_path}/items",
                 json=[item_payload(metadata, collection_key)],
                 headers={"Zotero-Write-Token": secrets.token_hex(16)},
             )
             item_key = self._successful_key(response)
             created = True
 
-        existing_main, children = await self._existing_main_pdf(item_key, metadata)
+        existing_main, children = await self._existing_main_pdf(
+            item_key, metadata, library_id
+        )
         attached = False
         attachment_key = None
         if pdf_path and not existing_main:
@@ -411,15 +554,15 @@ class ZoteroAdapter:
                 ]
                 attachment_key = (
                     (_data(incomplete[0]).get("key") or incomplete[0].get("key"))
-                    if incomplete else await self._create_attachment(item_key, pdf_path)
+                    if incomplete else await self._create_attachment(item_key, pdf_path, library_id)
                 )
-                await self._upload_file(attachment_key, pdf_path)
+                await self._upload_file(attachment_key, pdf_path, library_id)
                 attached = True
 
-        final = (await self._request("GET", f"/users/0/items/{item_key}")).json()
+        final = (await self._request("GET", f"{library_path}/items/{item_key}")).json()
         if len(match_items([final], metadata)) != 1:
             raise ZoteroError("Zotero 写入后题录核验失败")
-        final_children = await self._children(item_key)
+        final_children = await self._children(item_key, library_id)
         if pdf_path and not existing_main:
             wanted_md5 = hashlib.md5(pdf_path.read_bytes(), usedforsecurity=False).hexdigest()
             if not any(_data(item).get("md5") == wanted_md5 for item in final_children):
@@ -462,15 +605,21 @@ class ZoteroAdapter:
             "type": "journal-article",
         }
 
-    async def export_row(self, item_key: str, fallback_metadata: dict[str, Any] | None = None) -> dict[str, Any]:
+    async def export_row(
+        self,
+        item_key: str,
+        fallback_metadata: dict[str, Any] | None = None,
+        library_id: str = "user:0",
+    ) -> dict[str, Any]:
+        library_path = _library_path(library_id)
         await self._ensure_server()
-        item = (await self._request("GET", f"/users/0/items/{item_key}")).json()
+        item = (await self._request("GET", f"{library_path}/items/{item_key}")).json()
         metadata = self.metadata_from_item(item)
         if fallback_metadata:
             for key in ("doi", "title", "year", "authors", "journal", "volume", "issue", "pages", "url"):
                 if not metadata.get(key) and fallback_metadata.get(key):
                     metadata[key] = fallback_metadata[key]
-        children = await self._children(item_key)
+        children = await self._children(item_key, library_id)
         pdf_path = None
         attachment_key = None
         attachment_version = None
@@ -479,7 +628,7 @@ class ZoteroAdapter:
             if data.get("contentType") != "application/pdf":
                 continue
             key = data.get("key") or child.get("key")
-            path = await self._attachment_path(key)
+            path = await self._attachment_path(key, library_id)
             if path and path.is_file():
                 pdf_path = path
                 attachment_key = key
@@ -497,28 +646,83 @@ class ZoteroAdapter:
             "pdf_path": pdf_path,
         }
 
-    async def list_collections(self) -> list[dict[str, Any]]:
+    async def list_collections(
+        self, library_id: str = "user:0"
+    ) -> list[dict[str, Any]]:
+        library_path = _library_path(library_id)
         await self._ensure_server()
-        items = (await self._request("GET", "/users/0/collections")).json()
-        result = []
+        items: list[dict[str, Any]] = []
+        start = 0
+        while True:
+            page = (
+                await self._request(
+                    "GET",
+                    f"{library_path}/collections",
+                    params={"limit": 100, "start": start},
+                )
+            ).json()
+            items.extend(page)
+            if len(page) < 100:
+                break
+            start += 100
+        result: list[dict[str, Any]] = []
         for item in items:
             data = _data(item)
             result.append(
                 {
                     "key": data.get("key") or item.get("key"),
                     "name": data.get("name") or "",
+                    "parentCollection": data.get("parentCollection") or "",
                     "numItems": (item.get("meta") or {}).get("numItems"),
                 }
             )
+
+        by_key = {str(row["key"]): row for row in result if row.get("key")}
+        paths: dict[str, str] = {}
+
+        def collection_path(key: str, trail: frozenset[str] = frozenset()) -> str:
+            if key in paths:
+                return paths[key]
+            row = by_key[key]
+            name = str(row.get("name") or key)
+            parent = str(row.get("parentCollection") or "")
+            if key in trail:
+                return name
+            if parent and parent in by_key and parent not in trail:
+                path = f"{collection_path(parent, trail | {key})} / {name}"
+            else:
+                path = name
+            paths[key] = path
+            return path
+
+        for key in by_key:
+            collection_path(key)
+        path_counts: dict[str, int] = {}
+        for path in paths.values():
+            path_counts[path] = path_counts.get(path, 0) + 1
+        for row in result:
+            key = str(row.get("key") or "")
+            path = paths.get(key, str(row.get("name") or key))
+            row["path"] = f"{path} [{key}]" if path_counts.get(path, 0) > 1 else path
         return result
 
-    async def iter_collection_items(self, name: str):
-        key = await self.ensure_collection(name, create=False)
+    async def iter_library_items(
+        self, library_id: str = "user:0", collection_key: str = ""
+    ):
+        """Iterate top-level items in a whole library or one collection."""
+
+        library_path = _library_path(library_id)
+        key = _collection_path_key(collection_key) if collection_key else ""
+        await self._ensure_server()
+        if key:
+            path = f"{library_path}/collections/{key}/items/top"
+        else:
+            path = f"{library_path}/items/top"
         start = 0
         while True:
             response = await self._request(
                 "GET",
-                f"/users/0/collections/{key}/items/top",
+                path,
                 params={"limit": 100, "start": start},
             )
             rows = response.json()
@@ -530,8 +734,41 @@ class ZoteroAdapter:
                 break
             start += 100
 
-    async def rename_attachment_filename(self, attachment_key: str, filename: str, version: int | None) -> None:
+    async def iter_collection_items(
+        self, name: str, library_id: str = "user:0"
+    ):
+        """Backward-compatible name-based collection iterator."""
+
+        key = await self.ensure_collection(
+            name, create=False, library_id=library_id
+        )
+        async for item in self.iter_library_items(library_id, key):
+            yield item
+
+    async def rename_attachment_filename(
+        self,
+        attachment_key: str,
+        filename: str,
+        version: int | None,
+        library_id: str = "user:0",
+    ) -> None:
         payload: dict[str, Any] = {"filename": filename, "title": filename}
         if version is not None:
             payload["version"] = version
-        await self._request("PATCH", f"/users/0/items/{attachment_key}", json=payload)
+        await self._request(
+            "PATCH",
+            f"{_library_path(library_id)}/items/{attachment_key}",
+            json=payload,
+        )
+
+    async def attachment_filename(
+        self, attachment_key: str, library_id: str = "user:0"
+    ) -> str:
+        """Read the filename currently committed for one attachment."""
+
+        response = await self._request(
+            "GET",
+            f"{_library_path(library_id)}/items/{attachment_key}",
+        )
+        data = _data(response.json())
+        return str(data.get("filename") or data.get("title") or "")

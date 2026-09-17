@@ -236,6 +236,9 @@ button.danger.solid { border-color: var(--danger); color: white; background: var
 .icon-button { min-width: 38px; min-height: 38px; padding: .4rem; border-radius: 50%; font-size: 1.05rem; }
 .compact-button { min-height: 30px; padding: .35rem .55rem; font-size: .75rem; }
 .form-footer, .inline-actions, .dialog-actions { display: flex; align-items: center; gap: .65rem; flex-wrap: wrap; }
+.path-input { display: flex; align-items: stretch; gap: .5rem; }
+.path-input input { min-width: 0; flex: 1 1 auto; }
+.path-input button { flex: 0 0 auto; white-space: nowrap; }
 .form-footer { padding-top: .2rem; }
 .form-footer .primary { margin-left: auto; }
 .result-text { min-height: 1.3rem; margin: 0; color: var(--muted); font-size: .78rem; font-weight: 500; overflow-wrap: anywhere; }

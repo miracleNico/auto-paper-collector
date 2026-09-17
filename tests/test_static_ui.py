@@ -61,6 +61,25 @@ class PaperActionMenuTests(unittest.TestCase):
         self.assertIn('"/api/tools/export-pdfs/candidates"', self.javascript)
         self.assertIn("item_ids: itemIds", self.javascript)
 
+    def test_pdf_tools_can_select_endnote_and_zotero_libraries(self) -> None:
+        for prefix in ("rename", "export"):
+            self.assertIn(f'id="{prefix}-zotero-library"', self.html)
+            self.assertIn(f'id="{prefix}-endnote-library"', self.html)
+            self.assertIn(f'id="pick-{prefix}-endnote-library"', self.html)
+        self.assertNotIn('id="rename-endnote-library" readonly', self.html)
+        self.assertIn('id="export-endnote-wrap"', self.html)
+        self.assertIn("function selectedZoteroScope(prefix)", self.javascript)
+        self.assertIn("function loadZoteroCollections(prefix, supplied = null)", self.javascript)
+        self.assertIn('"/api/tools/pick-endnote-library"', self.javascript)
+        self.assertIn("zotero_library_id", self.javascript)
+        self.assertIn("collection_key", self.javascript)
+        self.assertIn("whole_library", self.javascript)
+        self.assertIn("endnote_library", self.javascript)
+        self.assertIn('data-scope-placeholder="true"', self.javascript)
+        self.assertIn('data-whole-library="true"', self.javascript)
+        self.assertIn('id="rename-collection" disabled', self.html)
+        self.assertIn('type="submit" disabled>开始重命名', self.html)
+
     def test_pdf_export_ignores_stale_candidate_requests(self) -> None:
         self.assertIn("exportRequestToken: 0", self.javascript)
         self.assertIn("exportController: null", self.javascript)
@@ -68,6 +87,12 @@ class PaperActionMenuTests(unittest.TestCase):
         self.assertIn("const controller = new AbortController()", self.javascript)
         self.assertIn("signal: controller.signal", self.javascript)
         self.assertIn("token !== state.exportRequestToken", self.javascript)
+
+    def test_tool_sources_ignore_stale_responses(self) -> None:
+        self.assertIn("toolSourcesRequestToken: 0", self.javascript)
+        self.assertIn("toolSourcesController: null", self.javascript)
+        self.assertIn("state.toolSourcesController?.abort()", self.javascript)
+        self.assertIn("token !== state.toolSourcesRequestToken", self.javascript)
 
     def test_endnote_to_zotero_sync_form_uses_sync_endpoint(self) -> None:
         self.assertIn('id="sync-endnote-zotero-form"', self.html)

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
 import os
 import secrets
 import threading
@@ -8,6 +9,7 @@ import webbrowser
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
+from weakref import WeakKeyDictionary
 
 import uvicorn
 from fastapi import FastAPI, File, HTTPException, Request, UploadFile
@@ -47,6 +49,7 @@ from .library_files import (
 from .redaction import redact_diagnostic_text
 from .ocr import ocr_status
 from .pipeline import PipelineManager
+from .path_picker import PathPickerError, pick_endnote_library
 from .reporting import batch_csv
 from .user_config import (
     ALLOWED_SOURCES,
@@ -70,6 +73,20 @@ settings.endnote_library = Path(library_setting).expanduser() if library_setting
 pipeline = PipelineManager(settings, database)
 deletion_manager = BatchDeletionManager(settings, database, pipeline)
 SESSION_TOKEN = secrets.token_urlsafe(32)
+_LIBRARY_TOOL_OPERATION_LOCKS: WeakKeyDictionary[
+    asyncio.AbstractEventLoop, asyncio.Lock
+] = WeakKeyDictionary()
+
+
+def library_tool_operation_lock() -> asyncio.Lock:
+    """Return one shared mutation lock for the current application event loop."""
+
+    loop = asyncio.get_running_loop()
+    lock = _LIBRARY_TOOL_OPERATION_LOCKS.get(loop)
+    if lock is None:
+        lock = asyncio.Lock()
+        _LIBRARY_TOOL_OPERATION_LOCKS[loop] = lock
+    return lock
 
 
 @asynccontextmanager
@@ -80,7 +97,7 @@ async def lifespan(_: FastAPI):
     await pipeline.close()
 
 
-app = FastAPI(title="Paper Reference Workflow", version="0.5.0", lifespan=lifespan)
+app = FastAPI(title="Paper Reference Workflow", version="0.6.0", lifespan=lifespan)
 app.mount("/static", StaticFiles(directory=settings.app_root / "paper_endnote" / "static"), name="static")
 
 
@@ -176,9 +193,18 @@ class LibraryToolRequest(BaseModel):
     source: str = Field(pattern="^(batch|zotero|endnote)$")
     batch_id: str = ""
     collection: str = ""
+    collection_key: str = Field(default="", max_length=64)
+    whole_library: bool = False
+    zotero_library_id: str = Field(default="user:0", max_length=64)
+    zotero_library_name: str = Field(default="", max_length=512)
+    endnote_library: str = Field(default="", max_length=32767)
     destination: str = ""
     open_folder: bool = False
     item_ids: list[str] | None = Field(default=None, max_length=10000)
+
+
+class EndNoteLibraryPickerRequest(BaseModel):
+    initial_path: str = Field(default="", max_length=32767)
 
 
 class EndNoteExportToolRequest(BaseModel):
@@ -203,7 +229,7 @@ async def index() -> FileResponse:
 @app.get("/api/state")
 async def state() -> dict[str, Any]:
     return {
-        "version": "0.5.0",
+        "version": "0.6.0",
         "runtime_dir": str(settings.runtime_dir),
         "config_path": str(settings.config_path),
         "endnote": probe_endnote(settings.endnote_exe, settings.endnote_library),
@@ -368,11 +394,20 @@ async def delete_credentials() -> dict[str, Any]:
 @app.get("/api/tools/sources")
 async def tool_sources() -> dict[str, Any]:
     collections: list[dict[str, Any]] = []
+    zotero_libraries: list[dict[str, Any]] = [
+        {"id": "user:0", "name": "My Library", "type": "user"}
+    ]
     zotero_error = None
+    zotero_library_error = None
     try:
-        collections = await pipeline.zotero.list_collections()
+        collections = await pipeline.zotero.list_collections(library_id="user:0")
     except Exception as exc:
         zotero_error = str(exc)
+    if zotero_error is None:
+        try:
+            zotero_libraries = await pipeline.zotero.list_libraries()
+        except Exception as exc:
+            zotero_library_error = str(exc)
     library = settings.endnote_library
     return {
         "batches": [
@@ -385,39 +420,76 @@ async def tool_sources() -> dict[str, Any]:
             for batch in database.list_batches()
         ],
         "collections": collections,
+        "zotero_libraries": zotero_libraries,
         "zotero_error": zotero_error,
+        "zotero_library_error": zotero_library_error,
         "endnote_library": str(library) if library else "",
         "endnote_data_dir": str(library.with_suffix(".Data") / "PDF") if library else "",
         "downloads_dir": str(Path.home() / "Downloads"),
     }
 
 
-@app.post("/api/tools/rename-pdfs")
-async def tool_rename_pdfs(payload: LibraryToolRequest) -> dict[str, Any]:
+@app.get("/api/tools/zotero-collections")
+async def tool_zotero_collections(library_id: str = "user:0") -> dict[str, Any]:
     try:
-        if payload.source == "batch":
-            if not payload.batch_id.strip():
-                raise LibraryFilesError("请选择本机批次")
-            batch_id = payload.batch_id.strip()
-            require_batch(batch_id, writable=True)
-            async with pipeline.track_batch_work(batch_id, cancellable=False):
-                return rename_batch_pdfs(database, batch_id)
-        if payload.source == "zotero":
-            if not payload.collection.strip():
-                raise LibraryFilesError("请选择 Zotero collection")
-            return await rename_zotero_pdfs(pipeline.zotero, payload.collection.strip())
-        if payload.source == "endnote":
-            library = settings.endnote_library
-            if not library:
-                raise LibraryFilesError("请先在设置中填写 EndNote 库路径")
-            return rename_endnote_pdfs(library)
-        raise LibraryFilesError("未知数据区")
-    except LibraryFilesError as exc:
-        raise HTTPException(400, str(exc)) from exc
-    except HTTPException:
-        raise
+        normalized = pipeline.zotero.normalize_library_id(library_id)
+        collections = await pipeline.zotero.list_collections(library_id=normalized)
+        return {"library_id": normalized, "collections": collections}
     except Exception as exc:
         raise HTTPException(409, str(exc)) from exc
+
+
+@app.post("/api/tools/pick-endnote-library")
+async def tool_pick_endnote_library(payload: EndNoteLibraryPickerRequest) -> dict[str, Any]:
+    try:
+        path = await asyncio.to_thread(pick_endnote_library, payload.initial_path)
+    except PathPickerError as exc:
+        raise HTTPException(409, str(exc)) from exc
+    return {"path": path, "cancelled": not bool(path)}
+
+
+def selected_endnote_library(payload: LibraryToolRequest) -> Path:
+    selected = payload.endnote_library.strip().strip('"')
+    if selected:
+        library = Path(selected).expanduser()
+        if not library.is_absolute():
+            raise LibraryFilesError("EndNote 库必须使用 .enl 文件的绝对路径")
+        return library
+    if settings.endnote_library:
+        return Path(settings.endnote_library).expanduser()
+    raise LibraryFilesError("请选择 EndNote .enl 库")
+
+
+@app.post("/api/tools/rename-pdfs")
+async def tool_rename_pdfs(payload: LibraryToolRequest) -> dict[str, Any]:
+    async with library_tool_operation_lock():
+        try:
+            if payload.source == "batch":
+                if not payload.batch_id.strip():
+                    raise LibraryFilesError("请选择本机批次")
+                batch_id = payload.batch_id.strip()
+                require_batch(batch_id, writable=True)
+                async with pipeline.track_batch_work(batch_id, cancellable=False):
+                    async with pipeline.zotero_operation_guard():
+                        return rename_batch_pdfs(database, batch_id)
+            if payload.source == "zotero":
+                async with pipeline.zotero_operation_guard():
+                    return await rename_zotero_pdfs(
+                        pipeline.zotero,
+                        payload.collection.strip(),
+                        library_id=payload.zotero_library_id.strip() or "user:0",
+                        collection_key=payload.collection_key.strip(),
+                        whole_library=payload.whole_library,
+                    )
+            if payload.source == "endnote":
+                return rename_endnote_pdfs(selected_endnote_library(payload))
+            raise LibraryFilesError("未知数据区")
+        except LibraryFilesError as exc:
+            raise HTTPException(400, str(exc)) from exc
+        except HTTPException:
+            raise
+        except Exception as exc:
+            raise HTTPException(409, str(exc)) from exc
 
 
 def selected_tool_item_ids(payload: LibraryToolRequest) -> set[str] | None:
@@ -441,14 +513,21 @@ async def tool_export_pdf_candidates(payload: LibraryToolRequest) -> dict[str, A
             source_name = batch["name"]
         elif payload.source == "zotero":
             collection = payload.collection.strip()
-            if not collection:
-                raise LibraryFilesError("请选择 Zotero collection")
-            items = await list_zotero_pdf_items(pipeline.zotero, collection)
-            source_name = collection
+            items = await list_zotero_pdf_items(
+                pipeline.zotero,
+                collection,
+                library_id=payload.zotero_library_id.strip() or "user:0",
+                collection_key=payload.collection_key.strip(),
+                whole_library=payload.whole_library,
+            )
+            source_name = (
+                collection
+                or payload.zotero_library_name.strip()
+                or payload.zotero_library_id.strip()
+                or "My Library"
+            )
         elif payload.source == "endnote":
-            library = settings.endnote_library
-            if not library:
-                raise LibraryFilesError("请先在设置中填写 EndNote 库路径")
+            library = selected_endnote_library(payload)
             items = list_endnote_pdf_items(library)
             source_name = library.stem
         else:
@@ -470,88 +549,104 @@ async def tool_export_pdf_candidates(payload: LibraryToolRequest) -> dict[str, A
 
 @app.post("/api/tools/export-pdfs")
 async def tool_export_pdfs(payload: LibraryToolRequest) -> dict[str, Any]:
-    try:
-        item_ids = selected_tool_item_ids(payload)
-        if payload.source == "batch":
-            if not payload.batch_id.strip():
-                raise LibraryFilesError("请选择本机批次")
-            batch_id = payload.batch_id.strip()
-            batch = require_batch(batch_id, writable=True)
-            lib_name = batch["target_library"]
-            destination = resolve_export_dir(payload.destination) if payload.destination.strip() else downloads_library_dir(lib_name)
-            async with pipeline.track_batch_work(batch_id, cancellable=False):
-                result = export_batch_pdfs(database, batch_id, destination, item_ids=item_ids)
-        elif payload.source == "zotero":
-            if not payload.collection.strip():
-                raise LibraryFilesError("请选择 Zotero collection")
-            destination = (
-                resolve_export_dir(payload.destination)
-                if payload.destination.strip()
-                else downloads_library_dir(payload.collection.strip())
-            )
-            result = await export_zotero_pdfs(
-                pipeline.zotero, payload.collection.strip(), destination, item_ids=item_ids
-            )
-        elif payload.source == "endnote":
-            library = settings.endnote_library
-            if not library:
-                raise LibraryFilesError("请先在设置中填写 EndNote 库路径")
-            destination = (
-                resolve_export_dir(payload.destination)
-                if payload.destination.strip()
-                else downloads_library_dir(library.stem)
-            )
-            result = export_endnote_data_pdfs(library, destination, item_ids=item_ids)
-        else:
-            raise LibraryFilesError("未知数据区")
-        if payload.open_folder:
-            os.startfile(destination)  # noqa: S606 - local Windows helper
-        return result
-    except LibraryFilesError as exc:
-        raise HTTPException(400, str(exc)) from exc
-    except HTTPException:
-        raise
-    except Exception as exc:
-        raise HTTPException(409, str(exc)) from exc
+    async with library_tool_operation_lock():
+        try:
+            item_ids = selected_tool_item_ids(payload)
+            if payload.source == "batch":
+                if not payload.batch_id.strip():
+                    raise LibraryFilesError("请选择本机批次")
+                batch_id = payload.batch_id.strip()
+                batch = require_batch(batch_id, writable=True)
+                lib_name = batch["target_library"]
+                destination = resolve_export_dir(payload.destination) if payload.destination.strip() else downloads_library_dir(lib_name)
+                async with pipeline.track_batch_work(batch_id, cancellable=False):
+                    result = export_batch_pdfs(database, batch_id, destination, item_ids=item_ids)
+            elif payload.source == "zotero":
+                source_name = (
+                    payload.collection.strip()
+                    or payload.zotero_library_name.strip()
+                    or payload.zotero_library_id.strip()
+                    or "My Library"
+                )
+                destination = (
+                    resolve_export_dir(payload.destination)
+                    if payload.destination.strip()
+                    else downloads_library_dir(source_name)
+                )
+                async with pipeline.zotero_operation_guard():
+                    result = await export_zotero_pdfs(
+                        pipeline.zotero,
+                        payload.collection.strip(),
+                        destination,
+                        item_ids=item_ids,
+                        library_id=payload.zotero_library_id.strip() or "user:0",
+                        collection_key=payload.collection_key.strip(),
+                        whole_library=payload.whole_library,
+                    )
+            elif payload.source == "endnote":
+                library = selected_endnote_library(payload)
+                destination = (
+                    resolve_export_dir(payload.destination)
+                    if payload.destination.strip()
+                    else downloads_library_dir(library.stem)
+                )
+                result = export_endnote_data_pdfs(library, destination, item_ids=item_ids)
+            else:
+                raise LibraryFilesError("未知数据区")
+            if payload.open_folder:
+                os.startfile(destination)  # noqa: S606 - local Windows helper
+            return result
+        except LibraryFilesError as exc:
+            raise HTTPException(400, str(exc)) from exc
+        except HTTPException:
+            raise
+        except Exception as exc:
+            raise HTTPException(409, str(exc)) from exc
 
 
 @app.post("/api/tools/export-endnote")
 async def tool_export_endnote(payload: EndNoteExportToolRequest) -> dict[str, Any]:
-    try:
-        collection = payload.collection.strip()
-        if not collection:
-            raise LibraryFilesError("请选择 Zotero collection")
-        destination = (
-            resolve_export_dir(payload.destination)
-            if payload.destination.strip()
-            else downloads_library_dir(collection)
-        )
-        result = await export_zotero_endnote_package(pipeline.zotero, collection, destination)
-        if payload.open_folder:
-            os.startfile(destination)  # noqa: S606 - local Windows helper
-        return result
-    except LibraryFilesError as exc:
-        raise HTTPException(400, str(exc)) from exc
-    except Exception as exc:
-        raise HTTPException(409, str(exc)) from exc
+    async with library_tool_operation_lock():
+        try:
+            collection = payload.collection.strip()
+            if not collection:
+                raise LibraryFilesError("请选择 Zotero collection")
+            destination = (
+                resolve_export_dir(payload.destination)
+                if payload.destination.strip()
+                else downloads_library_dir(collection)
+            )
+            async with pipeline.zotero_operation_guard():
+                result = await export_zotero_endnote_package(
+                    pipeline.zotero, collection, destination
+                )
+            if payload.open_folder:
+                os.startfile(destination)  # noqa: S606 - local Windows helper
+            return result
+        except LibraryFilesError as exc:
+            raise HTTPException(400, str(exc)) from exc
+        except Exception as exc:
+            raise HTTPException(409, str(exc)) from exc
 
 
 @app.post("/api/tools/sync-endnote-zotero")
 async def tool_sync_endnote_zotero(payload: EndNoteZoteroSyncRequest) -> dict[str, Any]:
-    try:
-        library = settings.endnote_library
-        if not library:
-            raise LibraryFilesError("请先在设置中填写 EndNote 库路径")
-        async with pipeline.zotero.sync_guard():
-            return await sync_endnote_to_zotero(
-                pipeline.zotero,
-                library,
-                payload.collection.strip(),
-            )
-    except LibraryFilesError as exc:
-        raise HTTPException(400, str(exc)) from exc
-    except Exception as exc:
-        raise HTTPException(409, str(exc)) from exc
+    async with library_tool_operation_lock():
+        try:
+            library = settings.endnote_library
+            if not library:
+                raise LibraryFilesError("请先在设置中填写 EndNote 库路径")
+            async with pipeline.zotero_operation_guard():
+                async with pipeline.zotero.sync_guard():
+                    return await sync_endnote_to_zotero(
+                        pipeline.zotero,
+                        library,
+                        payload.collection.strip(),
+                    )
+        except LibraryFilesError as exc:
+            raise HTTPException(400, str(exc)) from exc
+        except Exception as exc:
+            raise HTTPException(409, str(exc)) from exc
 
 
 @app.post("/api/institution/login")

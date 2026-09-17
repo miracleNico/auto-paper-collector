@@ -307,6 +307,7 @@ class StaticUiPlaywrightTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(candidate_payloads[-1]["whole_library"])
 
         await self.page.locator("#rename-scheme").select_option("title_only")
+        await self.page.locator("#rename-deduplicate").check()
         await self.page.locator("#rename-pdfs-form button[type='submit']").click()
         await expect(self.page.locator("#rename-result")).to_contain_text("已重命名 0 个")
         rename_payloads = [
@@ -315,6 +316,7 @@ class StaticUiPlaywrightTests(unittest.IsolatedAsyncioTestCase):
             if path == "/api/tools/rename-pdfs"
         ]
         self.assertEqual(rename_payloads[-1]["rename_scheme"], "title_only")
+        self.assertTrue(rename_payloads[-1]["deduplicate_pdfs"])
 
         await self.page.locator("#export-source").select_option("endnote")
         await expect(self.page.locator("#endnote-library-paths option")).to_have_count(2)

@@ -86,6 +86,40 @@ def unique_destination(directory: Path, filename: str, *, ignore: Path | None = 
         index += 1
 
 
+def _duplicate_collision(
+    directory: Path,
+    filename: str,
+    *,
+    source: Path,
+    protected_paths: set[Path] | None = None,
+) -> Path | None:
+    """Return an existing same-size collision before the first free suffix."""
+
+    source_resolved = source.resolve()
+    protected_resolved = {
+        path.resolve() for path in (protected_paths or set())
+    }
+    stem = Path(filename).stem
+    suffix = Path(filename).suffix or ".pdf"
+    index = 1
+    while True:
+        candidate = directory / (filename if index == 1 else f"{stem}_{index}{suffix}")
+        if not candidate.exists():
+            return None
+        candidate_resolved = candidate.resolve()
+        if candidate_resolved == source_resolved:
+            return None
+        if candidate_resolved in protected_resolved:
+            index += 1
+            continue
+        if (
+            candidate.is_file()
+            and candidate.stat().st_size == source.stat().st_size
+        ):
+            return candidate
+        index += 1
+
+
 def _reserve_unique_destination(directory: Path, filename: str) -> Path:
     """Atomically reserve a new export path owned by the current operation."""
 
@@ -151,6 +185,8 @@ def rename_pdf_file(
     metadata: dict[str, Any],
     *,
     naming_scheme: str = "year_author_title",
+    deduplicate_pdfs: bool = False,
+    protected_paths: set[Path] | None = None,
 ) -> dict[str, Any]:
     source = Path(path)
     if not source.is_file():
@@ -160,10 +196,26 @@ def rename_pdf_file(
         source.stem,
         naming_scheme=naming_scheme,
     )
+    if deduplicate_pdfs:
+        duplicate = _duplicate_collision(
+            source.parent,
+            filename,
+            source=source,
+            protected_paths=protected_paths,
+        )
+        if duplicate is not None:
+            return {
+                "renamed": False,
+                "deduplicated": True,
+                "path": str(duplicate),
+                "filename": duplicate.name,
+                "previous": source.name,
+            }
     destination = unique_destination(source.parent, filename, ignore=source)
     if destination.resolve() == source.resolve():
         return {
             "renamed": False,
+            "deduplicated": False,
             "path": str(source),
             "filename": source.name,
             "previous": source.name,
@@ -171,6 +223,7 @@ def rename_pdf_file(
     source.replace(destination)
     return {
         "renamed": True,
+        "deduplicated": False,
         "path": str(destination),
         "filename": destination.name,
         "previous": source.name,
@@ -600,6 +653,7 @@ def rename_endnote_pdfs(
     *,
     require_closed: bool = True,
     naming_scheme: str = "year_author_title",
+    deduplicate_pdfs: bool = False,
 ) -> dict[str, Any]:
     library = _validate_endnote_library(library)
     if require_closed and endnote_desktop_running():
@@ -617,9 +671,12 @@ def rename_endnote_pdfs(
         except LibraryFilesError:
             pdb_connection = None
     renamed = 0
+    deduplicated = 0
     skipped = 0
     files: list[dict[str, Any]] = []
+    warnings: list[str] = []
     moved_files: list[tuple[Path, Path]] = []
+    pending_duplicate_sources: list[tuple[Path, int]] = []
     primary_committed = False
     try:
         rows = connection.execute(
@@ -673,12 +730,25 @@ def rename_endnote_pdfs(
                 continue
             attachment_rows.setdefault(source, []).append(row)
 
+        protected_paths = {
+            source
+            for source, shared_rows in attachment_rows.items()
+            if bibliographic_filename(
+                _metadata_from_endnote_ref(shared_rows[0]),
+                source.stem,
+                naming_scheme=naming_scheme,
+            )
+            != source.name
+        }
+
         for source, shared_rows in attachment_rows.items():
             metadata = _metadata_from_endnote_ref(shared_rows[0])
             result = rename_pdf_file(
                 source,
                 metadata,
                 naming_scheme=naming_scheme,
+                deduplicate_pdfs=deduplicate_pdfs,
+                protected_paths=protected_paths,
             )
             reference_ids = [row["refs_id"] for row in shared_rows]
             files.append(
@@ -688,9 +758,12 @@ def rename_endnote_pdfs(
                     **result,
                 }
             )
-            if not result["renamed"]:
+            if not result["renamed"] and not result["deduplicated"]:
                 continue
-            moved_files.append((Path(result["path"]), source))
+            if result["deduplicated"]:
+                pending_duplicate_sources.append((source, len(files) - 1))
+            else:
+                moved_files.append((Path(result["path"]), source))
             new_name = result["filename"]
             old_name = result["previous"]
             for row in shared_rows:
@@ -744,7 +817,8 @@ def rename_endnote_pdfs(
                                 )
                     except sqlite3.DatabaseError:
                         pass
-            renamed += 1
+            if not result["deduplicated"]:
+                renamed += 1
         connection.commit()
         primary_committed = True
         if pdb_connection is not None:
@@ -754,6 +828,14 @@ def rename_endnote_pdfs(
                 # The PDB is a secondary PDF index. Keep the authoritative SDB
                 # and files consistent even if EndNote needs to rebuild it.
                 pdb_connection.rollback()
+        for duplicate_source, file_index in pending_duplicate_sources:
+            try:
+                duplicate_source.unlink()
+                deduplicated += 1
+            except OSError as exc:
+                files[file_index]["deduplicated"] = False
+                files[file_index]["deduplication_failed"] = True
+                warnings.append(f"未能删除重复文件 {duplicate_source}：{exc}")
     except BaseException as exc:
         rollback_errors: list[str] = []
         if not primary_committed:
@@ -789,8 +871,10 @@ def rename_endnote_pdfs(
             pdb_connection.close()
     return {
         "renamed": renamed,
+        "deduplicated": deduplicated,
         "skipped": skipped,
         "files": files,
+        "warnings": warnings,
         "source": str(library),
     }
 
@@ -800,28 +884,97 @@ def rename_batch_pdfs(
     batch_id: str,
     *,
     naming_scheme: str = "year_author_title",
+    deduplicate_pdfs: bool = False,
 ) -> dict[str, Any]:
     batch = database.get_batch(batch_id)
     if not batch:
         raise LibraryFilesError("批次不存在")
     renamed = 0
+    deduplicated = 0
     skipped = 0
     files: list[dict[str, Any]] = []
+    warnings: list[str] = []
+    grouped_papers: dict[Path, list[dict[str, Any]]] = {}
+    for paper in batch["papers"]:
+        path = paper.get("pdf_path")
+        if path and paper.get("pdf_status") in {"verified", "accepted"}:
+            grouped_papers.setdefault(Path(path).resolve(), []).append(paper)
+    shared_paper_reasons: dict[str, str] = {}
+    shared_source_paths: set[Path] = set()
+    for source_path, shared_papers in grouped_papers.items():
+        if len(shared_papers) < 2:
+            continue
+        shared_source_paths.add(source_path)
+        ids = ", ".join(str(paper["id"]) for paper in shared_papers)
+        warning = f"多个批次条目共享同一 PDF，已跳过以避免断链：{ids}"
+        warnings.append(warning)
+        for paper in shared_papers:
+            shared_paper_reasons[str(paper["id"])] = warning
+
+    protected_paths: set[Path] = set(grouped_papers)
     for paper in batch["papers"]:
         path = paper.get("pdf_path")
         if not path or paper.get("pdf_status") not in {"verified", "accepted"}:
             skipped += 1
             continue
+        if reason := shared_paper_reasons.get(str(paper["id"])):
+            skipped += 1
+            source = Path(path)
+            files.append(
+                {
+                    "paper_id": paper["id"],
+                    "renamed": False,
+                    "deduplicated": False,
+                    "skipped": True,
+                    "reason": reason,
+                    "path": str(source),
+                    "filename": source.name,
+                    "previous": source.name,
+                }
+            )
+            continue
         result = rename_pdf_file(
             Path(path),
             paper_metadata(paper),
             naming_scheme=naming_scheme,
+            deduplicate_pdfs=deduplicate_pdfs,
+            protected_paths=protected_paths,
         )
+        if result["renamed"] or result["deduplicated"]:
+            try:
+                update_fields: dict[str, Any] = {"pdf_path": result["path"]}
+                if result["deduplicated"]:
+                    update_fields["pdf_sha256"] = None
+                database.update_paper(paper["id"], **update_fields)
+            except BaseException:
+                destination = Path(result["path"])
+                original = Path(path)
+                if result["renamed"] and destination.exists() and not original.exists():
+                    destination.replace(original)
+                raise
         if result["renamed"]:
-            database.update_paper(paper["id"], pdf_path=result["path"])
             renamed += 1
+        elif result["deduplicated"]:
+            try:
+                Path(path).unlink()
+            except OSError as exc:
+                database.update_paper(
+                    paper["id"],
+                    pdf_path=path,
+                    pdf_sha256=paper.get("pdf_sha256"),
+                )
+                raise LibraryFilesError(f"无法删除重复 PDF，已还原批次链接：{exc}") from exc
+            deduplicated += 1
+        protected_paths.add(Path(result["path"]).resolve())
         files.append({"paper_id": paper["id"], **result})
-    return {"renamed": renamed, "skipped": skipped, "files": files, "source": batch["name"]}
+    return {
+        "renamed": renamed,
+        "deduplicated": deduplicated,
+        "skipped": skipped,
+        "files": files,
+        "warnings": warnings,
+        "source": batch["name"],
+    }
 
 
 def list_batch_pdf_items(database: Database, batch_id: str) -> list[dict[str, Any]]:
@@ -934,11 +1087,17 @@ async def rename_zotero_pdfs(
     collection_key: str = "",
     whole_library: bool = False,
     naming_scheme: str = "year_author_title",
+    deduplicate_pdfs: bool = False,
 ) -> dict[str, Any]:
     renamed = 0
+    deduplicated = 0
     skipped = 0
     files: list[dict[str, Any]] = []
     warnings: list[str] = []
+    if deduplicate_pdfs:
+        warnings.append(
+            "Zotero 附件不会合并为共享物理文件；同名冲突已保留并添加序号"
+        )
     scoped = bool(collection_key or whole_library or library_id != "user:0")
     source_items = _iter_zotero_source_items(
         zotero,
@@ -949,10 +1108,14 @@ async def rename_zotero_pdfs(
     )
 
     def failure_message(message: str) -> str:
-        if renamed:
-            return f"操作部分完成：已成功重命名 {renamed} 个文件；{message}"
+        if renamed or deduplicated:
+            return (
+                f"操作部分完成：已成功重命名 {renamed} 个文件、"
+                f"去重 {deduplicated} 个文件；{message}"
+            )
         return message
 
+    rows_to_process: list[tuple[str, dict[str, Any]]] = []
     iterator = aiter(source_items)
     while True:
         try:
@@ -987,21 +1150,85 @@ async def rename_zotero_pdfs(
         if not path:
             skipped += 1
             continue
+        rows_to_process.append((str(key), row))
+
+    shared_source_paths: set[Path] = set()
+    grouped_rows: dict[Path, list[tuple[str, dict[str, Any]]]] = {}
+    for key, row in rows_to_process:
+        grouped_rows.setdefault(Path(row["pdf_path"]).resolve(), []).append((key, row))
+    processable_rows: list[tuple[str, dict[str, Any]]] = []
+    for source_path, shared_rows in grouped_rows.items():
+        if len(shared_rows) == 1:
+            processable_rows.extend(shared_rows)
+            continue
+        shared_source_paths.add(source_path)
+        skipped += len(shared_rows)
+        keys = ", ".join(key for key, _ in shared_rows)
+        warning = f"多个 Zotero 附件共享同一文件，已跳过以避免断链：{keys}"
+        warnings.append(warning)
+        files.extend(
+            {
+                "zotero_key": key,
+                "renamed": False,
+                "deduplicated": False,
+                "skipped": True,
+                "reason": warning,
+                "path": str(source_path),
+                "filename": source_path.name,
+                "previous": source_path.name,
+            }
+            for key, _ in shared_rows
+        )
+    rows_to_process = processable_rows
+
+    protected_paths: set[Path] = set(shared_source_paths)
+    for _, row in rows_to_process:
+        source = Path(row["pdf_path"])
+        if (
+            bibliographic_filename(
+                row["metadata"],
+                source.stem,
+                naming_scheme=naming_scheme,
+            )
+            != source.name
+        ):
+            protected_paths.add(source.resolve())
+    for key, row in rows_to_process:
+        path = row["pdf_path"]
         try:
             result = rename_pdf_file(
                 Path(path),
                 row["metadata"],
                 naming_scheme=naming_scheme,
+                deduplicate_pdfs=False,
+                protected_paths=protected_paths,
             )
         except Exception as exc:
             raise LibraryFilesError(
                 failure_message(f"重命名 Zotero 条目 {key} 的文件失败：{exc}")
             ) from exc
-        if result["renamed"]:
+        if result["renamed"] or result["deduplicated"]:
             renamed_path = Path(result["path"])
             original_path = Path(path)
 
             def restore_original() -> None:
+                if result["deduplicated"]:
+                    if original_path.exists():
+                        return
+                    if not renamed_path.exists():
+                        raise LibraryFilesError(
+                            failure_message("无法安全还原 Zotero 文件：原文件和保留文件都不存在")
+                        )
+                    try:
+                        shutil.copy2(renamed_path, original_path)
+                    except OSError as rollback_exc:
+                        raise LibraryFilesError(
+                            failure_message(
+                                "Zotero 附件更新失败，且无法还原重复文件："
+                                f"{rollback_exc}"
+                            )
+                        ) from rollback_exc
+                    return
                 if original_path.exists():
                     raise LibraryFilesError(
                         failure_message(
@@ -1101,10 +1328,20 @@ async def rename_zotero_pdfs(
                     ) from exc
             if warning:
                 warnings.append(f"{key}: {warning}")
-            renamed += 1
+            if result["deduplicated"]:
+                try:
+                    original_path.unlink(missing_ok=True)
+                    deduplicated += 1
+                except OSError as exc:
+                    result["deduplicated"] = False
+                    result["deduplication_failed"] = True
+                    warnings.append(f"{key}: 未能删除重复文件 {original_path}：{exc}")
+            else:
+                renamed += 1
         files.append({"zotero_key": key, **result})
     return {
         "renamed": renamed,
+        "deduplicated": deduplicated,
         "skipped": skipped,
         "files": files,
         "warnings": warnings,

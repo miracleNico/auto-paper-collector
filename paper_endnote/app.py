@@ -208,6 +208,7 @@ class LibraryToolRequest(BaseModel):
         default="year_author_title",
         pattern="^(year_author_title|title_only)$",
     )
+    deduplicate_pdfs: bool = False
     destination: str = ""
     open_folder: bool = False
     item_ids: list[str] | None = Field(default=None, max_length=10000)
@@ -498,6 +499,7 @@ async def tool_rename_pdfs(payload: LibraryToolRequest) -> dict[str, Any]:
                             database,
                             batch_id,
                             naming_scheme=payload.rename_scheme,
+                            deduplicate_pdfs=payload.deduplicate_pdfs,
                         )
             if payload.source == "zotero":
                 async with pipeline.zotero_operation_guard():
@@ -508,11 +510,13 @@ async def tool_rename_pdfs(payload: LibraryToolRequest) -> dict[str, Any]:
                         collection_key=payload.collection_key.strip(),
                         whole_library=payload.whole_library,
                         naming_scheme=payload.rename_scheme,
+                        deduplicate_pdfs=payload.deduplicate_pdfs,
                     )
             if payload.source == "endnote":
                 return rename_endnote_pdfs(
                     selected_endnote_library(payload),
                     naming_scheme=payload.rename_scheme,
+                    deduplicate_pdfs=payload.deduplicate_pdfs,
                 )
             raise LibraryFilesError("未知数据区")
         except LibraryFilesError as exc:

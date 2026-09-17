@@ -83,6 +83,10 @@ class PaperActionMenuTests(unittest.TestCase):
         self.assertIn('value="year_author_title"', self.html)
         self.assertIn('value="title_only"', self.html)
         self.assertIn('rename_scheme: $("#rename-scheme").value', self.javascript)
+        self.assertIn('id="rename-deduplicate" type="checkbox"', self.html)
+        self.assertIn('deduplicate_pdfs: $("#rename-deduplicate").checked', self.javascript)
+        self.assertIn('文件大小相同', self.html)
+        self.assertIn('条警告：${warnings[0]}', self.javascript)
 
     def test_pdf_export_ignores_stale_candidate_requests(self) -> None:
         self.assertIn("exportRequestToken: 0", self.javascript)

@@ -94,6 +94,123 @@ class LibraryFilesTests(unittest.TestCase):
             self.assertTrue((destination / "2024 - Doe, Jane - Example Paper.pdf").is_file())
             self.assertTrue(path.is_file())
 
+    def test_batch_size_deduplication_clears_stale_pdf_hash(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            db = Database(root / "db.sqlite3")
+            batch_id = db.create_batch(
+                name="deduplicate",
+                target_library="DTN",
+                library_mode="new",
+                items=[{"input_text": "Same Paper", "title": "Same Paper"}],
+            )
+            paper_id = db.get_batch(batch_id)["papers"][0]["id"]
+            pdf_dir = root / "downloads" / paper_id
+            pdf_dir.mkdir(parents=True)
+            source = pdf_dir / "download.pdf"
+            canonical = pdf_dir / "2024 - Doe, Jane - Same Paper.pdf"
+            source.write_bytes(MINIMAL_PDF.replace(b"1 0", b"2 0"))
+            canonical.write_bytes(MINIMAL_PDF)
+            self.assertEqual(source.stat().st_size, canonical.stat().st_size)
+            db.update_paper(
+                paper_id,
+                title="Same Paper",
+                year=2024,
+                authors_json=["Doe, Jane"],
+                pdf_path=str(source),
+                pdf_sha256="stale-source-hash",
+                pdf_status="verified",
+            )
+
+            result = rename_batch_pdfs(db, batch_id, deduplicate_pdfs=True)
+
+            paper = db.get_paper(paper_id)
+            self.assertEqual(result["renamed"], 0)
+            self.assertEqual(result["deduplicated"], 1)
+            self.assertEqual(Path(paper["pdf_path"]), canonical)
+            self.assertIsNone(paper["pdf_sha256"])
+            self.assertFalse(source.exists())
+            self.assertTrue(canonical.is_file())
+
+    def test_batch_rename_skips_records_sharing_one_physical_file(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            db = Database(root / "db.sqlite3")
+            batch_id = db.create_batch(
+                name="shared",
+                target_library="DTN",
+                library_mode="new",
+                items=[
+                    {"input_text": "Paper 1", "title": "Paper 1"},
+                    {"input_text": "Paper 2", "title": "Paper 2"},
+                ],
+            )
+            papers = db.get_batch(batch_id)["papers"]
+            shared = root / "shared.pdf"
+            shared.write_bytes(MINIMAL_PDF)
+            for index, paper in enumerate(papers, start=1):
+                db.update_paper(
+                    paper["id"],
+                    title=f"Paper {index}",
+                    pdf_path=str(shared),
+                    pdf_status="verified",
+                )
+
+            result = rename_batch_pdfs(db, batch_id, deduplicate_pdfs=True)
+
+            self.assertEqual(result["renamed"], 0)
+            self.assertEqual(result["deduplicated"], 0)
+            self.assertEqual(result["skipped"], 2)
+            self.assertEqual(len(result["warnings"]), 1)
+            self.assertTrue(shared.is_file())
+            self.assertEqual(
+                {db.get_paper(paper["id"])["pdf_path"] for paper in papers},
+                {str(shared)},
+            )
+
+    def test_batch_deduplication_never_makes_two_papers_share_a_path(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            db = Database(root / "db.sqlite3")
+            batch_id = db.create_batch(
+                name="separate",
+                target_library="DTN",
+                library_mode="new",
+                items=[
+                    {"input_text": "Same Paper", "title": "Same Paper"},
+                    {"input_text": "Same Paper", "title": "Same Paper"},
+                ],
+            )
+            papers = db.get_batch(batch_id)["papers"]
+            pdf_dir = root / "downloads"
+            pdf_dir.mkdir()
+            sources = [pdf_dir / "A.pdf", pdf_dir / "B.pdf"]
+            for paper, source in zip(papers, sources, strict=True):
+                source.write_bytes(MINIMAL_PDF)
+                db.update_paper(
+                    paper["id"],
+                    title="Same Paper",
+                    pdf_path=str(source),
+                    pdf_status="verified",
+                )
+
+            result = rename_batch_pdfs(
+                db,
+                batch_id,
+                naming_scheme="title_only",
+                deduplicate_pdfs=True,
+            )
+
+            paths = [Path(db.get_paper(paper["id"])["pdf_path"]) for paper in papers]
+            self.assertEqual(result["renamed"], 2)
+            self.assertEqual(result["deduplicated"], 0)
+            self.assertEqual(
+                sorted(path.name for path in paths),
+                ["Same Paper.pdf", "Same Paper_2.pdf"],
+            )
+            self.assertEqual(len({path.resolve() for path in paths}), 2)
+            self.assertTrue(all(path.is_file() for path in paths))
+
     def test_export_batch_pdfs_only_copies_selected_paper(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -289,6 +406,71 @@ class LibraryFilesTests(unittest.TestCase):
             self.assertTrue(result["renamed"])
             self.assertEqual(result["filename"], "Full Paper Title.pdf")
             self.assertTrue((source.parent / "Full Paper Title.pdf").is_file())
+
+    def test_rename_collision_deduplicates_same_size_pdf_when_enabled(self) -> None:
+        metadata = {"authors": ["Doe, Jane"], "year": 2024, "title": "Same Paper"}
+        expected_name = "2024 - Doe, Jane - Same Paper.pdf"
+
+        with self.subTest("default preserves same-size collision"):
+            with tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                canonical = root / expected_name
+                source = root / "download.pdf"
+                canonical.write_bytes(MINIMAL_PDF)
+                source.write_bytes(MINIMAL_PDF)
+
+                result = rename_pdf_file(source, metadata)
+
+                self.assertTrue(result["renamed"])
+                self.assertFalse(result["deduplicated"])
+                self.assertEqual(result["filename"], "2024 - Doe, Jane - Same Paper_2.pdf")
+                self.assertTrue(canonical.is_file())
+                self.assertTrue(Path(result["path"]).is_file())
+
+        with self.subTest("enabled reuses same-size collision"):
+            with tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                canonical = root / expected_name
+                source = root / "download.pdf"
+                canonical.write_bytes(MINIMAL_PDF)
+                source.write_bytes(MINIMAL_PDF)
+
+                result = rename_pdf_file(source, metadata, deduplicate_pdfs=True)
+
+                self.assertFalse(result["renamed"])
+                self.assertTrue(result["deduplicated"])
+                self.assertEqual(Path(result["path"]), canonical)
+                self.assertTrue(source.is_file(), "caller deletes only after its link update succeeds")
+
+        with self.subTest("same size is treated as duplicate without hashing"):
+            with tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                canonical = root / expected_name
+                source = root / "download.pdf"
+                canonical.write_bytes(MINIMAL_PDF)
+                source.write_bytes(b"X" * len(MINIMAL_PDF))
+
+                result = rename_pdf_file(source, metadata, deduplicate_pdfs=True)
+
+                self.assertFalse(result["renamed"])
+                self.assertTrue(result["deduplicated"])
+                self.assertEqual(Path(result["path"]), canonical)
+
+        with self.subTest("different size is preserved"):
+            with tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                canonical = root / expected_name
+                source = root / "download.pdf"
+                canonical.write_bytes(MINIMAL_PDF)
+                source.write_bytes(MINIMAL_PDF + b"different")
+
+                result = rename_pdf_file(source, metadata, deduplicate_pdfs=True)
+
+                self.assertTrue(result["renamed"])
+                self.assertFalse(result["deduplicated"])
+                self.assertEqual(result["filename"], "2024 - Doe, Jane - Same Paper_2.pdf")
+                self.assertTrue(canonical.is_file())
+                self.assertTrue(Path(result["path"]).is_file())
 
     def test_downloads_library_dir_uses_lib_name(self) -> None:
         path = downloads_library_dir("DTN")
@@ -605,6 +787,178 @@ class LibraryFilesTests(unittest.TestCase):
                 )
             finally:
                 stored_pdb.close()
+
+    def test_rename_endnote_deduplicates_identical_same_folder_collision(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            library = root / "Duplicates.enl"
+            library.write_bytes(b"")
+            pdf_dir = library.with_suffix(".Data") / "PDF" / "ITEM"
+            pdf_dir.mkdir(parents=True)
+            first = pdf_dir / "first.pdf"
+            second = pdf_dir / "second.pdf"
+            first.write_bytes(MINIMAL_PDF)
+            second.write_bytes(MINIMAL_PDF)
+            sdb_dir = library.with_suffix(".Data") / "sdb"
+            sdb_dir.mkdir()
+            sdb = sqlite3.connect(sdb_dir / "sdb.eni")
+            sdb.execute(
+                "CREATE TABLE refs (id INTEGER PRIMARY KEY, author TEXT, year TEXT, title TEXT, "
+                "secondary_title TEXT, electronic_resource_number TEXT, url TEXT)"
+            )
+            sdb.execute(
+                "CREATE TABLE file_res (refs_id INTEGER, file_path TEXT, file_type INTEGER, file_pos INTEGER)"
+            )
+            for refs_id, filename in ((1, first.name), (2, second.name)):
+                sdb.execute(
+                    "INSERT INTO refs VALUES (?, 'Doe, Jane', '2024', 'Same Paper', '', '', '')",
+                    (refs_id,),
+                )
+                sdb.execute(
+                    "INSERT INTO file_res VALUES (?, ?, 1, 0)",
+                    (refs_id, f"ITEM/{filename}"),
+                )
+            sdb.commit()
+            sdb.close()
+
+            result = rename_endnote_pdfs(
+                library,
+                require_closed=False,
+                deduplicate_pdfs=True,
+            )
+
+            expected_relative = "ITEM/2024 - Doe, Jane - Same Paper.pdf"
+            self.assertEqual(result["renamed"], 1)
+            self.assertEqual(result["deduplicated"], 1)
+            self.assertEqual(result["warnings"], [])
+            self.assertEqual(
+                [path.name for path in pdf_dir.glob("*.pdf")],
+                ["2024 - Doe, Jane - Same Paper.pdf"],
+            )
+            stored = sqlite3.connect(sdb_dir / "sdb.eni")
+            try:
+                self.assertEqual(
+                    [row[0] for row in stored.execute("SELECT file_path FROM file_res ORDER BY refs_id")],
+                    [expected_relative, expected_relative],
+                )
+            finally:
+                stored.close()
+
+            repeated = rename_endnote_pdfs(
+                library,
+                require_closed=False,
+                deduplicate_pdfs=True,
+            )
+            self.assertEqual(repeated["renamed"], 0)
+            self.assertEqual(repeated["deduplicated"], 0)
+            self.assertEqual(
+                [path.name for path in pdf_dir.glob("*.pdf")],
+                ["2024 - Doe, Jane - Same Paper.pdf"],
+            )
+
+    def test_endnote_deduplication_never_reuses_another_pending_source(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            library = root / "RenameChain.enl"
+            library.write_bytes(b"")
+            pdf_dir = library.with_suffix(".Data") / "PDF" / "ITEM"
+            pdf_dir.mkdir(parents=True)
+            first = pdf_dir / "A.pdf"
+            second = pdf_dir / "X.pdf"
+            first.write_bytes(MINIMAL_PDF)
+            second.write_bytes(MINIMAL_PDF)
+            sdb_dir = library.with_suffix(".Data") / "sdb"
+            sdb_dir.mkdir()
+            sdb = sqlite3.connect(sdb_dir / "sdb.eni")
+            sdb.execute(
+                "CREATE TABLE refs (id INTEGER PRIMARY KEY, author TEXT, year TEXT, title TEXT, "
+                "secondary_title TEXT, electronic_resource_number TEXT, url TEXT)"
+            )
+            sdb.execute(
+                "CREATE TABLE file_res (refs_id INTEGER, file_path TEXT, file_type INTEGER, file_pos INTEGER)"
+            )
+            sdb.execute("INSERT INTO refs VALUES (1, '', '', 'X', '', '', '')")
+            sdb.execute("INSERT INTO refs VALUES (2, '', '', 'Y', '', '', '')")
+            sdb.execute("INSERT INTO file_res VALUES (1, 'ITEM/A.pdf', 1, 0)")
+            sdb.execute("INSERT INTO file_res VALUES (2, 'ITEM/X.pdf', 1, 0)")
+            sdb.commit()
+            sdb.close()
+
+            result = rename_endnote_pdfs(
+                library,
+                require_closed=False,
+                naming_scheme="title_only",
+                deduplicate_pdfs=True,
+            )
+
+            self.assertEqual(result["renamed"], 2)
+            self.assertEqual(result["deduplicated"], 0)
+            self.assertEqual(
+                sorted(path.name for path in pdf_dir.glob("*.pdf")),
+                ["X_2.pdf", "Y.pdf"],
+            )
+            stored = sqlite3.connect(sdb_dir / "sdb.eni")
+            try:
+                paths = [
+                    row[0]
+                    for row in stored.execute(
+                        "SELECT file_path FROM file_res ORDER BY refs_id"
+                    )
+                ]
+            finally:
+                stored.close()
+            self.assertEqual(paths, ["ITEM/X_2.pdf", "ITEM/Y.pdf"])
+            self.assertTrue(all((library.with_suffix(".Data") / "PDF" / path).is_file() for path in paths))
+
+    def test_endnote_deduplication_can_reuse_stable_canonical_source(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            library = root / "StableCanonical.enl"
+            library.write_bytes(b"")
+            pdf_dir = library.with_suffix(".Data") / "PDF" / "ITEM"
+            pdf_dir.mkdir(parents=True)
+            (pdf_dir / "A.pdf").write_bytes(MINIMAL_PDF)
+            (pdf_dir / "X.pdf").write_bytes(MINIMAL_PDF)
+            sdb_dir = library.with_suffix(".Data") / "sdb"
+            sdb_dir.mkdir()
+            sdb = sqlite3.connect(sdb_dir / "sdb.eni")
+            sdb.execute(
+                "CREATE TABLE refs (id INTEGER PRIMARY KEY, author TEXT, year TEXT, title TEXT, "
+                "secondary_title TEXT, electronic_resource_number TEXT, url TEXT)"
+            )
+            sdb.execute(
+                "CREATE TABLE file_res (refs_id INTEGER, file_path TEXT, file_type INTEGER, file_pos INTEGER)"
+            )
+            for refs_id, filename in ((1, "A.pdf"), (2, "X.pdf")):
+                sdb.execute("INSERT INTO refs VALUES (?, '', '', 'X', '', '', '')", (refs_id,))
+                sdb.execute(
+                    "INSERT INTO file_res VALUES (?, ?, 1, 0)",
+                    (refs_id, f"ITEM/{filename}"),
+                )
+            sdb.commit()
+            sdb.close()
+
+            result = rename_endnote_pdfs(
+                library,
+                require_closed=False,
+                naming_scheme="title_only",
+                deduplicate_pdfs=True,
+            )
+
+            self.assertEqual(result["renamed"], 0)
+            self.assertEqual(result["deduplicated"], 1)
+            self.assertEqual([path.name for path in pdf_dir.glob("*.pdf")], ["X.pdf"])
+            stored = sqlite3.connect(sdb_dir / "sdb.eni")
+            try:
+                paths = [
+                    row[0]
+                    for row in stored.execute(
+                        "SELECT file_path FROM file_res ORDER BY refs_id"
+                    )
+                ]
+            finally:
+                stored.close()
+            self.assertEqual(paths, ["ITEM/X.pdf", "ITEM/X.pdf"])
 
     def test_rename_endnote_pdfs_skips_attachment_path_outside_pdf_root(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -1048,6 +1402,115 @@ class ZoteroEndNoteExportTests(unittest.IsolatedAsyncioTestCase):
                 zotero.rename_calls,
                 [("GROUPATT", "2025 - Doe, Jane - Scoped Paper.pdf", 7, "group:42")],
             )
+
+    async def test_zotero_rename_preserves_collision_when_dedupe_is_requested(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "download.pdf"
+            canonical = root / "2025 - Doe, Jane - Scoped Paper.pdf"
+            source.write_bytes(MINIMAL_PDF)
+            canonical.write_bytes(MINIMAL_PDF)
+            zotero = _FakeScopedZoteroExport(source)
+
+            result = await rename_zotero_pdfs(
+                zotero,
+                "Group Collection",
+                library_id="group:42",
+                collection_key="COLLKEY1",
+                deduplicate_pdfs=True,
+            )
+
+            preserved = root / "2025 - Doe, Jane - Scoped Paper_2.pdf"
+            self.assertEqual(result["renamed"], 1)
+            self.assertEqual(result["deduplicated"], 0)
+            self.assertFalse(source.exists())
+            self.assertTrue(canonical.is_file())
+            self.assertTrue(preserved.is_file())
+            self.assertTrue(any("不会合并" in warning for warning in result["warnings"]))
+            self.assertEqual(
+                zotero.rename_calls,
+                [("GROUPATT", preserved.name, 7, "group:42")],
+            )
+
+    async def test_zotero_rename_skips_records_sharing_one_physical_file(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            shared = Path(directory) / "shared.pdf"
+            shared.write_bytes(MINIMAL_PDF)
+            zotero = _FakeSelectiveZoteroExport(
+                {"ITEM1": shared, "ITEM2": shared}
+            )
+
+            result = await rename_zotero_pdfs(
+                zotero,
+                "Collection",
+                deduplicate_pdfs=True,
+            )
+
+            self.assertEqual(result["renamed"], 0)
+            self.assertEqual(result["deduplicated"], 0)
+            self.assertEqual(result["skipped"], 2)
+            self.assertEqual(len(result["warnings"]), 2)
+            self.assertTrue(any("共享同一文件" in warning for warning in result["warnings"]))
+            self.assertTrue(shared.is_file())
+
+    async def test_zotero_collision_never_targets_another_pending_source(self) -> None:
+        class TwoItemZotero:
+            def __init__(self, pdfs: dict[str, Path], titles: dict[str, str]) -> None:
+                self.pdfs = pdfs
+                self.titles = titles
+                self.rename_calls: list[tuple[str, str]] = []
+
+            async def iter_collection_items(self, _name: str):
+                for key in self.pdfs:
+                    yield {"data": {"key": key, "itemType": "journalArticle"}}
+
+            async def export_row(self, key: str, fallback_metadata=None):
+                return {
+                    "attachment_key": f"ATT-{key}",
+                    "attachment_version": 1,
+                    "metadata": {"title": self.titles[key]},
+                    "pdf_path": self.pdfs[key],
+                }
+
+            async def rename_attachment_filename(
+                self,
+                attachment_key: str,
+                filename: str,
+                _version: int | None,
+            ) -> None:
+                self.rename_calls.append((attachment_key, filename))
+
+        for second_title, expected_counts, expected_files in (
+            ("Y", (2, 0), ["X_2.pdf", "Y.pdf"]),
+            ("X", (1, 0), ["X.pdf", "X_2.pdf"]),
+        ):
+            with self.subTest(second_title=second_title):
+                with tempfile.TemporaryDirectory() as directory:
+                    root = Path(directory)
+                    first = root / "A.pdf"
+                    second = root / "X.pdf"
+                    first.write_bytes(MINIMAL_PDF)
+                    second.write_bytes(MINIMAL_PDF)
+                    zotero = TwoItemZotero(
+                        {"ITEM1": first, "ITEM2": second},
+                        {"ITEM1": "X", "ITEM2": second_title},
+                    )
+
+                    result = await rename_zotero_pdfs(
+                        zotero,
+                        "Collection",
+                        naming_scheme="title_only",
+                        deduplicate_pdfs=True,
+                    )
+
+                    self.assertEqual(
+                        (result["renamed"], result["deduplicated"]),
+                        expected_counts,
+                    )
+                    self.assertEqual(
+                        sorted(path.name for path in root.glob("*.pdf")),
+                        expected_files,
+                    )
 
     async def test_zotero_rename_restores_file_for_unexpected_failure_or_cancel(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

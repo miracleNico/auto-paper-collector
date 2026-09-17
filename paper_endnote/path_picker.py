@@ -11,6 +11,40 @@ class PathPickerError(RuntimeError):
 _PICKER_LOCK = threading.Lock()
 
 
+def discover_endnote_libraries(configured_path: str | Path | None) -> list[str]:
+    """Return existing EndNote libraries beside the configured library.
+
+    Discovery is intentionally limited to one directory.  It makes sibling
+    libraries easy to select without recursively scanning a user's drive or
+    treating an uploaded ``.enl`` as a complete library.
+    """
+
+    if not configured_path:
+        return []
+    configured = Path(configured_path).expanduser()
+    directory = configured if configured.is_dir() else configured.parent
+    try:
+        directory = directory.resolve(strict=True)
+    except OSError:
+        return []
+    if not directory.is_dir():
+        return []
+
+    libraries: list[Path] = []
+    try:
+        for candidate in directory.iterdir():
+            if candidate.suffix.casefold() != ".enl" or not candidate.is_file():
+                continue
+            try:
+                libraries.append(candidate.resolve(strict=True))
+            except OSError:
+                continue
+    except OSError:
+        return []
+    libraries.sort(key=lambda path: (path.name.casefold(), str(path).casefold()))
+    return [str(path) for path in libraries]
+
+
 def pick_endnote_library(initial_path: str = "") -> str:
     """Open one native file chooser and return a canonical EndNote library path.
 

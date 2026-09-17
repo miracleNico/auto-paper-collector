@@ -49,7 +49,11 @@ from .library_files import (
 from .redaction import redact_diagnostic_text
 from .ocr import ocr_status
 from .pipeline import PipelineManager
-from .path_picker import PathPickerError, pick_endnote_library
+from .path_picker import (
+    PathPickerError,
+    discover_endnote_libraries,
+    pick_endnote_library,
+)
 from .reporting import batch_csv
 from .user_config import (
     ALLOWED_SOURCES,
@@ -409,6 +413,7 @@ async def tool_sources() -> dict[str, Any]:
         except Exception as exc:
             zotero_library_error = str(exc)
     library = settings.endnote_library
+    endnote_libraries = discover_endnote_libraries(library)
     return {
         "batches": [
             {
@@ -424,6 +429,7 @@ async def tool_sources() -> dict[str, Any]:
         "zotero_error": zotero_error,
         "zotero_library_error": zotero_library_error,
         "endnote_library": str(library) if library else "",
+        "endnote_libraries": endnote_libraries,
         "endnote_data_dir": str(library.with_suffix(".Data") / "PDF") if library else "",
         "downloads_dir": str(Path.home() / "Downloads"),
     }

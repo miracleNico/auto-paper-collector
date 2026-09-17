@@ -352,6 +352,35 @@ class ToolApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(result["zotero_error"])
         self.assertIn("group discovery unavailable", result["zotero_library_error"])
 
+    async def test_tool_sources_lists_endnote_libraries_beside_configured_library(self) -> None:
+        from paper_endnote import app as app_module
+
+        pipeline = _ToolPipeline()
+        pipeline.zotero.list_collections = AsyncMock(return_value=[])
+        pipeline.zotero.list_libraries = AsyncMock(return_value=[])
+        database = type("ToolDatabase", (), {"list_batches": lambda self: []})()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            configured = root / "Configured.enl"
+            sibling = root / "Sibling.enl"
+            ignored = root / "notes.txt"
+            configured.write_bytes(b"")
+            sibling.write_bytes(b"")
+            ignored.write_text("not a library", encoding="utf-8")
+            settings = type("ToolSettings", (), {"endnote_library": configured})()
+
+            with (
+                patch.object(app_module, "pipeline", pipeline),
+                patch.object(app_module, "settings", settings),
+                patch.object(app_module, "database", database),
+            ):
+                result = await app_module.tool_sources()
+
+        self.assertEqual(
+            result["endnote_libraries"],
+            [str(configured.resolve()), str(sibling.resolve())],
+        )
+
     async def test_native_endnote_picker_returns_path_or_cancel(self) -> None:
         from paper_endnote import app as app_module
 

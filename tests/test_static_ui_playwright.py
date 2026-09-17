@@ -183,6 +183,10 @@ class StaticUiPlaywrightTests(unittest.IsolatedAsyncioTestCase):
                 "zotero_error": None,
                 "zotero_library_error": None,
                 "endnote_library": r"C:\Libraries\Default.enl",
+                "endnote_libraries": [
+                    r"C:\Libraries\Default.enl",
+                    r"C:\Libraries\Other.enl",
+                ],
                 "downloads_dir": r"C:\Users\tester\Downloads",
             }
         elif path == "/api/tools/zotero-collections":
@@ -301,6 +305,11 @@ class StaticUiPlaywrightTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(candidate_payloads[-1]["whole_library"])
 
         await self.page.locator("#export-source").select_option("endnote")
+        await expect(self.page.locator("#endnote-library-paths option")).to_have_count(2)
+        self.assertEqual(
+            await self.page.locator("#endnote-library-paths option").nth(1).get_attribute("value"),
+            r"C:\Libraries\Other.enl",
+        )
         await self.page.locator("#pick-export-endnote-library").click()
         await expect(self.page.locator("#export-endnote-library")).to_have_value(
             r"C:\Libraries\Selected.enl"

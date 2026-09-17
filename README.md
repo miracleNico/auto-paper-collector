@@ -190,7 +190,7 @@ GET  /api/batch-deletions/{operation_id}
 
 Zotero 写入会优先使用 DOI 去重，并以规范化题名与年份补充判断。已有且身份匹配的主文 PDF 会复用，不覆盖附件或批注。
 
-“工具”页的重命名与 PDF 导出不再绑定设置中的默认库：EndNote 可以为每次操作选择或粘贴任意现有 `.enl` 路径；Zotero 可以先选择当前运行配置中的 `My Library` 或 Group Library，再选择整个库或一个 collection。“整个库”必须在范围下拉框中明确选择，加载中或读取失败时不会自动退化为整库操作。网页文件上传无法同时访问 `.enl` 的配套 `.Data`，所以“选择…”按钮调用仅限本机的原生文件选择器；也可以直接粘贴绝对路径。Zotero 使用正在运行的桌面客户端 Local API，不会直接修改 `zotero.sqlite`；若要使用另一个 Zotero profile，请先用该 profile 启动 Zotero，再刷新工具页。PDF 导出默认勾选所有可用文件，也可以逐篇取消。重命名 EndNote 附件前必须完全退出 EndNote。
+“工具”页的重命名与 PDF 导出不再绑定设置中的默认库：EndNote 可以为每次操作选择或粘贴任意现有 `.enl` 路径；设置了一个库后，同目录中的其他 `.enl` 也会自动出现在路径建议中。Zotero 可以先选择当前运行配置中的 `My Library` 或 Group Library，再选择整个库或一个 collection。“整个库”必须在范围下拉框中明确选择，加载中或读取失败时不会自动退化为整库操作。网页文件上传无法同时访问 `.enl` 的配套 `.Data`，所以“选择…”按钮调用仅限本机的原生文件选择器；也可以直接粘贴绝对路径。Zotero 使用正在运行的桌面客户端 Local API，不会直接修改 `zotero.sqlite`；若要使用另一个 Zotero profile，请先用该 profile 启动 Zotero，再刷新工具页。PDF 导出默认勾选所有可用文件，也可以逐篇取消。重命名 EndNote 附件前必须完全退出 EndNote。
 
 EndNote → Zotero 同步仍使用设置页保存的默认 EndNote 库，并会跳过 EndNote 垃圾箱中的题录，复用同样的去重规则，按内容避免重复上传 PDF。当前安全同步期刊文章，其他 EndNote 题录类型会在结果中明确列为跳过。同步前请完全退出 EndNote。
 
@@ -443,7 +443,7 @@ GET  /api/batch-deletions/{operation_id}
 
 Zotero では DOI を優先して重複を判定し、必要に応じて正規化したタイトルと発行年も使います。既存の一致する本文 PDF は再利用し、添付ファイルや注釈を上書きしません。
 
-「ツール」の名前変更と PDF 出力は、設定の既定ライブラリに固定されません。EndNote は操作ごとに既存の `.enl` を選択または絶対パスで指定できます。Zotero は、起動中のプロファイルにある `My Library` または Group Library を選び、ライブラリ全体または 1 つの collection を範囲にできます。ライブラリ全体は範囲メニューで明示的に選択する必要があり、読み込み中や取得失敗時に自動で全体操作へ切り替わることはありません。ブラウザーのファイルアップロードでは `.enl` と隣接する `.Data` を一緒に扱えないため、「選択…」はローカルのネイティブファイル選択画面を開きます。Zotero は Local API を使い、`zotero.sqlite` を直接変更しません。別プロファイルを使う場合は、そのプロファイルで Zotero を起動してからツール画面を更新してください。出力候補は PDF のある論文を初期選択し、個別に解除できます。EndNote 内の PDF 名を変更する前に EndNote を完全に終了してください。
+「ツール」の名前変更と PDF 出力は、設定の既定ライブラリに固定されません。EndNote は操作ごとに既存の `.enl` を選択または絶対パスで指定でき、1 つのライブラリを設定すると同じフォルダーにある他の `.enl` もパス候補に表示されます。Zotero は、起動中のプロファイルにある `My Library` または Group Library を選び、ライブラリ全体または 1 つの collection を範囲にできます。ライブラリ全体は範囲メニューで明示的に選択する必要があり、読み込み中や取得失敗時に自動で全体操作へ切り替わることはありません。ブラウザーのファイルアップロードでは `.enl` と隣接する `.Data` を一緒に扱えないため、「選択…」はローカルのネイティブファイル選択画面を開きます。Zotero は Local API を使い、`zotero.sqlite` を直接変更しません。別プロファイルを使う場合は、そのプロファイルで Zotero を起動してからツール画面を更新してください。出力候補は PDF のある論文を初期選択し、個別に解除できます。EndNote 内の PDF 名を変更する前に EndNote を完全に終了してください。
 
 EndNote → Zotero 同期は引き続き設定に保存された既定の EndNote ライブラリを使い、ゴミ箱を除外して指定 collection に統合します。現在はジャーナル論文を安全に同期し、その他のレコード形式はスキップ理由を表示します。同期前に EndNote を完全に終了してください、にゃ。
 
@@ -686,7 +686,7 @@ GET  /api/batch-deletions/{operation_id}
 
 Zotero records are deduplicated primarily by DOI, with normalized title and year as fallback signals. Existing matching primary PDFs are reused without overwriting attachments or annotations.
 
-The rename and PDF export tools are no longer tied to the configured default library. For each operation, choose or paste the absolute path of an existing EndNote `.enl`, or select `My Library`/a Group Library from the running Zotero profile and then target the whole library or one collection. Whole-library scope must be selected explicitly; loading or lookup failures never fall back to a whole-library operation. A browser upload cannot provide the `.enl` together with its sibling `.Data`, so “Choose…” opens a local native file picker instead. Zotero access goes through the desktop Local API and never edits `zotero.sqlite` directly. To use another Zotero profile, launch Zotero with that profile and refresh the Tools page. Export candidates with available PDFs are selected by default and can be unchecked individually. Close EndNote before renaming its attachments.
+The rename and PDF export tools are no longer tied to the configured default library. For each operation, choose or paste the absolute path of an existing EndNote `.enl`; after one library is configured, other `.enl` files in the same folder also appear as path suggestions. Alternatively, select `My Library`/a Group Library from the running Zotero profile and then target the whole library or one collection. Whole-library scope must be selected explicitly; loading or lookup failures never fall back to a whole-library operation. A browser upload cannot provide the `.enl` together with its sibling `.Data`, so “Choose…” opens a local native file picker instead. Zotero access goes through the desktop Local API and never edits `zotero.sqlite` directly. To use another Zotero profile, launch Zotero with that profile and refresh the Tools page. Export candidates with available PDFs are selected by default and can be unchecked individually. Close EndNote before renaming its attachments.
 
 EndNote-to-Zotero sync still uses the default EndNote library saved in Settings. It excludes trashed records, applies the same deduplication rules, avoids duplicate PDF uploads, safely syncs journal articles, and reports other reference types as skipped. Close EndNote before starting a sync.
 

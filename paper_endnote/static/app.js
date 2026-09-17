@@ -1177,9 +1177,10 @@ async function loadToolSources() {
     $("#endnote-collection").innerHTML = namedCollectionHtml;
     $("#rename-endnote-library").value = sources.endnote_library || "";
     $("#export-endnote-library").value = sources.endnote_library || "";
-    $("#endnote-library-paths").innerHTML = sources.endnote_library
-      ? `<option value="${esc(sources.endnote_library)}"></option>`
-      : "";
+    const endnoteLibraries = sources.endnote_libraries || (sources.endnote_library ? [sources.endnote_library] : []);
+    $("#endnote-library-paths").innerHTML = endnoteLibraries
+      .map(path => `<option value="${esc(path)}"></option>`)
+      .join("");
     $("#sync-endnote-library").value = sources.endnote_library || "";
     $("#sync-zotero-collections").innerHTML = collections
       .map(item => `<option value="${esc(item.name)}"></option>`)

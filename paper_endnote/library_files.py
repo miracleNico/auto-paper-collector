@@ -429,6 +429,72 @@ def _rewrite_endnote_path(stored: str, old_name: str, new_name: str) -> str:
     return text.replace(old_name, new_name)
 
 
+def _replace_endnote_url_attachment(
+    url: str,
+    old_values: set[str],
+    replacement: str,
+) -> str:
+    """Replace one exact attachment entry without rewriting unrelated URLs."""
+
+    updated = str(url or "")
+    changed = False
+    for old_value in sorted((value for value in old_values if value), key=len, reverse=True):
+        delimiter = r"(?:;|\r\n|\r|\n)"
+        entry_pattern = re.compile(
+            rf"(?P<prefix>^|{delimiter})(?P<leading>[ \t]*)"
+            rf"{re.escape(old_value)}(?P<trailing>[ \t]*)(?=$|{delimiter})"
+        )
+        updated, replacements = entry_pattern.subn(
+            lambda match: (
+                f"{match.group('prefix')}{match.group('leading')}"
+                f"{replacement}{match.group('trailing')}"
+            ),
+            updated,
+        )
+        changed = changed or bool(replacements)
+    if not changed:
+        return updated
+    delimiter = r"(?:;|\r\n|\r|\n)"
+    duplicate_pattern = re.compile(
+        rf"(?P<first>(?:^|{delimiter})[ \t]*{re.escape(replacement)}[ \t]*)"
+        rf"{delimiter}[ \t]*{re.escape(replacement)}[ \t]*(?=$|{delimiter})"
+    )
+    while True:
+        updated, replacements = duplicate_pattern.subn(r"\g<first>", updated, count=1)
+        if not replacements:
+            return updated
+
+
+def _delete_endnote_pdf_index(
+    connection: sqlite3.Connection,
+    *,
+    refs_id: int,
+    stored_path: str,
+    source_name: str,
+) -> None:
+    """Delete one secondary-index row for a removed EndNote attachment."""
+
+    normalized = str(stored_path or "").replace("\\", "/")
+    candidates = [str(stored_path or ""), normalized]
+    for candidate in dict.fromkeys(value for value in candidates if value):
+        row = connection.execute(
+            "SELECT rowid FROM pdf_index WHERE refs_id = ? AND subkey = ? "
+            "ORDER BY rowid LIMIT 1",
+            (refs_id, candidate),
+        ).fetchone()
+        if row is not None:
+            connection.execute("DELETE FROM pdf_index WHERE rowid = ?", (row[0],))
+            return
+    if source_name:
+        row = connection.execute(
+            "SELECT rowid FROM pdf_index WHERE refs_id = ? AND subkey = ? "
+            "ORDER BY rowid DESC LIMIT 1",
+            (refs_id, source_name),
+        ).fetchone()
+        if row is not None:
+            connection.execute("DELETE FROM pdf_index WHERE rowid = ?", (row[0],))
+
+
 def _connect_endnote_db(path: Path, *, writable: bool) -> sqlite3.Connection:
     resolved = Path(path).expanduser().resolve()
     if not resolved.is_file():
@@ -679,10 +745,17 @@ def rename_endnote_pdfs(
     pending_duplicate_sources: list[tuple[Path, int]] = []
     primary_committed = False
     try:
+        file_columns = {
+            str(column[1]) for column in connection.execute("PRAGMA table_info(file_res)")
+        }
+        file_position = (
+            "file_res.file_pos" if "file_pos" in file_columns else "file_res.rowid"
+        )
         rows = connection.execute(
-            """
+            f"""
             SELECT file_res.rowid AS file_rowid, file_res.refs_id AS refs_id,
-                   file_res.file_path AS file_path, refs.author AS author, refs.year AS year,
+                   file_res.file_path AS file_path, {file_position} AS file_pos,
+                   refs.author AS author, refs.year AS year,
                    refs.title AS title, refs.secondary_title AS secondary_title,
                    refs.electronic_resource_number AS electronic_resource_number, refs.url AS url
             FROM file_res
@@ -730,9 +803,55 @@ def rename_endnote_pdfs(
                 continue
             attachment_rows.setdefault(source, []).append(row)
 
+        duplicate_row_targets: dict[int, Path] = {}
+        if deduplicate_pdfs:
+            duplicate_groups: dict[
+                tuple[int, str, int], dict[Path, list[sqlite3.Row]]
+            ] = {}
+            for source, shared_rows in attachment_rows.items():
+                file_size = source.stat().st_size
+                for row in shared_rows:
+                    desired_name = bibliographic_filename(
+                        _metadata_from_endnote_ref(row),
+                        source.stem,
+                        naming_scheme=naming_scheme,
+                    )
+                    key = (int(row["refs_id"]), desired_name.casefold(), file_size)
+                    duplicate_groups.setdefault(key, {}).setdefault(source, []).append(row)
+            for (_, desired_name, _), grouped_sources in duplicate_groups.items():
+                if len(grouped_sources) < 2:
+                    continue
+                ordered_sources = sorted(
+                    grouped_sources,
+                    key=lambda source: (
+                        source.name.casefold() != desired_name,
+                        min(
+                            (int(row["file_pos"]), int(row["file_rowid"]))
+                            for row in grouped_sources[source]
+                        ),
+                    ),
+                )
+                canonical = ordered_sources[0]
+                for duplicate_source in ordered_sources[1:]:
+                    for row in grouped_sources[duplicate_source]:
+                        duplicate_row_targets[int(row["file_rowid"])] = canonical
+
+        active_attachment_rows = {
+            source: [
+                row
+                for row in shared_rows
+                if int(row["file_rowid"]) not in duplicate_row_targets
+            ]
+            for source, shared_rows in attachment_rows.items()
+        }
+        fully_redundant_sources = {
+            source for source, shared_rows in active_attachment_rows.items() if not shared_rows
+        }
+
         protected_paths = {
             source
-            for source, shared_rows in attachment_rows.items()
+            for source, shared_rows in active_attachment_rows.items()
+            if shared_rows
             if bibliographic_filename(
                 _metadata_from_endnote_ref(shared_rows[0]),
                 source.stem,
@@ -740,8 +859,14 @@ def rename_endnote_pdfs(
             )
             != source.name
         }
+        protected_paths.update(fully_redundant_sources)
 
-        for source, shared_rows in attachment_rows.items():
+        final_paths: dict[Path, Path] = {}
+        final_stored_paths: dict[tuple[Path, int], str] = {}
+
+        for source, shared_rows in active_attachment_rows.items():
+            if not shared_rows:
+                continue
             metadata = _metadata_from_endnote_ref(shared_rows[0])
             result = rename_pdf_file(
                 source,
@@ -758,11 +883,10 @@ def rename_endnote_pdfs(
                     **result,
                 }
             )
-            if not result["renamed"] and not result["deduplicated"]:
-                continue
+            final_paths[source] = Path(result["path"]).resolve()
             if result["deduplicated"]:
                 pending_duplicate_sources.append((source, len(files) - 1))
-            else:
+            elif result["renamed"]:
                 moved_files.append((Path(result["path"]), source))
             new_name = result["filename"]
             old_name = result["previous"]
@@ -773,6 +897,7 @@ def rename_endnote_pdfs(
                 new_path = _rewrite_endnote_path(
                     row["file_path"], path_name, new_name
                 )
+                final_stored_paths[(source, int(row["refs_id"]))] = str(new_path)
                 connection.execute(
                     "UPDATE file_res SET file_path = ? WHERE rowid = ?",
                     (new_path, row["file_rowid"]),
@@ -817,8 +942,80 @@ def rename_endnote_pdfs(
                                 )
                     except sqlite3.DatabaseError:
                         pass
-            if not result["deduplicated"]:
+            if result["renamed"] and not result["deduplicated"]:
                 renamed += 1
+
+        affected_positions: set[int] = set()
+        redundant_rows_by_source: dict[Path, list[sqlite3.Row]] = {}
+        for source, shared_rows in attachment_rows.items():
+            for row in shared_rows:
+                rowid = int(row["file_rowid"])
+                if rowid in duplicate_row_targets:
+                    redundant_rows_by_source.setdefault(source, []).append(row)
+
+        for source, redundant_rows in redundant_rows_by_source.items():
+            for row in redundant_rows:
+                refs_id = int(row["refs_id"])
+                target_source = duplicate_row_targets[int(row["file_rowid"])]
+                target_stored = final_stored_paths[(target_source, refs_id)]
+                connection.execute(
+                    "DELETE FROM file_res WHERE rowid = ?",
+                    (int(row["file_rowid"]),),
+                )
+                affected_positions.add(refs_id)
+                url = current_urls.get(refs_id, str(row["url"] or ""))
+                old_stored = str(row["file_path"] or "")
+                updated_url = _replace_endnote_url_attachment(
+                    url,
+                    {old_stored, old_stored.replace("\\", "/")},
+                    target_stored,
+                )
+                if updated_url != url:
+                    connection.execute(
+                        "UPDATE refs SET url = ? WHERE id = ?",
+                        (updated_url, refs_id),
+                    )
+                    current_urls[refs_id] = updated_url
+                if pdb_connection is not None:
+                    try:
+                        _delete_endnote_pdf_index(
+                            pdb_connection,
+                            refs_id=refs_id,
+                            stored_path=old_stored,
+                            source_name=source.name,
+                        )
+                    except sqlite3.DatabaseError:
+                        pass
+
+            if source in fully_redundant_sources:
+                first_row = redundant_rows[0]
+                target_source = duplicate_row_targets[int(first_row["file_rowid"])]
+                target_path = final_paths[target_source]
+                files.append(
+                    {
+                        "refs_id": int(first_row["refs_id"]),
+                        "refs_ids": sorted({int(row["refs_id"]) for row in redundant_rows}),
+                        "renamed": False,
+                        "deduplicated": True,
+                        "path": str(target_path),
+                        "filename": target_path.name,
+                        "previous": source.name,
+                    }
+                )
+                pending_duplicate_sources.append((source, len(files) - 1))
+
+        if "file_pos" in file_columns:
+            for refs_id in affected_positions:
+                remaining_rows = connection.execute(
+                    "SELECT rowid FROM file_res WHERE refs_id = ? "
+                    "ORDER BY file_pos, rowid",
+                    (refs_id,),
+                ).fetchall()
+                for position, remaining_row in enumerate(remaining_rows):
+                    connection.execute(
+                        "UPDATE file_res SET file_pos = ? WHERE rowid = ?",
+                        (position, int(remaining_row[0])),
+                    )
         connection.commit()
         primary_committed = True
         if pdb_connection is not None:

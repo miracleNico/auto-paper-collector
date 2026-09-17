@@ -856,6 +856,195 @@ class LibraryFilesTests(unittest.TestCase):
                 ["2024 - Doe, Jane - Same Paper.pdf"],
             )
 
+    def test_rename_endnote_deduplicates_same_reference_across_folders(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            library = root / "CrossFolder.enl"
+            library.write_bytes(b"")
+            pdf_root = library.with_suffix(".Data") / "PDF"
+            canonical_source = pdf_root / "FIRST" / "canonical.pdf"
+            duplicate_source = pdf_root / "SECOND" / "duplicate.pdf"
+            canonical_source.parent.mkdir(parents=True)
+            duplicate_source.parent.mkdir(parents=True)
+            canonical_source.write_bytes(MINIMAL_PDF)
+            duplicate_source.write_bytes(b"x" * len(MINIMAL_PDF))
+            canonical_stored = "FIRST/canonical.pdf"
+            duplicate_stored = "SECOND/duplicate.pdf"
+
+            sdb_dir = library.with_suffix(".Data") / "sdb"
+            sdb_dir.mkdir()
+            sdb = sqlite3.connect(sdb_dir / "sdb.eni")
+            sdb.execute(
+                "CREATE TABLE refs (id INTEGER PRIMARY KEY, author TEXT, year TEXT, title TEXT, "
+                "secondary_title TEXT, electronic_resource_number TEXT, url TEXT)"
+            )
+            sdb.execute(
+                "CREATE TABLE file_res (refs_id INTEGER, file_path TEXT, file_type INTEGER, file_pos INTEGER)"
+            )
+            sdb.execute(
+                "INSERT INTO refs VALUES (1, 'Doe, Jane', '2024', 'Across Folders', '', '', ?)",
+                (f"https://host.example/a;b=1\r{duplicate_stored}\r{canonical_stored}",),
+            )
+            # Insert the duplicate first to prove file_pos, not rowid, selects the canonical file.
+            sdb.execute(
+                "INSERT INTO file_res VALUES (1, ?, 1, 1)",
+                (duplicate_stored,),
+            )
+            sdb.execute(
+                "INSERT INTO file_res VALUES (1, ?, 1, 0)",
+                (canonical_stored,),
+            )
+            sdb.commit()
+            sdb.close()
+
+            pdb = sqlite3.connect(sdb_dir / "pdb.eni")
+            pdb.execute("CREATE TABLE pdf_index (refs_id INTEGER, subkey BLOB)")
+            pdb.execute("INSERT INTO pdf_index VALUES (1, ?)", (duplicate_stored,))
+            pdb.execute("INSERT INTO pdf_index VALUES (1, ?)", (canonical_stored,))
+            pdb.commit()
+            pdb.close()
+
+            result = rename_endnote_pdfs(
+                library,
+                require_closed=False,
+                deduplicate_pdfs=True,
+            )
+
+            expected_name = "2024 - Doe, Jane - Across Folders.pdf"
+            expected_stored = f"FIRST/{expected_name}"
+            expected_path = canonical_source.parent / expected_name
+            self.assertEqual(result["renamed"], 1)
+            self.assertEqual(result["deduplicated"], 1)
+            self.assertEqual(result["warnings"], [])
+            self.assertTrue(expected_path.is_file())
+            self.assertEqual(expected_path.read_bytes(), MINIMAL_PDF)
+            self.assertFalse(canonical_source.exists())
+            self.assertFalse(duplicate_source.exists())
+
+            stored = sqlite3.connect(sdb_dir / "sdb.eni")
+            try:
+                self.assertEqual(
+                    stored.execute(
+                        "SELECT file_path, file_pos FROM file_res WHERE refs_id = 1"
+                    ).fetchall(),
+                    [(expected_stored, 0)],
+                )
+                self.assertEqual(
+                    stored.execute("SELECT url FROM refs WHERE id = 1").fetchone()[0],
+                    f"https://host.example/a;b=1\r{expected_stored}",
+                )
+            finally:
+                stored.close()
+            stored_pdb = sqlite3.connect(sdb_dir / "pdb.eni")
+            try:
+                self.assertEqual(
+                    stored_pdb.execute(
+                        "SELECT subkey FROM pdf_index WHERE refs_id = 1"
+                    ).fetchall(),
+                    [(expected_stored,)],
+                )
+            finally:
+                stored_pdb.close()
+
+            repeated = rename_endnote_pdfs(
+                library,
+                require_closed=False,
+                deduplicate_pdfs=True,
+            )
+            self.assertEqual((repeated["renamed"], repeated["deduplicated"]), (0, 0))
+            self.assertEqual(list(pdf_root.rglob("*.pdf")), [expected_path])
+
+    def test_rename_endnote_keeps_different_size_files_across_folders(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            library = root / "DifferentSizes.enl"
+            library.write_bytes(b"")
+            pdf_root = library.with_suffix(".Data") / "PDF"
+            sources = [pdf_root / "FIRST" / "first.pdf", pdf_root / "SECOND" / "second.pdf"]
+            for index, source in enumerate(sources):
+                source.parent.mkdir(parents=True)
+                source.write_bytes(MINIMAL_PDF + (b"x" * index))
+            sdb_dir = library.with_suffix(".Data") / "sdb"
+            sdb_dir.mkdir()
+            sdb = sqlite3.connect(sdb_dir / "sdb.eni")
+            sdb.execute(
+                "CREATE TABLE refs (id INTEGER PRIMARY KEY, author TEXT, year TEXT, title TEXT, "
+                "secondary_title TEXT, electronic_resource_number TEXT, url TEXT)"
+            )
+            sdb.execute(
+                "CREATE TABLE file_res (refs_id INTEGER, file_path TEXT, file_type INTEGER, file_pos INTEGER)"
+            )
+            sdb.execute(
+                "INSERT INTO refs VALUES (1, 'Doe, Jane', '2024', 'Different Sizes', '', '', '')"
+            )
+            for position, source in enumerate(sources):
+                relative = source.relative_to(pdf_root).as_posix()
+                sdb.execute(
+                    "INSERT INTO file_res VALUES (1, ?, 1, ?)",
+                    (relative, position),
+                )
+            sdb.commit()
+            sdb.close()
+
+            result = rename_endnote_pdfs(
+                library,
+                require_closed=False,
+                deduplicate_pdfs=True,
+            )
+
+            self.assertEqual(result["renamed"], 2)
+            self.assertEqual(result["deduplicated"], 0)
+            self.assertEqual(len(list(pdf_root.rglob("*.pdf"))), 2)
+            stored = sqlite3.connect(sdb_dir / "sdb.eni")
+            try:
+                self.assertEqual(
+                    stored.execute("SELECT COUNT(*) FROM file_res WHERE refs_id = 1").fetchone()[0],
+                    2,
+                )
+            finally:
+                stored.close()
+
+    def test_rename_endnote_does_not_cross_folder_deduplicate_different_references(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            library = root / "DifferentReferences.enl"
+            library.write_bytes(b"")
+            pdf_root = library.with_suffix(".Data") / "PDF"
+            sdb_dir = library.with_suffix(".Data") / "sdb"
+            sdb_dir.mkdir(parents=True)
+            sdb = sqlite3.connect(sdb_dir / "sdb.eni")
+            sdb.execute(
+                "CREATE TABLE refs (id INTEGER PRIMARY KEY, author TEXT, year TEXT, title TEXT, "
+                "secondary_title TEXT, electronic_resource_number TEXT, url TEXT)"
+            )
+            sdb.execute(
+                "CREATE TABLE file_res (refs_id INTEGER, file_path TEXT, file_type INTEGER, file_pos INTEGER)"
+            )
+            for refs_id, folder in ((1, "FIRST"), (2, "SECOND")):
+                source = pdf_root / folder / "old.pdf"
+                source.parent.mkdir(parents=True)
+                source.write_bytes(MINIMAL_PDF)
+                sdb.execute(
+                    "INSERT INTO refs VALUES (?, 'Doe, Jane', '2024', 'Same Metadata', '', '', '')",
+                    (refs_id,),
+                )
+                sdb.execute(
+                    "INSERT INTO file_res VALUES (?, ?, 1, 0)",
+                    (refs_id, source.relative_to(pdf_root).as_posix()),
+                )
+            sdb.commit()
+            sdb.close()
+
+            result = rename_endnote_pdfs(
+                library,
+                require_closed=False,
+                deduplicate_pdfs=True,
+            )
+
+            self.assertEqual(result["renamed"], 2)
+            self.assertEqual(result["deduplicated"], 0)
+            self.assertEqual(len(list(pdf_root.rglob("*.pdf"))), 2)
+
     def test_endnote_deduplication_never_reuses_another_pending_source(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

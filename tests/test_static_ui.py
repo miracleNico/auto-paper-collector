@@ -86,6 +86,7 @@ class PaperActionMenuTests(unittest.TestCase):
         self.assertIn('id="rename-deduplicate" type="checkbox"', self.html)
         self.assertIn('deduplicate_pdfs: $("#rename-deduplicate").checked', self.javascript)
         self.assertIn('文件大小相同', self.html)
+        self.assertIn('不同附件文件夹', self.html)
         self.assertIn('条警告：${warnings[0]}', self.javascript)
 
     def test_pdf_export_ignores_stale_candidate_requests(self) -> None:

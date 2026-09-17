@@ -4,11 +4,16 @@ import tempfile
 import unittest
 from html.parser import HTMLParser
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 from paper_endnote.config import Settings
 from paper_endnote.db import Database
-from paper_endnote.user_config import OcrOptions, load_preset
+from paper_endnote.user_config import (
+    InstitutionProfile,
+    OcrOptions,
+    load_acquisition_config,
+    load_preset,
+)
 
 
 class _InputParser(HTMLParser):
@@ -58,6 +63,129 @@ def _settings(root: Path) -> Settings:
 
 
 class SettingsUpdateTests(unittest.IsolatedAsyncioTestCase):
+    async def test_clearing_institution_returns_to_oa_only(self) -> None:
+        from paper_endnote import app as app_module
+
+        with tempfile.TemporaryDirectory() as directory:
+            settings = _settings(Path(directory))
+            database = Database(settings.database_path)
+            payload = app_module.SettingsUpdate(
+                institution=app_module.InstitutionUpdate(
+                    id="",
+                    name="",
+                    access_type="ezproxy",
+                    login_url="",
+                    login_url_markers=[],
+                    openurl="",
+                    ezproxy_login="",
+                    ezproxy_hosts=[],
+                    school_aliases=[],
+                    entity_id="",
+                    publisher_login_urls={},
+                    preset="",
+                )
+            )
+            with (
+                patch.object(app_module, "settings", settings),
+                patch.object(app_module, "database", database),
+            ):
+                await app_module.update_settings(payload)
+
+            self.assertEqual(settings.institution.id, "")
+            self.assertEqual(settings.acquisition_sources, ("open_access",))
+            self.assertFalse(settings.auto_institution)
+
+    async def test_new_batch_keeps_credential_free_institution_snapshot(self) -> None:
+        from paper_endnote import app as app_module
+
+        with tempfile.TemporaryDirectory() as directory:
+            settings = _settings(Path(directory))
+            settings.institution = InstitutionProfile(
+                id="example-u",
+                name="Example University",
+                access_type="carsi_saml",
+                login_url="https://idp.example.edu/login",
+                school_aliases=("Example University",),
+            )
+            database = Database(settings.database_path)
+            payload = app_module.BatchCreate(
+                name="snapshot",
+                items_text="10.1000/example",
+                target_library="Test",
+                library_mode="new",
+                start_immediately=False,
+            )
+            with (
+                patch.object(app_module, "settings", settings),
+                patch.object(app_module, "database", database),
+            ):
+                result = await app_module.create_batch(payload)
+
+            snapshot = database.get_batch(result["id"])["institution_config"]
+            self.assertEqual(snapshot["id"], "example-u")
+            self.assertEqual(snapshot["access_type"], "carsi_saml")
+            self.assertEqual(
+                snapshot["_acquisition_sources"], ["open_access", "institution"]
+            )
+            self.assertTrue(snapshot["_auto_institution"])
+            self.assertNotIn("password", snapshot)
+            self.assertNotIn("cookie", snapshot)
+
+    async def test_switching_from_carsi_to_manual_clears_hidden_carsi_links(self) -> None:
+        from paper_endnote import app as app_module
+
+        with tempfile.TemporaryDirectory() as directory:
+            settings = _settings(Path(directory))
+            settings.institution = InstitutionProfile(
+                id="example-u",
+                name="Example University",
+                access_type="carsi_saml",
+                login_url="https://idp.example.edu/login",
+                school_aliases=("Example University",),
+                entity_id="https://idp.example.edu/entity",
+                publisher_login_urls={"ieee": "https://idp.example.edu/ieee"},
+            )
+            database = Database(settings.database_path)
+            payload = app_module.SettingsUpdate(
+                institution=app_module.InstitutionUpdate(
+                    access_type="manual_browser",
+                    id="example-u",
+                    name="Example University",
+                    login_url="https://library.example.edu/manual",
+                )
+            )
+            with (
+                patch.object(app_module, "settings", settings),
+                patch.object(app_module, "database", database),
+            ):
+                await app_module.update_settings(payload)
+
+            self.assertEqual(settings.institution.access_type, "manual_browser")
+            self.assertEqual(settings.institution.school_aliases, ())
+            self.assertEqual(settings.institution.entity_id, "")
+            self.assertEqual(settings.institution.publisher_login_urls, {})
+
+    async def test_cannot_enable_institution_without_school_id(self) -> None:
+        from fastapi import HTTPException
+        from paper_endnote import app as app_module
+
+        with tempfile.TemporaryDirectory() as directory:
+            settings = _settings(Path(directory))
+            settings.institution = InstitutionProfile()
+            settings.acquisition_sources = ("open_access",)
+            settings.auto_institution = False
+            database = Database(settings.database_path)
+            payload = app_module.SettingsUpdate(
+                acquisition_sources=["open_access", "institution"],
+                auto_institution=True,
+            )
+            with (
+                patch.object(app_module, "settings", settings),
+                patch.object(app_module, "database", database),
+                self.assertRaises(HTTPException),
+            ):
+                await app_module.update_settings(payload)
+
     async def test_partial_acquisition_update_preserves_saved_profile_and_database_settings(self) -> None:
         from paper_endnote import app as app_module
 
@@ -180,6 +308,108 @@ class SettingsUpdateTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(database.get_setting("crossref_email"), "updated-crossref@example.org")
             self.assertEqual(database.get_setting("unpaywall_email"), "updated-unpaywall@example.org")
             self.assertEqual(database.get_setting("endnote_library"), "")
+
+    async def test_carsi_profile_saves_without_ezproxy_fields(self) -> None:
+        from paper_endnote import app as app_module
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            settings = _settings(root)
+            settings.acquisition_sources = ("open_access",)
+            settings.auto_institution = False
+            database = Database(settings.database_path)
+            payload = app_module.SettingsUpdate(
+                institution=app_module.InstitutionUpdate(
+                    id="example-university",
+                    name="Example University",
+                    access_type="carsi_saml",
+                    login_url="https://library.example.edu/carsi",
+                    login_url_markers=["idp.example.edu"],
+                    school_aliases=["Example U", "示例大学"],
+                    entity_id="https://idp.example.edu/idp/shibboleth",
+                    publisher_login_urls={
+                        "IEEE": "https://library.example.edu/ieee",
+                        "sciencedirect": "https://library.example.edu/elsevier",
+                    },
+                    preset="",
+                )
+            )
+
+            with (
+                patch.object(app_module, "settings", settings),
+                patch.object(app_module, "database", database),
+            ):
+                result = await app_module.update_settings(payload)
+
+            self.assertEqual(result, {"status": "saved"})
+            self.assertEqual(settings.institution.access_type, "carsi_saml")
+            self.assertEqual(settings.institution.ezproxy_login, "")
+            self.assertEqual(settings.institution.school_aliases, ("Example U", "示例大学"))
+            self.assertEqual(
+                settings.institution.publisher_login_urls["ieee"],
+                "https://library.example.edu/ieee",
+            )
+            self.assertEqual(settings.acquisition_sources, ("open_access", "institution"))
+            self.assertTrue(settings.auto_institution)
+            persisted = load_acquisition_config(settings.config_path, create=False)
+            self.assertEqual(persisted.institution.as_dict(), settings.institution.as_dict())
+
+    async def test_explicit_empty_optional_fields_are_not_restored_from_preset(self) -> None:
+        from paper_endnote import app as app_module
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            settings = _settings(root)
+            database = Database(settings.database_path)
+            payload = app_module.SettingsUpdate(
+                institution=app_module.InstitutionUpdate(
+                    login_url="", openurl="", login_url_markers=[], ezproxy_hosts=[]
+                )
+            )
+
+            with (
+                patch.object(app_module, "settings", settings),
+                patch.object(app_module, "database", database),
+            ):
+                await app_module.update_settings(payload)
+
+            self.assertEqual(settings.institution.login_url, "")
+            self.assertEqual(settings.institution.openurl, "")
+            self.assertEqual(settings.institution.login_url_markers, ())
+            self.assertEqual(settings.institution.ezproxy_hosts, ())
+            persisted = load_acquisition_config(settings.config_path, create=False)
+            self.assertEqual(persisted.institution.login_url, "")
+            self.assertEqual(persisted.institution.openurl, "")
+            self.assertEqual(persisted.institution.login_url_markers, ())
+            self.assertEqual(persisted.institution.ezproxy_hosts, ())
+
+    async def test_state_exposes_access_types_and_complete_institution_profile(self) -> None:
+        from paper_endnote import app as app_module
+
+        with tempfile.TemporaryDirectory() as directory:
+            settings = _settings(Path(directory))
+            with (
+                patch.object(app_module, "settings", settings),
+                patch.object(app_module.pipeline.zotero, "probe", AsyncMock(return_value={})),
+                patch.object(app_module, "probe_endnote", return_value={}),
+                patch.object(app_module, "ocr_status", return_value={}),
+                patch.object(
+                    app_module,
+                    "credential_status",
+                    return_value={"username": "", "password_saved": False},
+                ),
+            ):
+                result = await app_module.state()
+
+            self.assertEqual(
+                result["institution_access_types"],
+                ["ezproxy", "carsi_saml", "manual_browser"],
+            )
+            institution = result["settings"]["institution"]
+            self.assertEqual(institution["access_type"], "ezproxy")
+            self.assertEqual(institution["login_url"], "https://proxy.library.mcgill.ca/login")
+            self.assertIn("publisher_login_urls", institution)
+            self.assertIn("school_aliases", institution)
 
 
 class StaticSettingsDefaultsTests(unittest.TestCase):

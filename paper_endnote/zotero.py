@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import secrets
+from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Any
+from typing import Any, AsyncIterator
 from urllib.parse import unquote, urlparse
 
 import httpx
@@ -40,6 +42,13 @@ def _creators(authors: list[str]) -> list[dict[str, str]]:
 
 
 def item_payload(metadata: dict[str, Any], collection_key: str) -> dict[str, Any]:
+    tags = [
+        {"tag": str(tag).strip()}
+        for tag in metadata.get("tags") or []
+        if str(tag).strip()
+    ]
+    if not any(item["tag"].casefold() == "paperendnote" for item in tags):
+        tags.append({"tag": "PaperEndNote"})
     return {
         "itemType": "journalArticle",
         "title": metadata.get("title") or "",
@@ -52,9 +61,12 @@ def item_payload(metadata: dict[str, Any], collection_key: str) -> dict[str, Any
         "date": str(metadata.get("year") or ""),
         "DOI": normalize_doi(metadata.get("doi")) or "",
         "url": metadata.get("url") or "",
-        "libraryCatalog": "Crossref",
+        "shortTitle": metadata.get("short_title") or "",
+        "language": metadata.get("language") or "",
+        "accessDate": metadata.get("access_date") or "",
+        "libraryCatalog": metadata.get("library_catalog") or "Crossref",
         "collections": [collection_key],
-        "tags": [{"tag": "PaperEndNote"}],
+        "tags": tags,
         "relations": {},
     }
 
@@ -87,6 +99,14 @@ class ZoteroAdapter:
         self.api_key = api_key
         self.server_id = ""
         self.client = httpx.AsyncClient(timeout=30.0, follow_redirects=False, trust_env=False)
+        self._sync_lock = asyncio.Lock()
+
+    @asynccontextmanager
+    async def sync_guard(self) -> AsyncIterator[None]:
+        """Serialize complete library syncs that share this adapter instance."""
+
+        async with self._sync_lock:
+            yield
 
     async def close(self) -> None:
         await self.client.aclose()
@@ -194,9 +214,35 @@ class ZoteroAdapter:
         return self._successful_key(response)
 
     async def _candidate_items(self, metadata: dict[str, Any]) -> list[dict[str, Any]]:
-        query = normalize_doi(metadata.get("doi")) or metadata.get("title") or ""
+        doi = normalize_doi(metadata.get("doi"))
+        title = str(metadata.get("title") or "").strip()
+        if doi:
+            response = await self._request(
+                "GET", "/users/0/items/top", params={"q": doi, "qmode": "everything"}
+            )
+            exact = [
+                item
+                for item in response.json()
+                if normalize_doi(_data(item).get("DOI")) == doi
+            ]
+            if exact or not title:
+                return exact
+
+            response = await self._request(
+                "GET", "/users/0/items/top", params={"q": title, "qmode": "everything"}
+            )
+            title_matches = match_items(
+                response.json(), {**metadata, "doi": None}
+            )
+            return [
+                item
+                for item in title_matches
+                if not normalize_doi(_data(item).get("DOI"))
+                or normalize_doi(_data(item).get("DOI")) == doi
+            ]
+
         response = await self._request(
-            "GET", "/users/0/items/top", params={"q": query, "qmode": "everything"}
+            "GET", "/users/0/items/top", params={"q": title, "qmode": "everything"}
         )
         return match_items(response.json(), metadata)
 
@@ -290,6 +336,45 @@ class ZoteroAdapter:
                 data={"upload": authorization["uploadKey"]},
                 headers=condition,
             )
+
+    async def attach_pdf(self, item_key: str, pdf_path: Path) -> dict[str, Any]:
+        """Attach one local PDF unless the same bytes are already attached."""
+
+        await self._ensure_server()
+        pdf_path = Path(pdf_path)
+        if not pdf_path.is_file():
+            raise ZoteroError(f"PDF 不存在：{pdf_path}")
+        wanted_md5 = hashlib.md5(pdf_path.read_bytes(), usedforsecurity=False).hexdigest()
+        children = await self._children(item_key)
+        incomplete_key = None
+        for child in children:
+            data = _data(child)
+            if data.get("contentType") != "application/pdf":
+                continue
+            key = data.get("key") or child.get("key")
+            if data.get("md5") == wanted_md5:
+                return {"attached": False, "attachment_key": key, "existing": True}
+            if key and not data.get("md5"):
+                existing_path = await self._attachment_path(key)
+                if existing_path and existing_path.is_file():
+                    existing_md5 = hashlib.md5(
+                        existing_path.read_bytes(), usedforsecurity=False
+                    ).hexdigest()
+                    if existing_md5 == wanted_md5:
+                        return {"attached": False, "attachment_key": key, "existing": True}
+                    continue
+                if (
+                    incomplete_key is None
+                    and data.get("filename") == pdf_path.name
+                    and data.get("linkMode") in {None, "imported_file", "imported_url"}
+                ):
+                    incomplete_key = key
+        attachment_key = incomplete_key or await self._create_attachment(item_key, pdf_path)
+        await self._upload_file(attachment_key, pdf_path)
+        final_children = await self._children(item_key)
+        if not any(_data(item).get("md5") == wanted_md5 for item in final_children):
+            raise ZoteroError("Zotero 写入后未找到匹配的 PDF 附件")
+        return {"attached": True, "attachment_key": attachment_key, "existing": False}
 
     async def commit_paper(
         self, collection_key: str, metadata: dict[str, Any], pdf_path: Path | None
@@ -450,4 +535,3 @@ class ZoteroAdapter:
         if version is not None:
             payload["version"] = version
         await self._request("PATCH", f"/users/0/items/{attachment_key}", json=payload)
-

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import tempfile
 import unittest
 from pathlib import Path
@@ -18,6 +19,8 @@ class ZoteroTests(unittest.TestCase):
                 "year": 2024,
                 "authors": ["Doe, Jane", "John Smith"],
                 "journal": "A Journal",
+                "library_catalog": "EndNote",
+                "tags": ["EndNote import", "reviewed"],
             },
             "COLL1234",
         )
@@ -25,6 +28,15 @@ class ZoteroTests(unittest.TestCase):
         self.assertEqual(payload["collections"], ["COLL1234"])
         self.assertEqual(payload["creators"][0]["lastName"], "Doe")
         self.assertEqual(payload["creators"][1]["lastName"], "Smith")
+        self.assertEqual(payload["libraryCatalog"], "EndNote")
+        self.assertEqual(
+            payload["tags"],
+            [
+                {"tag": "EndNote import"},
+                {"tag": "reviewed"},
+                {"tag": "PaperEndNote"},
+            ],
+        )
 
     def test_match_items_prefers_exact_doi(self) -> None:
         items = [
@@ -36,6 +48,174 @@ class ZoteroTests(unittest.TestCase):
 
 
 class ZoteroAsyncTests(unittest.IsolatedAsyncioTestCase):
+    async def test_candidate_items_falls_back_to_title_year_after_doi_miss(self) -> None:
+        queries: list[str] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            query = request.url.params.get("q", "")
+            queries.append(query)
+            if query == "10.1000/example":
+                return httpx.Response(200, json=[])
+            if query == "An Example":
+                return httpx.Response(
+                    200,
+                    json=[
+                        {
+                            "data": {
+                                "key": "NO_DOI",
+                                "DOI": "",
+                                "title": "An Example",
+                                "date": "2024",
+                            }
+                        },
+                        {
+                            "data": {
+                                "key": "OTHER_DOI",
+                                "DOI": "10.1000/other",
+                                "title": "An Example",
+                                "date": "2024",
+                            }
+                        },
+                    ],
+                )
+            return httpx.Response(500, text="unexpected query")
+
+        adapter = ZoteroAdapter(api_key="test-key")
+        await adapter.client.aclose()
+        adapter.client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        try:
+            matches = await adapter._candidate_items(
+                {"doi": "10.1000/example", "title": "An Example", "year": 2024}
+            )
+        finally:
+            await adapter.close()
+
+        self.assertEqual(queries, ["10.1000/example", "An Example"])
+        self.assertEqual([item["data"]["key"] for item in matches], ["NO_DOI"])
+
+    async def test_attach_pdf_reuses_child_with_same_md5(self) -> None:
+        requests: list[tuple[str, str]] = []
+
+        with tempfile.TemporaryDirectory() as directory:
+            pdf_path = Path(directory) / "paper.pdf"
+            pdf_path.write_bytes(b"%PDF-1.4\nmatching bytes\n%%EOF\n")
+            digest = hashlib.md5(pdf_path.read_bytes(), usedforsecurity=False).hexdigest()
+
+            def handler(request: httpx.Request) -> httpx.Response:
+                requests.append((request.method, request.url.path))
+                headers = {
+                    "Zotero-Server-ID": "SERVER123",
+                    "Zotero-API-Version": "3",
+                    "X-Zotero-Version": "10.0.2",
+                }
+                if request.url.path == "/api/":
+                    return httpx.Response(200, headers=headers, json={})
+                if request.url.path == "/api/users/0/items/ITEM1234/children":
+                    return httpx.Response(
+                        200,
+                        headers=headers,
+                        json=[
+                            {
+                                "data": {
+                                    "key": "FILE1234",
+                                    "contentType": "application/pdf",
+                                    "md5": digest,
+                                }
+                            }
+                        ],
+                    )
+                return httpx.Response(500, headers=headers, text="unexpected request")
+
+            adapter = ZoteroAdapter(api_key="test-key")
+            await adapter.client.aclose()
+            adapter.client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+            try:
+                result = await adapter.attach_pdf("ITEM1234", pdf_path)
+            finally:
+                await adapter.close()
+
+        self.assertEqual(
+            result,
+            {"attached": False, "attachment_key": "FILE1234", "existing": True},
+        )
+        self.assertEqual(
+            requests,
+            [
+                ("GET", "/api/"),
+                ("GET", "/api/users/0/items/ITEM1234/children"),
+            ],
+        )
+
+    async def test_attach_pdf_reuses_incomplete_same_name_attachment(self) -> None:
+        requests: list[tuple[str, str]] = []
+        children_requests = 0
+
+        with tempfile.TemporaryDirectory() as directory:
+            pdf_path = Path(directory) / "paper.pdf"
+            pdf_path.write_bytes(b"%PDF-1.4\nretry bytes\n%%EOF\n")
+            digest = hashlib.md5(pdf_path.read_bytes(), usedforsecurity=False).hexdigest()
+
+            def handler(request: httpx.Request) -> httpx.Response:
+                nonlocal children_requests
+                requests.append((request.method, request.url.path))
+                headers = {
+                    "Zotero-Server-ID": "SERVER123",
+                    "Zotero-API-Version": "3",
+                    "X-Zotero-Version": "10.0.2",
+                }
+                if request.url.path == "/api/":
+                    return httpx.Response(200, headers=headers, json={})
+                if request.url.path == "/api/users/0/items/ITEM1234/children":
+                    children_requests += 1
+                    md5 = None if children_requests == 1 else digest
+                    return httpx.Response(
+                        200,
+                        headers=headers,
+                        json=[
+                            {
+                                "data": {
+                                    "key": "FILE1234",
+                                    "contentType": "application/pdf",
+                                    "filename": "paper.pdf",
+                                    "linkMode": "imported_file",
+                                    "md5": md5,
+                                }
+                            }
+                        ],
+                    )
+                if request.url.path == "/api/users/0/items/FILE1234/file/view/url":
+                    return httpx.Response(404, headers=headers)
+                if (
+                    request.url.path == "/api/users/0/items/FILE1234/file"
+                    and request.method == "POST"
+                ):
+                    return httpx.Response(200, headers=headers, json={"exists": 1})
+                return httpx.Response(500, headers=headers, text="unexpected request")
+
+            adapter = ZoteroAdapter(api_key="test-key")
+            await adapter.client.aclose()
+            adapter.client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+            try:
+                result = await adapter.attach_pdf("ITEM1234", pdf_path)
+            finally:
+                await adapter.close()
+
+        self.assertEqual(
+            result,
+            {"attached": True, "attachment_key": "FILE1234", "existing": False},
+        )
+        self.assertNotIn(("POST", "/api/users/0/items"), requests)
+        self.assertEqual(
+            requests,
+            [
+                ("GET", "/api/"),
+                ("GET", "/api/users/0/items/ITEM1234/children"),
+                ("GET", "/api/users/0/items/FILE1234/file/view/url"),
+                ("POST", "/api/users/0/items/FILE1234/file"),
+                ("GET", "/api/users/0/items/ITEM1234/children"),
+            ],
+        )
+
     async def test_create_collection_and_metadata_only_item(self) -> None:
         created_items = []
 

@@ -84,6 +84,15 @@
           <label><span class="field-label">数据区</span><select id="export-source"><option value="zotero">Zotero collection</option><option value="batch">本机批次</option><option value="endnote">EndNote 库数据区</option></select></label>
           <label id="export-collection-wrap"><span class="field-label">Zotero collection</span><select id="export-collection"></select></label>
           <label id="export-batch-wrap" hidden><span class="field-label">本机批次</span><select id="export-batch"></select></label>
+          <div id="export-picker" class="export-picker" aria-busy="false">
+            <div class="export-picker-head">
+              <label class="check compact"><input id="export-select-all" type="checkbox" disabled> <span>全选可导出论文</span></label>
+              <span id="export-selection-count" class="selection-count">0 / 0</span>
+            </div>
+            <div id="export-items" class="export-item-list" role="group" aria-label="选择要导出的论文" tabindex="-1">
+              <div class="picker-state">请选择数据区</div>
+            </div>
+          </div>
           <label><span class="field-label">目标文件夹</span><input id="export-destination" placeholder="C:\Users\...\Downloads\DTN"></label>
           <label class="check"><input id="export-open-folder" type="checkbox" checked> 完成后打开文件夹</label>
           <div class="card-footer"><p id="export-result" class="result-text" role="status"></p><button class="primary" type="submit">导出 PDF</button></div>
@@ -96,6 +105,15 @@
           <label><span class="field-label">目标文件夹</span><input id="endnote-destination" placeholder="C:\Users\...\Downloads\DTN"></label>
           <label class="check"><input id="endnote-open-folder" type="checkbox" checked> 完成后打开文件夹</label>
           <div class="card-footer"><p id="endnote-export-result" class="result-text" role="status"></p><button class="primary" type="submit">导出导入包</button></div>
+        </form>
+
+        <form id="sync-endnote-zotero-form" class="panel tool-card">
+          <div class="card-icon pink" aria-hidden="true">↗</div>
+          <div class="card-heading"><h2>EndNote → Zotero</h2><button class="help-button" type="button" data-help="把 EndNote 中未删除的期刊文章单向合并到目标 collection。按 DOI 或题名与年份去重，并复制 PDF；其他题录类型会列为跳过。同步前请退出 EndNote。" aria-label="EndNote 同步帮助">?</button></div>
+          <label><span class="field-label">EndNote 库</span><input id="sync-endnote-library" readonly placeholder="请先在设置中填写 .enl 路径"></label>
+          <label><span class="field-label">目标 Zotero collection</span><input id="sync-zotero-collection" list="sync-zotero-collections" maxlength="120" placeholder="例如 DTN & FL" required><datalist id="sync-zotero-collections"></datalist></label>
+          <div id="sync-endnote-report" class="sync-report" hidden></div>
+          <div class="card-footer"><p id="sync-endnote-result" class="result-text" role="status"></p><button class="primary" type="submit">开始同步</button></div>
         </form>
       </div>
     </section>
@@ -113,7 +131,7 @@
         <section class="panel settings-card">
           <div class="settings-title"><span class="settings-icon" aria-hidden="true">⇣</span><h2>获取来源</h2></div>
           <label class="check"><input id="source-open-access" type="checkbox" checked><span>开放获取（Unpaywall）</span></label>
-          <label class="check"><input id="source-institution" type="checkbox"><span>机构订阅（EZProxy / OpenURL）</span></label>
+          <label class="check"><input id="source-institution" type="checkbox"><span>机构订阅（EZProxy / CARSI / 手动浏览器）</span></label>
           <label class="check"><input id="auto-institution" type="checkbox"><span>自动尝试机构获取</span></label>
           <label class="check"><input id="auto-commit" type="checkbox" checked><span>获取后自动提交 Zotero</span></label>
           <label><span class="field-label">登录等待秒数 <button class="help-button" type="button" data-help="为机构登录、验证码或双重验证预留的等待时间。" aria-label="登录等待帮助">?</button></span><input id="login-wait-seconds" type="number" min="30" max="1800" value="600"></label>
@@ -129,22 +147,35 @@
         </section>
 
         <section class="panel settings-card wide">
-          <div class="settings-title"><span class="settings-icon" aria-hidden="true">⌂</span><h2>机构</h2></div>
-          <label><span class="field-label">预设 <button class="help-button" type="button" data-help="选择预设会填入下方字段；Generic EZProxy 需要替换为校园代理地址。" aria-label="机构预设帮助">?</button></span><select id="institution-preset"></select></label>
-          <div class="grid two"><label><span class="field-label">机构 ID</span><input id="institution-id" required></label><label><span class="field-label">显示名称</span><input id="institution-name" required></label></div>
+          <div class="settings-title-row"><div class="settings-title"><span class="settings-icon" aria-hidden="true">⌂</span><h2>机构</h2></div><span id="carsi-experimental" class="status-pill warn" hidden>CARSI 实验性支持</span></div>
+          <div class="grid two">
+            <label><span class="field-label">预设 <button class="help-button" type="button" data-help="选择预设会填入下方字段；Generic EZProxy 需要替换为校园代理地址。" aria-label="机构预设帮助">?</button></span><select id="institution-preset"></select></label>
+            <label><span class="field-label">访问方式</span><select id="institution-access-type"><option value="ezproxy">EZProxy</option><option value="carsi_saml">CARSI / SAML（实验性）</option><option value="manual_browser">手动浏览器会话</option></select></label>
+          </div>
+          <div class="grid two"><label><span class="field-label">机构 ID</span><input id="institution-id"></label><label><span class="field-label">显示名称</span><input id="institution-name"></label></div>
+          <label><span class="field-label">官方登录入口（完整 URL，可选） <button class="help-button" type="button" data-help="填写学校图书馆或 CARSI 提供的完整 https:// 地址；登录后程序会单独返回论文页。" aria-label="机构登录入口帮助">?</button></span><input id="institution-login-url" type="url" placeholder="https://idp.example.edu/..."></label>
           <details class="subtle-details"><summary>高级连接设置</summary><div class="details-body">
-            <label><span class="field-label">EZProxy 登录模板</span><input id="institution-login" placeholder="https://ezproxy.example.edu/login?url={url}"></label>
-            <label><span class="field-label">EZProxy 主机（逗号分隔）</span><input id="institution-hosts" placeholder="ezproxy.example.edu"></label>
+            <div data-institution-types="ezproxy">
+              <label><span class="field-label">EZProxy 登录模板</span><input id="institution-login" placeholder="https://ezproxy.example.edu/login?url={url}"></label>
+              <label><span class="field-label">EZProxy 主机（逗号分隔）</span><input id="institution-hosts" placeholder="ezproxy.example.edu"></label>
+            </div>
+            <div data-institution-types="carsi_saml">
+              <label><span class="field-label">学校名称别名（逗号分隔）</span><input id="institution-school-aliases" placeholder="示例大学, Example University"></label>
+              <label><span class="field-label">IdP entityID（可选） <button class="help-button" type="button" data-help="这是学校在身份联盟中的标识，不会被当作网址直接打开。" aria-label="IdP entityID 帮助">?</button></span><input id="institution-entity-id" placeholder="https://idp.example.edu/idp/shibboleth"></label>
+              <label><span class="field-label">出版社官方登录链接 <button class="help-button" type="button" data-help="每行填写 publisher=https://...，首版支持 ieee 与 sciencedirect；只接受完整 URL。" aria-label="出版社登录链接帮助">?</button></span><textarea id="institution-publisher-login-urls" rows="3" placeholder="ieee=https://...&#10;sciencedirect=https://..."></textarea></label>
+            </div>
             <label><span class="field-label">OpenURL / 馆藏解析</span><input id="institution-openurl" placeholder="https://...link?rft_id=info:doi/{doi}"></label>
             <label><span class="field-label">登录页标记（逗号分隔）</span><input id="institution-login-markers" placeholder="login.microsoftonline.com, shibboleth, saml"></label>
           </div></details>
+          <p id="institution-access-result" class="result-text" role="status" aria-live="polite"></p>
+          <div class="inline-actions institution-actions"><button id="open-institution-login-settings" type="button">打开登录页</button><button id="test-institution-access" type="button">测试访问</button></div>
         </section>
         <div class="settings-save"><button class="primary" type="submit">保存设置</button></div>
       </form>
 
       <div class="settings-grid lower-settings">
         <form id="credentials-form" class="panel settings-card">
-          <div class="settings-title-row"><div class="settings-title"><span class="settings-icon" aria-hidden="true">⌘</span><h2>机构凭据</h2></div><button class="help-button" type="button" data-help="凭据保存在 Windows 凭据管理器；浏览器只会填入账号，不会代替你提交或处理双重验证。" aria-label="机构凭据帮助">?</button></div>
+          <div class="settings-title-row"><div class="settings-title"><span class="settings-icon" aria-hidden="true">⌘</span><h2>EZProxy 凭据</h2></div><button class="help-button" type="button" data-help="仅适用于 EZProxy。凭据保存在 Windows 凭据管理器；CARSI 与手动模式请在可见浏览器中登录。" aria-label="机构凭据帮助">?</button></div>
           <p id="credentials-status" class="result-text" aria-live="polite"></p>
           <label><span class="field-label">用户名</span><input id="institution-username" autocomplete="username"></label>
           <label><span class="field-label">密码</span><input id="institution-password" type="password" autocomplete="current-password" placeholder="已保存密码不会回显"></label>

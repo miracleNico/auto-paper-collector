@@ -485,7 +485,7 @@ def probe_endnote(endnote_exe: Path, library: Path | None = None) -> dict[str, A
         "library_exists": bool(library and Path(library).is_file()),
         "ready": True,
         "details": [
-            "EndNote 不再通过桌面控件写入。在工具页从 Zotero 导出导入包到 Downloads，再由 EndNote 导入 XML。"
+            "工具页支持从 Zotero 生成 EndNote 导入包，也可将已关闭的 EndNote 库单向同步到 Zotero。"
         ],
     }
     if library and not Path(library).is_file():

@@ -354,7 +354,7 @@ td.actions { min-width: 190px; max-width: 270px; }
 .spinner { display: inline-block; width: 18px; height: 18px; border: 2px solid var(--blue-200); border-top-color: var(--blue-600); border-radius: 50%; animation: spin .7s linear infinite; }
 @keyframes spin { to { transform: rotate(360deg); } }
 
-.tool-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 1rem; align-items: stretch; }
+.tool-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 1rem; align-items: stretch; }
 .tool-card { display: flex; min-height: 450px; flex-direction: column; padding: 1.2rem; }
 .card-icon, .settings-icon { display: grid; width: 42px; height: 42px; place-items: center; margin-bottom: .9rem; border-radius: 14px; font-size: .78rem; font-weight: 850; }
 .card-icon.pink { color: var(--pink-600); background: var(--pink-100); }
@@ -364,6 +364,24 @@ td.actions { min-width: 190px; max-width: 270px; }
 .card-heading .help-button { margin-left: auto; }
 .card-footer { display: flex; align-items: flex-end; gap: .7rem; margin-top: auto; padding-top: .6rem; }
 .card-footer .result-text { flex: 1; }
+.export-picker { margin: 0 0 1rem; overflow: hidden; border: 1px solid var(--line); border-radius: 14px; background: #fbfdff; }
+.export-picker-head { display: flex; align-items: center; justify-content: space-between; gap: .7rem; padding: .65rem .72rem; border-bottom: 1px solid var(--line); }
+.export-picker-head label.check { margin: 0; }
+.selection-count { flex: 0 0 auto; color: var(--muted); font-size: .72rem; font-weight: 700; }
+.export-item-list { display: grid; max-height: 230px; overflow-y: auto; overscroll-behavior: contain; scrollbar-width: thin; }
+.export-item { display: grid; grid-template-columns: 18px minmax(0, 1fr) auto; gap: .6rem; align-items: center; margin: 0; padding: .65rem .72rem; border-bottom: 1px solid var(--line); cursor: pointer; }
+.export-item:last-child { border-bottom: 0; }
+.export-item:hover { background: var(--blue-50); }
+.export-item input { margin: 0; }
+.export-item-copy { min-width: 0; }
+.export-item-copy strong { display: block; overflow: hidden; color: var(--ink-soft); font-size: .78rem; text-overflow: ellipsis; white-space: nowrap; }
+.export-item-copy small { display: block; overflow: hidden; margin-top: .18rem; font-size: .68rem; text-overflow: ellipsis; white-space: nowrap; }
+.export-item-size { color: var(--muted); font-size: .68rem; white-space: nowrap; }
+.export-item.unavailable { cursor: default; opacity: .58; }
+.export-item.unavailable:hover { background: transparent; }
+.picker-state { padding: 1.4rem .75rem; color: var(--muted); text-align: center; font-size: .76rem; }
+.sync-report { margin-bottom: 1rem; padding: .7rem .8rem; border: 1px solid var(--line); border-radius: 13px; color: var(--ink-soft); background: var(--blue-50); font-size: .75rem; line-height: 1.55; }
+.sync-report.error { border-color: var(--pink-200); color: var(--danger); background: var(--pink-50); }
 
 .settings-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 1rem; align-items: start; }
 .settings-card { padding: 1.2rem; }
@@ -378,6 +396,9 @@ td.actions { min-width: 190px; max-width: 270px; }
 .subtle-details, .diagnostics { border: 1px solid var(--line); border-radius: 14px; background: #fbfdff; }
 .subtle-details summary, .diagnostics summary { padding: .75rem .85rem; color: var(--blue-600); font-size: .8rem; font-weight: 720; cursor: pointer; }
 .details-body { padding: .3rem .85rem 0; }
+.details-body [data-institution-types] { padding: 0; }
+.institution-actions { margin-top: .75rem; }
+[data-institution-types][hidden], #carsi-experimental[hidden] { display: none; }
 .environment-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: .55rem; margin-bottom: .9rem; }
 .status-card { min-width: 0; padding: .7rem; border: 1px solid var(--line); border-radius: 14px; background: #fbfdff; }
 .status-card.loading { grid-column: 1 / -1; color: var(--muted); }
@@ -425,7 +446,7 @@ dialog::backdrop { background: rgba(35, 47, 66, .46); backdrop-filter: blur(3px)
 
 @media (max-width: 1100px) {
   .tool-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
-  .tool-card:last-child { grid-column: 1 / -1; min-height: 390px; }
+  .tool-card { min-height: 390px; }
   .task-layout { grid-template-columns: 285px minmax(0, 1fr); }
   .task-actions { flex-basis: 100%; justify-content: flex-start; }
   .task-head { flex-wrap: wrap; }

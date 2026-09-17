@@ -10,6 +10,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable, Iterator
 
+from .redaction import redact_diagnostic, redact_diagnostic_text
+
 
 class BatchDeletingError(RuntimeError):
     """Raised when a write targets a batch whose deletion has started."""
@@ -62,6 +64,7 @@ class Database:
             paused INTEGER NOT NULL DEFAULT 0,
             backup_path TEXT,
             endnote_export_path TEXT,
+            institution_config_json TEXT,
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL,
             error TEXT,
@@ -93,6 +96,8 @@ class Database:
             pdf_path TEXT,
             pdf_sha256 TEXT,
             record_number TEXT,
+            institution_publisher TEXT,
+            institution_state TEXT,
             needs_action TEXT,
             error TEXT,
             created_at TEXT NOT NULL,
@@ -173,6 +178,15 @@ class Database:
                 connection.execute("ALTER TABLE batches ADD COLUMN deletion_operation_id TEXT")
             if "deletion_error" not in columns:
                 connection.execute("ALTER TABLE batches ADD COLUMN deletion_error TEXT")
+            if "institution_config_json" not in columns:
+                connection.execute("ALTER TABLE batches ADD COLUMN institution_config_json TEXT")
+            paper_columns = {
+                row[1] for row in connection.execute("PRAGMA table_info(papers)")
+            }
+            if "institution_publisher" not in paper_columns:
+                connection.execute("ALTER TABLE papers ADD COLUMN institution_publisher TEXT")
+            if "institution_state" not in paper_columns:
+                connection.execute("ALTER TABLE papers ADD COLUMN institution_state TEXT")
 
     @contextmanager
     def allow_deleting_writes(self) -> Iterator[None]:
@@ -237,13 +251,28 @@ class Database:
         library_mode: str,
         items: Iterable[dict[str, Any]],
         reference_manager: str = "zotero",
+        institution_config: dict[str, Any] | None = None,
     ) -> str:
         batch_id = str(uuid.uuid4())
         now = utc_now()
         with self._lock, self.connect() as connection:
             connection.execute(
-                "INSERT INTO batches(id,name,target_library,library_mode,reference_manager,created_at,updated_at) VALUES(?,?,?,?,?,?,?)",
-                (batch_id, name, target_library, library_mode, reference_manager, now, now),
+                """INSERT INTO batches(
+                id,name,target_library,library_mode,reference_manager,
+                institution_config_json,created_at,updated_at
+                ) VALUES(?,?,?,?,?,?,?,?)""",
+                (
+                    batch_id,
+                    name,
+                    target_library,
+                    library_mode,
+                    reference_manager,
+                    json.dumps(institution_config, ensure_ascii=False)
+                    if institution_config is not None
+                    else None,
+                    now,
+                    now,
+                ),
             )
             for position, item in enumerate(items, start=1):
                 connection.execute(
@@ -279,18 +308,88 @@ class Database:
                 FROM batches b LEFT JOIN papers p ON p.batch_id=b.id
                 GROUP BY b.id ORDER BY b.created_at DESC"""
             ).fetchall()
-        return [dict(row) for row in rows]
+        return [self._decode_batch(dict(row)) for row in rows]
 
     def get_batch(self, batch_id: str) -> dict[str, Any] | None:
         with self.connect() as connection:
             batch = _row(connection.execute("SELECT * FROM batches WHERE id=?", (batch_id,)).fetchone())
             if batch is None:
                 return None
+            batch = self._decode_batch(batch)
             papers = connection.execute(
                 "SELECT * FROM papers WHERE batch_id=? ORDER BY position", (batch_id,)
             ).fetchall()
             batch["papers"] = [self._decode_paper(dict(item)) for item in papers]
             return batch
+
+    @staticmethod
+    def _decode_batch(batch: dict[str, Any]) -> dict[str, Any]:
+        raw = batch.pop("institution_config_json", None)
+        if raw:
+            try:
+                batch["institution_config"] = json.loads(raw)
+            except (json.JSONDecodeError, TypeError):
+                batch["institution_config"] = None
+        else:
+            batch["institution_config"] = None
+        return batch
+
+    def ensure_batch_institution_config(
+        self, batch_id: str, institution_config: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Persist the first credential-free institution snapshot for a batch.
+
+        Existing batches have a NULL snapshot after migration.  The conditional
+        update makes their first resume deterministic even if two requests race.
+        """
+        encoded = json.dumps(institution_config, ensure_ascii=False)
+        with self._lock, self.connect() as connection:
+            self._assert_batch_writable(connection, batch_id)
+            connection.execute(
+                """UPDATE batches
+                SET institution_config_json=?, updated_at=?
+                WHERE id=? AND institution_config_json IS NULL""",
+                (encoded, utc_now(), batch_id),
+            )
+            row = connection.execute(
+                "SELECT institution_config_json FROM batches WHERE id=?", (batch_id,)
+            ).fetchone()
+        if row is None:
+            raise KeyError(batch_id)
+        try:
+            value = json.loads(row[0]) if row[0] else {}
+        except (json.JSONDecodeError, TypeError):
+            value = {}
+        return value if isinstance(value, dict) else {}
+
+    def ensure_batch_institution_config_fields(
+        self, batch_id: str, defaults: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Add newly introduced snapshot fields once without changing saved values."""
+        with self._lock, self.connect() as connection:
+            self._assert_batch_writable(connection, batch_id)
+            row = connection.execute(
+                "SELECT institution_config_json FROM batches WHERE id=?", (batch_id,)
+            ).fetchone()
+            if row is None:
+                raise KeyError(batch_id)
+            try:
+                value = json.loads(row[0]) if row[0] else {}
+            except (json.JSONDecodeError, TypeError):
+                value = {}
+            if not isinstance(value, dict):
+                value = {}
+            changed = False
+            for key, default in defaults.items():
+                if key not in value:
+                    value[key] = default
+                    changed = True
+            if changed:
+                connection.execute(
+                    "UPDATE batches SET institution_config_json=?, updated_at=? WHERE id=?",
+                    (json.dumps(value, ensure_ascii=False), utc_now(), batch_id),
+                )
+        return value
 
     def get_paper(self, paper_id: str) -> dict[str, Any] | None:
         with self.connect() as connection:
@@ -342,10 +441,13 @@ class Database:
             "doi", "title", "year", "authors_json", "journal", "metadata_json",
             "metadata_status", "pdf_status", "endnote_status", "status", "version",
             "source_url", "pdf_path", "pdf_sha256", "record_number", "needs_action", "error",
+            "institution_publisher", "institution_state",
         }
         unknown = set(fields) - allowed
         if unknown:
             raise ValueError(f"Unsupported paper fields: {sorted(unknown)}")
+        if fields.get("error") is not None:
+            fields["error"] = redact_diagnostic_text(fields["error"])
         for key in ("authors_json", "metadata_json"):
             if key in fields and not isinstance(fields[key], str):
                 fields[key] = json.dumps(fields[key], ensure_ascii=False)
@@ -366,6 +468,8 @@ class Database:
         unknown = set(fields) - allowed
         if unknown:
             raise ValueError(f"Unsupported batch fields: {sorted(unknown)}")
+        if fields.get("error") is not None:
+            fields["error"] = redact_diagnostic_text(fields["error"])
         fields["updated_at"] = utc_now()
         assignments = ",".join(f"{key}=?" for key in fields)
         with self._lock, self.connect() as connection:
@@ -373,6 +477,7 @@ class Database:
             connection.execute(f"UPDATE batches SET {assignments} WHERE id=?", (*fields.values(), batch_id))
 
     def event(self, batch_id: str, message: str, *, level: str = "info", paper_id: str | None = None) -> None:
+        message = redact_diagnostic_text(message)
         with self._lock, self.connect() as connection:
             self._assert_batch_writable(connection, batch_id)
             connection.execute(
@@ -393,7 +498,14 @@ class Database:
             self._assert_paper_writable(connection, paper_id)
             connection.execute(
                 "INSERT INTO operations(id,paper_id,step,status,details_json,started_at) VALUES(?,?,?,?,?,?)",
-                (operation_id, paper_id, step, "pending", json.dumps(details or {}, ensure_ascii=False), utc_now()),
+                (
+                    operation_id,
+                    paper_id,
+                    step,
+                    "pending",
+                    json.dumps(redact_diagnostic(details or {}), ensure_ascii=False),
+                    utc_now(),
+                ),
             )
         return operation_id
 
@@ -408,7 +520,12 @@ class Database:
                 self._assert_paper_writable(connection, row[0])
             connection.execute(
                 "UPDATE operations SET status=?, details_json=?, finished_at=? WHERE id=?",
-                (status, json.dumps(details or {}, ensure_ascii=False), utc_now(), operation_id),
+                (
+                    status,
+                    json.dumps(redact_diagnostic(details or {}), ensure_ascii=False),
+                    utc_now(),
+                    operation_id,
+                ),
             )
 
     def reset_paper_for_retry(self, paper_id: str) -> None:
@@ -477,6 +594,8 @@ class Database:
                     (batch_id,),
                 ).fetchone()
                 item_error = item.get("error")
+                if item_error is not None:
+                    item_error = redact_diagnostic_text(item_error)
                 if row is None:
                     item_status = "missing"
                     name = str(item.get("name") or batch_id[:8])
@@ -560,6 +679,8 @@ class Database:
         error: str | None = None,
     ) -> None:
         now = utc_now()
+        if error is not None:
+            error = redact_diagnostic_text(error)
         with self._lock, self.connect() as connection:
             values: list[Any] = [status, error, now]
             deleted_sql = ""

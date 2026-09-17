@@ -510,10 +510,23 @@ function paperActions(paper) {
   if (["retry", "reconcile_endnote"].includes(paper.needs_action)) primary.push(`<button type="button" data-paper-action="retry" data-paper="${esc(paper.id)}">重试 / 对账</button>`);
   if (!['complete', 'skipped'].includes(paper.status)) secondary.push(`<button class="danger" type="button" data-paper-action="skip" data-paper="${esc(paper.id)}">跳过</button>`);
   if (!primary.length && !secondary.length) return "";
-  return `<div class="paper-actions">${primary.join("")}${secondary.length ? `<details><summary>更多操作</summary><div>${secondary.join("")}</div></details>` : ""}</div>`;
+  return `<div class="paper-actions">${primary.join("")}${secondary.length ? `<details class="paper-more-actions"><summary>更多操作</summary><div class="paper-more-menu"><div class="paper-more-menu-head"><strong>更多操作</strong><button class="paper-more-close" type="button" aria-label="关闭更多操作菜单">关闭</button></div><div class="paper-more-menu-items">${secondary.join("")}</div></div></details>` : ""}</div>`;
 }
 
 function bindPaperActions(papers) {
+  $$(".paper-more-actions").forEach(menu => menu.addEventListener("toggle", () => {
+    if (!menu.open) return;
+    $$(".paper-more-actions[open]").forEach(other => {
+      if (other !== menu) other.open = false;
+    });
+  }));
+  $$(".paper-more-close").forEach(button => button.addEventListener("click", event => {
+    event.preventDefault();
+    const menu = button.closest(".paper-more-actions");
+    if (!menu) return;
+    menu.open = false;
+    menu.querySelector("summary")?.focus();
+  }));
   $$('[data-paper-action]').forEach(button => button.addEventListener("click", async () => {
     const paper = papers.find(item => item.id === button.dataset.paper);
     const action = button.dataset.paperAction;
@@ -633,7 +646,7 @@ async function pollTasks() {
   state.pollCount += 1;
   try {
     const batchId = state.selectedBatch;
-    if (batchId && !$("#task-detail .more-actions[open]")) {
+    if (batchId && !$("#task-detail .more-actions[open], #task-detail .paper-more-actions[open]")) {
       await renderBatch(batchId, {silent: true});
     }
     if (state.pollCount % 2 === 0) await refreshBatches({renderDetail: false, silent: true});

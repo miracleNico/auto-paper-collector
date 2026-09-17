@@ -331,7 +331,10 @@ td.actions { min-width: 190px; max-width: 270px; }
 .paper-actions button, .upload-label { min-height: 30px; margin: 0; padding: .35rem .5rem; border-radius: 9px; font-size: .7rem; }
 .paper-actions details { width: 100%; }
 .paper-actions details summary { width: max-content; color: var(--blue-600); font-size: .72rem; font-weight: 700; cursor: pointer; }
-.paper-actions details > div { display: flex; gap: .35rem; margin-top: .35rem; flex-wrap: wrap; }
+.paper-more-menu { width: min(230px, 100%); margin-top: .4rem; padding: .5rem; border: 1px solid var(--line); border-radius: 12px; background: white; box-shadow: 0 10px 24px rgba(48, 73, 104, .14); }
+.paper-more-menu-head { display: flex; align-items: center; justify-content: space-between; gap: .5rem; margin-bottom: .4rem; color: var(--ink-soft); font-size: .7rem; }
+.paper-actions .paper-more-close { min-height: 26px; padding: .2rem .45rem; border-color: transparent; color: var(--blue-600); background: var(--blue-50); }
+.paper-more-menu-items { display: flex; gap: .35rem; flex-wrap: wrap; }
 .error-text { margin-top: .3rem; color: var(--danger); font-size: .7rem; line-height: 1.4; overflow-wrap: anywhere; }
 
 .empty-state, .loading-state {

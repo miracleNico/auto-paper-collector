@@ -56,6 +56,8 @@
    `Always Allow`。
 6. 新建任务，填写 Zotero collection 名称，并粘贴 DOI、题名或导入 CSV。
 
+完成后可点击网页右上角的“关闭服务”；它只会停止本地收藏夹服务，不会关闭 Zotero、EndNote 或浏览器。
+
 首次启动会创建 `.venv`，并安装 `requirements.lock` 中锁定的依赖。也可以指定端口或禁止自动打开浏览器：
 
 ```powershell
@@ -321,6 +323,8 @@ DOI、論文タイトル、または CSV を渡していただければ、書誌
    `Always Allow` を選びます。
 6. 新しいタスクを作り、Zotero collection 名と DOI、タイトル、または CSV を入力します。
 
+終了時は画面右上の「关闭服务」をクリックできます。停止するのはローカルの収集サービスだけで、Zotero、EndNote、ブラウザーは終了しません。
+
 初回起動では `.venv` が作成され、`requirements.lock` の依存関係がインストールされます。
 
 ```powershell
@@ -564,6 +568,8 @@ The runtime does not depend on a conversational AI or agent. See
 4. The application opens at [http://127.0.0.1:8765](http://127.0.0.1:8765).
 5. Open Settings, authorize local Zotero writes, and select `Always Allow` in Zotero.
 6. Create a task, enter the target Zotero collection, and paste DOIs or titles, or import a CSV file.
+
+When finished, use “关闭服务” in the upper-right corner. It stops only the local collector service, not Zotero, EndNote, or the browser.
 
 The first run creates `.venv` and installs the versions pinned in `requirements.lock`.
 

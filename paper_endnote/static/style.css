@@ -94,6 +94,8 @@ body::after { right: -95px; bottom: 8%; border-color: rgba(239, 148, 182, .18); 
 }
 .brand h1 { margin: 0; font-size: clamp(1.2rem, 2.3vw, 1.55rem); letter-spacing: -.025em; }
 .brand p { margin: .15rem 0 0; color: var(--muted); font-size: .78rem; letter-spacing: .04em; }
+.header-actions { display: flex; align-items: center; justify-content: flex-end; gap: .55rem; }
+.header-shutdown { min-height: 34px; border-radius: 999px; padding: .48rem .72rem; font-size: .76rem; }
 
 main { width: min(1480px, calc(100% - 3rem)); margin: .75rem auto 4rem; }
 h2 { margin: 0; font-size: 1.2rem; line-height: 1.3; letter-spacing: -.015em; }
@@ -475,6 +477,8 @@ dialog::backdrop { background: rgba(35, 47, 66, .46); backdrop-filter: blur(3px)
   main { margin-top: .35rem; }
   .brand p { display: none; }
   .app-header { align-items: flex-start; }
+  .header-actions { flex-wrap: wrap; }
+  .header-shutdown { min-height: 32px; padding: .42rem .62rem; }
   .tabs { width: 100%; }
   .tab { flex: 1 0 auto; }
   .tab span { display: none; }

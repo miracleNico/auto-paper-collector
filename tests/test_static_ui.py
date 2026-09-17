@@ -94,6 +94,12 @@ class PaperActionMenuTests(unittest.TestCase):
         self.assertIn("state.toolSourcesController?.abort()", self.javascript)
         self.assertIn("token !== state.toolSourcesRequestToken", self.javascript)
 
+    def test_header_has_confirmed_local_service_shutdown(self) -> None:
+        self.assertIn('id="shutdown-service"', self.html)
+        self.assertIn('class="danger header-shutdown"', self.html)
+        self.assertIn('window.confirm("关闭本地论文收藏夹服务？', self.javascript)
+        self.assertIn('"/api/system/shutdown"', self.javascript)
+
     def test_endnote_to_zotero_sync_form_uses_sync_endpoint(self) -> None:
         self.assertIn('id="sync-endnote-zotero-form"', self.html)
         self.assertIn("EndNote → Zotero", self.html)

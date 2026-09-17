@@ -75,6 +75,23 @@ def _batch_with_pdf(root: Path) -> tuple[Database, str, str, Path]:
 
 
 class ToolApiTests(unittest.IsolatedAsyncioTestCase):
+    async def test_shutdown_endpoint_schedules_graceful_server_exit(self) -> None:
+        from paper_endnote import app as app_module
+
+        called = asyncio.Event()
+        previous_callback = app_module.app.state.shutdown_callback
+        previous_requested = app_module.app.state.shutdown_requested
+        app_module.app.state.shutdown_callback = called.set
+        app_module.app.state.shutdown_requested = False
+        try:
+            result = await app_module.shutdown_local_service()
+            await asyncio.wait_for(called.wait(), timeout=1)
+        finally:
+            app_module.app.state.shutdown_callback = previous_callback
+            app_module.app.state.shutdown_requested = previous_requested
+
+        self.assertEqual(result["status"], "shutting_down")
+
     async def test_library_tool_request_distinguishes_omitted_and_empty_item_ids(self) -> None:
         from paper_endnote import app as app_module
 

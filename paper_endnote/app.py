@@ -102,6 +102,8 @@ async def lifespan(_: FastAPI):
 
 
 app = FastAPI(title="Paper Reference Workflow", version="0.6.0", lifespan=lifespan)
+app.state.shutdown_callback = None
+app.state.shutdown_requested = False
 app.mount("/static", StaticFiles(directory=settings.app_root / "paper_endnote" / "static"), name="static")
 
 
@@ -257,6 +259,17 @@ async def state() -> dict[str, Any]:
             "institution": settings.institution.as_dict(),
         },
     }
+
+
+@app.post("/api/system/shutdown")
+async def shutdown_local_service() -> dict[str, str]:
+    callback = getattr(app.state, "shutdown_callback", None)
+    if not callable(callback):
+        raise HTTPException(409, "当前启动方式不支持从网页关闭；请在终端结束服务")
+    if not app.state.shutdown_requested:
+        app.state.shutdown_requested = True
+        asyncio.get_running_loop().call_later(0.25, callback)
+    return {"status": "shutting_down", "message": "本地服务正在关闭"}
 
 
 @app.post("/api/zotero/authorize")
@@ -1009,7 +1022,14 @@ def main() -> None:
         parser.error("For safety, --host must be 127.0.0.1 or localhost")
     if not args.no_browser:
         threading.Timer(1.0, lambda: webbrowser.open(f"http://127.0.0.1:{args.port}/")).start()
-    uvicorn.run("paper_endnote.app:app", host=args.host, port=args.port, reload=False)
+    config = uvicorn.Config(app, host=args.host, port=args.port, reload=False)
+    server = uvicorn.Server(config)
+    app.state.shutdown_requested = False
+    app.state.shutdown_callback = lambda: setattr(server, "should_exit", True)
+    try:
+        server.run()
+    finally:
+        app.state.shutdown_callback = None
 
 
 if __name__ == "__main__":

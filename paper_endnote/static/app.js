@@ -1438,6 +1438,21 @@ $("#clear-credentials").addEventListener("click", async event => {
 });
 
 $("#open-institution-login").addEventListener("click", openInstitutionLogin);
+$("#shutdown-service").addEventListener("click", async event => {
+  if (!window.confirm("关闭本地论文收藏夹服务？正在运行的任务会停止。")) return;
+  const button = event.currentTarget;
+  setButtonBusy(button, true, "正在关闭…");
+  try {
+    const result = await api("/api/system/shutdown", {method: "POST", body: "{}"});
+    $("#system-badge").textContent = result.message || "服务正在关闭";
+    $("#system-badge").className = "badge warn";
+    button.textContent = "正在关闭…";
+    toast("本地服务正在关闭，可以关闭此页面");
+  } catch (error) {
+    setButtonBusy(button, false);
+    toast(error.message);
+  }
+});
 $("#rename-source").addEventListener("change", () => syncToolSource("rename"));
 $("#export-source").addEventListener("change", async () => { syncToolSource("export"); await loadExportItems(); });
 $("#rename-zotero-library").addEventListener("change", async () => { await loadZoteroCollections("rename"); });

@@ -17,6 +17,7 @@ from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, PlainTex
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
+from . import __version__
 from .config import Settings
 from .credentials import (
     CredentialError,
@@ -101,7 +102,7 @@ async def lifespan(_: FastAPI):
     await pipeline.close()
 
 
-app = FastAPI(title="Paper Reference Workflow", version="0.6.0", lifespan=lifespan)
+app = FastAPI(title="Paper Reference Workflow", version=__version__, lifespan=lifespan)
 app.state.shutdown_callback = None
 app.state.shutdown_requested = False
 app.mount("/static", StaticFiles(directory=settings.app_root / "paper_endnote" / "static"), name="static")
@@ -245,7 +246,7 @@ async def index() -> FileResponse:
 @app.get("/api/state")
 async def state() -> dict[str, Any]:
     return {
-        "version": "0.6.0",
+        "version": __version__,
         "runtime_dir": str(settings.runtime_dir),
         "config_path": str(settings.config_path),
         "endnote": probe_endnote(settings.endnote_exe, settings.endnote_library),

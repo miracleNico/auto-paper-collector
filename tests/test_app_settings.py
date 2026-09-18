@@ -401,6 +401,9 @@ class SettingsUpdateTests(unittest.IsolatedAsyncioTestCase):
             ):
                 result = await app_module.state()
 
+            from paper_endnote import __version__
+
+            self.assertEqual(result["version"], __version__)
             self.assertEqual(
                 result["institution_access_types"],
                 ["ezproxy", "carsi_saml", "manual_browser"],

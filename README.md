@@ -34,7 +34,7 @@
 ### 出发前的准备
 
 - Windows 10 / 11
-- Python 3.12
+- Python 3.12 – 3.14
 - Google Chrome
 - Zotero 10 或更高版本
 - EndNote 21 或更高版本，仅在需要导入 EndNote 时使用
@@ -300,7 +300,7 @@ DOI、論文タイトル、または CSV を渡していただければ、書誌
 ### お迎え前の準備
 
 - Windows 10 / 11
-- Python 3.12
+- Python 3.12 – 3.14
 - Google Chrome
 - Zotero 10 以降
 - EndNote 21 以降（EndNote へ取り込む場合のみ）
@@ -548,7 +548,7 @@ The runtime does not depend on a conversational AI or agent. See
 ### What to prepare
 
 - Windows 10 or 11
-- Python 3.12
+- Python 3.12 – 3.14
 - Google Chrome
 - Zotero 10 or later
 - EndNote 21 or later, only when EndNote import is required

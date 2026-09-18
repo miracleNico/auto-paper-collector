@@ -1,4 +1,4 @@
-param(
+﻿param(
     [int]$Port = 8765,
     [switch]$NoBrowser
 )
@@ -6,17 +6,49 @@ param(
 $ErrorActionPreference = 'Stop'
 $projectRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
 $venvPython = Join-Path $projectRoot '.venv\Scripts\python.exe'
+$supportedPython = @('3.14', '3.13', '3.12')
 
-if (-not (Test-Path -LiteralPath $venvPython)) {
+function Get-PythonVersion([string]$Executable) {
+    # Probes must not throw on stderr output under Windows PowerShell 5.1.
+    $ErrorActionPreference = 'Continue'
+    $version = & $Executable -c "import sys; print('%d.%d' % sys.version_info[:2])" 2>$null
+    if ($LASTEXITCODE -eq 0 -and $version) { return "$version".Trim() }
+    return $null
+}
+
+function Find-SupportedPython {
+    $ErrorActionPreference = 'Continue'
+    # 'py -0p' only lists installed runtimes, so probing never triggers an install.
     $pyLauncher = Get-Command py -ErrorAction SilentlyContinue
-    $pythonCommand = Get-Command python -ErrorAction SilentlyContinue
     if ($pyLauncher) {
-        & $pyLauncher.Source -3.12 -m venv (Join-Path $projectRoot '.venv')
-    } elseif ($pythonCommand) {
-        & $pythonCommand.Source -m venv (Join-Path $projectRoot '.venv')
-    } else {
-        throw '未找到 Python。请先安装 Python 3.12。'
+        $installed = @{}
+        foreach ($line in (& $pyLauncher.Source -0p 2>$null)) {
+            if ($line -match '^\s*-V:(3\.\d+)(?:-64)?\s+\*?\s*(\S.*?\.exe)\s*$' -and -not $installed.ContainsKey($Matches[1])) {
+                $installed[$Matches[1]] = $Matches[2]
+            }
+        }
+        foreach ($version in $supportedPython) {
+            if ($installed.ContainsKey($version) -and (Get-PythonVersion $installed[$version]) -eq $version) {
+                return $installed[$version]
+            }
+        }
     }
+    $pythonCommand = Get-Command python -ErrorAction SilentlyContinue
+    if ($pythonCommand -and ($supportedPython -contains (Get-PythonVersion $pythonCommand.Source))) {
+        return $pythonCommand.Source
+    }
+    return $null
+}
+
+if (Test-Path -LiteralPath $venvPython) {
+    $venvVersion = Get-PythonVersion $venvPython
+    if ($supportedPython -notcontains $venvVersion) {
+        Write-Warning "现有 .venv 使用 Python $venvVersion，不在支持范围 3.12–3.14 内。如遇问题，请删除 .venv 后重新运行本脚本。"
+    }
+} else {
+    $basePython = Find-SupportedPython
+    if (-not $basePython) { throw '未找到 Python 3.12–3.14。请先安装其中一个版本。' }
+    & $basePython -m venv (Join-Path $projectRoot '.venv')
     if ($LASTEXITCODE -ne 0) { throw '无法创建 Python 虚拟环境。' }
 }
 

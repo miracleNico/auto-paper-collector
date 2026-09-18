@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import tempfile
+import threading
 import unittest
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -269,6 +270,81 @@ class ToolApiTests(unittest.IsolatedAsyncioTestCase):
         export.assert_called_once_with(
             selected, destination.resolve(), item_ids={"ref:1"}
         )
+
+    def _blocking_rename(self, started: threading.Event, release: threading.Event, seen: list):
+        def rename(*_args, **_kwargs):
+            seen.append(threading.current_thread())
+            started.set()
+            release.wait(5)
+            return {"renamed": 0}
+
+        return rename
+
+    async def test_endnote_rename_runs_off_the_event_loop(self) -> None:
+        from paper_endnote import app as app_module
+
+        loop_thread = threading.current_thread()
+        started, release, seen = threading.Event(), threading.Event(), []
+        settings = type("ToolSettings", (), {"endnote_library": None})()
+        with (
+            patch.object(app_module, "settings", settings),
+            patch.object(
+                app_module,
+                "rename_endnote_pdfs",
+                side_effect=self._blocking_rename(started, release, seen),
+            ),
+        ):
+            task = asyncio.create_task(
+                app_module.tool_rename_pdfs(
+                    app_module.LibraryToolRequest(
+                        source="endnote", endnote_library=r"D:\Research\Selected.enl"
+                    )
+                )
+            )
+            # These sleeps only complete if the loop is free while the rename blocks.
+            for _ in range(200):
+                if started.is_set():
+                    break
+                await asyncio.sleep(0.01)
+            self.assertTrue(started.is_set())
+            self.assertFalse(task.done())
+            release.set()
+            result = await task
+
+        self.assertEqual(result, {"renamed": 0})
+        self.assertIsNot(seen[0], loop_thread)
+
+    async def test_cancelled_rename_keeps_tool_lock_until_worker_finishes(self) -> None:
+        from paper_endnote import app as app_module
+
+        started, release, seen = threading.Event(), threading.Event(), []
+        settings = type("ToolSettings", (), {"endnote_library": None})()
+        with (
+            patch.object(app_module, "settings", settings),
+            patch.object(
+                app_module,
+                "rename_endnote_pdfs",
+                side_effect=self._blocking_rename(started, release, seen),
+            ),
+        ):
+            task = asyncio.create_task(
+                app_module.tool_rename_pdfs(
+                    app_module.LibraryToolRequest(
+                        source="endnote", endnote_library=r"D:\Research\Selected.enl"
+                    )
+                )
+            )
+            while not started.is_set():
+                await asyncio.sleep(0.01)
+            task.cancel()
+            await asyncio.sleep(0.05)
+            # The worker thread is still renaming files: no other tool may start yet.
+            self.assertTrue(app_module.library_tool_operation_lock().locked())
+            release.set()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+
+        self.assertFalse(app_module.library_tool_operation_lock().locked())
 
     async def test_endnote_tool_keeps_configured_library_as_legacy_fallback(self) -> None:
         from paper_endnote import app as app_module

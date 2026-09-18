@@ -8,9 +8,10 @@ import threading
 import webbrowser
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 from weakref import WeakKeyDictionary
 
+import anyio
 import uvicorn
 from fastapi import FastAPI, File, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, PlainTextResponse, Response
@@ -92,6 +93,27 @@ def library_tool_operation_lock() -> asyncio.Lock:
         lock = asyncio.Lock()
         _LIBRARY_TOOL_OPERATION_LOCKS[loop] = lock
     return lock
+
+
+async def run_blocking(func: Callable[..., Any], /, *args: Any, **kwargs: Any) -> Any:
+    """Run blocking library file work in a worker thread so the event loop stays responsive.
+
+    A thread cannot be interrupted, so the caller's locks and guards must stay held until
+    it finishes even if the request is cancelled. anyio's shield absorbs cancel-scope
+    cancellation without busy re-delivery; asyncio.shield covers a native Task.cancel(),
+    which is re-raised once the thread is done.
+    """
+    work = asyncio.ensure_future(asyncio.to_thread(func, *args, **kwargs))
+    with anyio.CancelScope(shield=True):
+        try:
+            return await asyncio.shield(work)
+        except asyncio.CancelledError:
+            while not work.done():
+                try:
+                    await asyncio.shield(work)
+                except asyncio.CancelledError:
+                    pass
+            raise
 
 
 @asynccontextmanager
@@ -501,7 +523,8 @@ async def tool_rename_pdfs(payload: LibraryToolRequest) -> dict[str, Any]:
                 require_batch(batch_id, writable=True)
                 async with pipeline.track_batch_work(batch_id, cancellable=False):
                     async with pipeline.zotero_operation_guard():
-                        return rename_batch_pdfs(
+                        return await run_blocking(
+                            rename_batch_pdfs,
                             database,
                             batch_id,
                             naming_scheme=payload.rename_scheme,
@@ -519,7 +542,8 @@ async def tool_rename_pdfs(payload: LibraryToolRequest) -> dict[str, Any]:
                         deduplicate_pdfs=payload.deduplicate_pdfs,
                     )
             if payload.source == "endnote":
-                return rename_endnote_pdfs(
+                return await run_blocking(
+                    rename_endnote_pdfs,
                     selected_endnote_library(payload),
                     naming_scheme=payload.rename_scheme,
                     deduplicate_pdfs=payload.deduplicate_pdfs,
@@ -550,7 +574,7 @@ async def tool_export_pdf_candidates(payload: LibraryToolRequest) -> dict[str, A
             if not batch_id:
                 raise LibraryFilesError("请选择本机批次")
             batch = require_batch(batch_id)
-            items = list_batch_pdf_items(database, batch_id)
+            items = await run_blocking(list_batch_pdf_items, database, batch_id)
             source_name = batch["name"]
         elif payload.source == "zotero":
             collection = payload.collection.strip()
@@ -569,7 +593,7 @@ async def tool_export_pdf_candidates(payload: LibraryToolRequest) -> dict[str, A
             )
         elif payload.source == "endnote":
             library = selected_endnote_library(payload)
-            items = list_endnote_pdf_items(library)
+            items = await run_blocking(list_endnote_pdf_items, library)
             source_name = library.stem
         else:
             raise LibraryFilesError("未知数据区")
@@ -601,7 +625,9 @@ async def tool_export_pdfs(payload: LibraryToolRequest) -> dict[str, Any]:
                 lib_name = batch["target_library"]
                 destination = resolve_export_dir(payload.destination) if payload.destination.strip() else downloads_library_dir(lib_name)
                 async with pipeline.track_batch_work(batch_id, cancellable=False):
-                    result = export_batch_pdfs(database, batch_id, destination, item_ids=item_ids)
+                    result = await run_blocking(
+                        export_batch_pdfs, database, batch_id, destination, item_ids=item_ids
+                    )
             elif payload.source == "zotero":
                 source_name = (
                     payload.collection.strip()
@@ -631,7 +657,9 @@ async def tool_export_pdfs(payload: LibraryToolRequest) -> dict[str, Any]:
                     if payload.destination.strip()
                     else downloads_library_dir(library.stem)
                 )
-                result = export_endnote_data_pdfs(library, destination, item_ids=item_ids)
+                result = await run_blocking(
+                    export_endnote_data_pdfs, library, destination, item_ids=item_ids
+                )
             else:
                 raise LibraryFilesError("未知数据区")
             if payload.open_folder:

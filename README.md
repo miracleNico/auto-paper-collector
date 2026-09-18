@@ -27,6 +27,7 @@
 - 粉蓝白响应式界面，包含新建任务、批次、工具和设置四个页面，当然要有一点猫娘审美！
 - 支持单个或多个批次预览、停止并删除及磁盘清理。
 - 设置项帮助收在旁边的 `?` 中，支持鼠标、键盘和 Escape。
+- 附带 [auto-paper-find-skill](#让-skill-帮你凑齐论文清单)：在 Codex 里用 `$auto-paper-find-skill` 把模糊线索或选题要求整理成可直接导入的清单。
 
 运行时不依赖对话式 AI 或 Agent。自动化边界和实测结果见
 [`docs/automation-feasibility.md`](docs/automation-feasibility.md)。
@@ -72,6 +73,28 @@
 
 运行数据库、PDF、配置、Zotero 授权密钥和专用浏览器会话保存在 `runtime/`，不会进入源码包。
 
+### 让 skill 帮你凑齐论文清单
+
+只记得“那篇提出 Transformer 的文章”，或者只想要“近五年关于某个主题的十篇论文”？可以先请仓库里的 [auto-paper-find-skill](skills/auto-paper-find-skill/SKILL.md) 出马：它会联网检索、核实论文身份并去重，再用本项目自己的输入解析器校验格式，最后交给你一份能直接导入的 CSV（想要 TXT 也可以）。
+
+1. 把 skill 装进 Codex，也就是复制到 `$CODEX_HOME/skills`（未设置时为 `~/.codex/skills`）。在项目目录的 PowerShell 中运行：
+
+   ```powershell
+   $codexHome = if ($env:CODEX_HOME) { $env:CODEX_HOME } else { Join-Path $HOME '.codex' }
+   New-Item -ItemType Directory -Force (Join-Path $codexHome 'skills') | Out-Null
+   Copy-Item -Recurse -Force .\skills\auto-paper-find-skill (Join-Path $codexHome 'skills')
+   ```
+
+   以后 skill 有更新时，再运行一次即可覆盖旧版本。
+
+2. 在新的 Codex 会话里用 `$` **显式**叫它。这个 skill 关闭了隐式触发，普通的“帮我找论文”不会惊动它；请在请求里写出 `$auto-paper-find-skill`，或者先在技能选择器里选中 `auto-paper-find`：
+
+   > 使用 $auto-paper-find-skill，找近五年关于延迟容忍网络路由的 10 篇论文，生成本项目可导入的 CSV；不确定的论文单独列出。
+
+3. 结果默认放在 `outputs/paper-input/<时间戳>/`。在“新建任务”里导入或粘贴这份 CSV 就能开工；如果做过检索或筛选，同名的 `.sources.md` 会列出来源链接和还没确认的论文。
+
+skill 只负责备好清单，不会自己启动采集，也不会写入 Zotero 或 EndNote。什么时候出发，还是由你说了算喵。
+
 ### 小猫的工作路线
 
 1. 输入 DOI、完整题名或 CSV。
@@ -85,14 +108,7 @@
 
 ### 投喂格式
 
-可以使用仓库内的 [auto-paper-find-skill](skills/auto-paper-find-skill/SKILL.md)，把模糊论文清单、论文简称或研究要求整理为经过核实的 TXT/CSV。将 `skills/auto-paper-find-skill` 文件夹复制到 `$CODEX_HOME/skills`（未设置时为 `~/.codex/skills`）后，在支持 skills 的会话中调用，例如：
-
-该 skill 已关闭隐式触发；普通的“帮我找论文”请求不会自动调用它。请在请求中显式写出 `$auto-paper-find-skill`，或先在界面的技能选择器中选中 `auto-paper-find`。
-
-> 使用 $auto-paper-find-skill，找近五年关于延迟容忍网络路由的 10 篇论文，生成本项目可导入的 CSV；不确定的论文单独列出。
-
-该 skill 会生成文件并调用项目输入解析器验证格式；默认不启动采集。也可以手动按下面格式准备列表喵~
-每行一个 DOI 或完整题名：
+不想手写清单时，可以先[请 skill 帮忙](#让-skill-帮你凑齐论文清单)。自己准备也很简单喵~ 每行一个 DOI 或完整题名：
 
 ```text
 10.1038/nature12373
@@ -305,6 +321,7 @@ DOI、論文タイトル、または CSV を渡していただければ、書誌
 - 猫娘らしいピンク・ブルー・ホワイトのレスポンシブ UI
 - 単一または複数バッチの選択、削除前確認、安全なディスク整理
 - マウス、キーボード、Escape に対応した `?` ヘルプ
+- 同梱の [auto-paper-find-skill](#skill-で論文リストを用意する)：Codex で `$auto-paper-find-skill` と呼ぶと、あいまいな手がかりやテーマから取り込み用リストを作成
 
 実行時に対話型 AI や Agent は必要ありません。自動化の範囲と検証結果は
 [`docs/automation-feasibility.md`](docs/automation-feasibility.md) を参照してください。
@@ -352,6 +369,28 @@ DOI、論文タイトル、または CSV を渡していただければ、書誌
 データベース、PDF、設定、Zotero の認証キー、専用ブラウザープロファイルは
 `runtime/` に保存されます。
 
+### skill で論文リストを用意する
+
+「Transformer を提案したあの論文」のようなあいまいな手がかりや、「直近 5 年の○○に関する論文を 10 本」といった要望から始めたいときは、リポジトリ同梱の [auto-paper-find-skill](skills/auto-paper-find-skill/SKILL.md) が先回りしてお手伝いします。ネットで検索して論文の同一性を確かめ、重複を除き、このプロジェクト自身の入力パーサーで形式を検証してから、そのまま取り込める CSV（TXT も可）を用意します。
+
+1. skill を Codex にインストールします。コピー先は `$CODEX_HOME/skills`（未設定なら `~/.codex/skills`）です。プロジェクトフォルダーの PowerShell で次を実行します。
+
+   ```powershell
+   $codexHome = if ($env:CODEX_HOME) { $env:CODEX_HOME } else { Join-Path $HOME '.codex' }
+   New-Item -ItemType Directory -Force (Join-Path $codexHome 'skills') | Out-Null
+   Copy-Item -Recurse -Force .\skills\auto-paper-find-skill (Join-Path $codexHome 'skills')
+   ```
+
+   skill が更新されたときも、同じコマンドをもう一度実行すれば上書きできます。
+
+2. 新しい Codex セッションで、`$` を付けて**明示的に**呼び出します。この skill は暗黙の呼び出しを無効にしているため、「論文を探して」と頼むだけでは動きません。依頼文に `$auto-paper-find-skill` と書くか、スキル選択画面で `auto-paper-find` を選んでください。
+
+   > $auto-paper-find-skill を使って、遅延耐性ネットワークのルーティングに関する直近 5 年の論文を 10 本探し、このプロジェクトに取り込める CSV を作ってください。確認できない論文は別に一覧にしてください。
+
+3. 結果は既定で `outputs/paper-input/<タイムスタンプ>/` に保存されます。「新しいタスク」画面でこの CSV を取り込むか貼り付ければ準備完了です。検索や絞り込みを行った場合は、同名の `.sources.md` に出典リンクと未確認の論文がまとめられています。
+
+skill の仕事はリストの準備までです。収集を始めたり Zotero や EndNote に書き込んだりはしないので、出発の合図はいつもどおりあなたからお願いしますにゃ。
+
 ### お仕事の流れ
 
 1. DOI、完全な論文タイトル、または CSV を入力します。
@@ -365,7 +404,7 @@ DOI、論文タイトル、または CSV を渡していただければ、書誌
 
 ### 論文の渡し方
 
-1 行に DOI または完全なタイトルを 1 件ずつ入力します。
+手でリストを書く代わりに、[skill に任せる](#skill-で論文リストを用意する)こともできます。自分で用意する場合は、1 行に DOI または完全なタイトルを 1 件ずつ入力します。
 
 ```text
 10.1038/nature12373
@@ -565,6 +604,7 @@ Everything runs locally on Windows and listens only on `127.0.0.1` by default. T
 - One-way synchronization of EndNote records and PDFs into a selected Zotero collection
 - Catgirl-approved pink, blue, and white responsive interface with keyboard-accessible help
 - Single and multi-batch deletion with previews and safe disk cleanup
+- A bundled [auto-paper-find-skill](#let-the-skill-round-up-your-paper-list) for Codex: call `$auto-paper-find-skill` to turn vague leads or a research topic into an importable list
 
 The runtime does not depend on a conversational AI or agent. See
 [`docs/automation-feasibility.md`](docs/automation-feasibility.md) for automation boundaries and acceptance results.
@@ -609,6 +649,28 @@ When dependencies need downloading, I sniff out a route in this order: the local
 
 The database, downloaded files, configuration, Zotero authorization key, and dedicated browser profile are stored under `runtime/`.
 
+### Let the skill round up your paper list
+
+Only remember "that paper that introduced the Transformer", or just want "ten papers on some topic from the last five years"? The bundled [auto-paper-find-skill](skills/auto-paper-find-skill/SKILL.md) can go hunting first: it searches online, confirms each paper's identity, removes duplicates, checks the format with this project's own input parser, and hands you a CSV that is ready to import (or TXT, if you prefer).
+
+1. Install the skill for Codex by copying it into `$CODEX_HOME/skills` (`~/.codex/skills` when unset). In PowerShell, from the project directory:
+
+   ```powershell
+   $codexHome = if ($env:CODEX_HOME) { $env:CODEX_HOME } else { Join-Path $HOME '.codex' }
+   New-Item -ItemType Directory -Force (Join-Path $codexHome 'skills') | Out-Null
+   Copy-Item -Recurse -Force .\skills\auto-paper-find-skill (Join-Path $codexHome 'skills')
+   ```
+
+   Run the same commands again whenever the skill is updated; they overwrite the old copy.
+
+2. In a new Codex session, invoke it **explicitly** with `$`. Implicit invocation is turned off, so a plain "find me some papers" will not wake it: write `$auto-paper-find-skill` in your request, or pick `auto-paper-find` in the skill picker first.
+
+   > Use $auto-paper-find-skill to find 10 papers from the last five years on routing in delay-tolerant networks and produce a CSV this project can import; list any papers you cannot confirm separately.
+
+3. Results land in `outputs/paper-input/<timestamp>/` by default. Import or paste the CSV on the New task page and you are ready to go. If any searching or filtering happened, a matching `.sources.md` lists the source links and the papers still awaiting confirmation.
+
+The skill only prepares the list: it never starts a collection run or writes to Zotero or EndNote, so when to set off is still your call. I will be ready when you are.
+
 ### How the paper-pawline works
 
 1. Enter DOIs, full paper titles, or a CSV file.
@@ -622,7 +684,7 @@ Optional saved EZProxy credentials go only to **Windows Credential Manager**. CA
 
 ### How to feed me papers
 
-Enter one DOI or complete title per line:
+Rather than writing the list by hand, you can [let the skill round it up](#let-the-skill-round-up-your-paper-list). To write it yourself, enter one DOI or complete title per line:
 
 ```text
 10.1038/nature12373

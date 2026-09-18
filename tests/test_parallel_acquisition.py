@@ -312,7 +312,9 @@ class ParallelAcquisitionTests(unittest.IsolatedAsyncioTestCase):
 
             paper = db.get_paper(paper_id)
             self.assertEqual(paper["pdf_status"], "verified")
-            self.assertEqual(Path(paper["pdf_path"]), manual)
+            # Staged browser downloads are stored resolved; the temp dir may be
+            # an 8.3 short path (e.g. RUNNER~1 on CI), so compare canonical paths.
+            self.assertEqual(Path(paper["pdf_path"]).resolve(), manual.resolve())
             self.assertTrue(manual.exists())
 
     async def test_browser_download_during_post_race_gap_is_not_dropped(self) -> None:

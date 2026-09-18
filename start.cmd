@@ -1,4 +1,20 @@
-﻿param(
+<# : batch part - PowerShell reads this block as a comment
+@echo off
+setlocal
+rem One launcher for double-click, cmd, Windows PowerShell 5.1 and PowerShell 7.
+rem The PowerShell part below runs as a script block, which the default
+rem "Restricted" execution policy allows (it only blocks .ps1 files).
+set "PAPER_ENDNOTE_LAUNCHER=%~f0"
+set "PAPER_ENDNOTE_LAUNCHER_DIR=%~dp0"
+rem A PowerShell 7 parent leaks its module path, which breaks Windows PowerShell 5.1.
+set "PSModulePath="
+powershell.exe -NoProfile -Command "& ([scriptblock]::Create((Get-Content -LiteralPath $env:PAPER_ENDNOTE_LAUNCHER -Raw -Encoding UTF8))) %*"
+set "EXIT_CODE=%ERRORLEVEL%"
+rem Keep a double-clicked window open long enough to read the error.
+if %EXIT_CODE% GEQ 1 pause
+exit /b %EXIT_CODE%
+#>
+param(
     [int]$Port = 8765,
     [switch]$NoBrowser,
     # Local proxy port for installing dependencies; skips proxy auto-detection.
@@ -7,7 +23,7 @@
 )
 
 $ErrorActionPreference = 'Stop'
-$projectRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
+$projectRoot = $env:PAPER_ENDNOTE_LAUNCHER_DIR.TrimEnd('\')
 $venvPython = Join-Path $projectRoot '.venv\Scripts\python.exe'
 $supportedPython = @('3.14', '3.13', '3.12')
 $proxyPortGiven = $PSBoundParameters.ContainsKey('ProxyPort')
@@ -170,7 +186,7 @@ if (-not (Test-DependenciesInstalled)) {
 
 $listener = Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction SilentlyContinue
 if ($listener) {
-    throw "端口 $Port 已被占用。请关闭已有服务，或用 .\start.ps1 -Port <其他端口>。"
+    throw "端口 $Port 已被占用。请关闭已有服务，或用 .\start.cmd -Port <其他端口>。"
 }
 
 $arguments = @('-m', 'paper_endnote.app', '--port', "$Port")

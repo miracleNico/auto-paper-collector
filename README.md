@@ -45,11 +45,13 @@
 1. 打开 Zotero。
 2. 进入 `Edit → Settings → Advanced`，启用
    **Allow other applications on this computer to communicate with Zotero**。
-3. 在 PowerShell 中进入项目目录：
+3. 双击项目目录里的 `start.cmd`；也可以在 PowerShell 或命令提示符中进入项目目录运行：
 
    ```powershell
-   .\start.ps1
+   .\start.cmd
    ```
+
+   Windows 自带的 PowerShell 5.1 和 PowerShell 7 都能用，也不用改执行策略，门小猫自己会开喵。
 
 4. 浏览器会打开 [http://127.0.0.1:8765](http://127.0.0.1:8765)。
 5. 在“设置”中点击“授权 Zotero 本地写入”，再在 Zotero 弹窗中选择
@@ -61,9 +63,9 @@
 首次启动时，我会挑选电脑上已安装的最新 Python（3.12 – 3.14）来创建 `.venv`，再装好 `requirements.lock` 中锁定的依赖。也可以指定端口、不自动打开浏览器，或者直接告诉我代理端口：
 
 ```powershell
-.\start.ps1 -Port 8766
-.\start.ps1 -NoBrowser
-.\start.ps1 -ProxyPort 7890
+.\start.cmd -Port 8766
+.\start.cmd -NoBrowser
+.\start.cmd -ProxyPort 7890
 ```
 
 安装依赖需要联网时，我会按这个顺序找路：`-ProxyPort` 指定的本机代理端口 → `HTTPS_PROXY` / `HTTP_PROXY` 环境变量或 pip 配置里的代理 → 系统代理（PAC 自动配置脚本也认得）。实在找不到，我会停下来问你本机代理的端口；直接按回车，就不走代理直接出门喵。
@@ -322,11 +324,13 @@ DOI、論文タイトル、または CSV を渡していただければ、書誌
 2. `Edit → Settings → Advanced` を開き、
    **Allow other applications on this computer to communicate with Zotero**
    を有効にします。
-3. PowerShell でプロジェクトフォルダーを開きます。
+3. プロジェクトフォルダーの `start.cmd` をダブルクリックします。PowerShell やコマンドプロンプトから起動する場合は、プロジェクトフォルダーで次を実行します。
 
    ```powershell
-   .\start.ps1
+   .\start.cmd
    ```
+
+   Windows 標準の PowerShell 5.1 でも PowerShell 7 でも動き、実行ポリシーを変更する必要はありません。扉は猫娘が開けておきますにゃ。
 
 4. [http://127.0.0.1:8765](http://127.0.0.1:8765) がブラウザーで開きます。
 5. 「設定」で Zotero のローカル書き込みを承認し、Zotero の確認画面で
@@ -338,9 +342,9 @@ DOI、論文タイトル、または CSV を渡していただければ、書誌
 初回起動では、インストール済みの Python（3.12 – 3.14）からいちばん新しいものを選んで `.venv` を作り、`requirements.lock` の依存関係をインストールします。ポートの指定、ブラウザーの自動起動の停止、プロキシのポート指定もできます。
 
 ```powershell
-.\start.ps1 -Port 8766
-.\start.ps1 -NoBrowser
-.\start.ps1 -ProxyPort 7890
+.\start.cmd -Port 8766
+.\start.cmd -NoBrowser
+.\start.cmd -ProxyPort 7890
 ```
 
 依存関係をダウンロードするときは、`-ProxyPort` で指定したローカルプロキシのポート → `HTTPS_PROXY` / `HTTP_PROXY` 環境変数または pip 設定のプロキシ → システムプロキシ（PAC 自動構成スクリプトにも対応）の順に道を探します。どれも見つからなければ、ローカルプロキシのポートをお尋ねします。Enter だけを押すと、プロキシを使わずに直接つなぎますにゃ。
@@ -579,11 +583,13 @@ The runtime does not depend on a conversational AI or agent. See
 1. Start Zotero.
 2. Open `Edit → Settings → Advanced` and enable
    **Allow other applications on this computer to communicate with Zotero**.
-3. Open PowerShell in the project directory and run:
+3. Double-click `start.cmd` in the project directory, or run it from PowerShell or Command Prompt there:
 
    ```powershell
-   .\start.ps1
+   .\start.cmd
    ```
+
+   It works with the Windows PowerShell 5.1 that ships with Windows as well as PowerShell 7, and there is no execution policy to change: I can open that door myself.
 
 4. The application opens at [http://127.0.0.1:8765](http://127.0.0.1:8765).
 5. Open Settings, authorize local Zotero writes, and select `Always Allow` in Zotero.
@@ -594,9 +600,9 @@ When finished, use “关闭服务” in the upper-right corner. It stops only t
 On the first run I pick the newest installed Python (3.12 – 3.14), create `.venv`, and install the versions pinned in `requirements.lock`. You can also choose a port, skip opening the browser, or hand me a proxy port:
 
 ```powershell
-.\start.ps1 -Port 8766
-.\start.ps1 -NoBrowser
-.\start.ps1 -ProxyPort 7890
+.\start.cmd -Port 8766
+.\start.cmd -NoBrowser
+.\start.cmd -ProxyPort 7890
 ```
 
 When dependencies need downloading, I sniff out a route in this order: the local proxy port given with `-ProxyPort`, a proxy from `HTTPS_PROXY` / `HTTP_PROXY` or the pip configuration, then the Windows system proxy (PAC auto-config scripts included). If nothing turns up, I will stop and ask for your local proxy port; just press Enter to go direct.

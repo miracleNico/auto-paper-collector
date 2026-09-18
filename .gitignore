@@ -4,10 +4,14 @@
 .pytest_cache/
 .mypy_cache/
 .coverage
+build/
+dist/
+*.egg-info/
 .env
 .idea/
 .vscode/
 runtime/
+.runtime/
 work/
 outputs/
 playwright-profile/

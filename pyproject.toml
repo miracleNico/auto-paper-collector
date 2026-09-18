@@ -28,5 +28,16 @@ version = {attr = "paper_endnote.__version__"}
 [tool.setuptools.packages.find]
 include = ["paper_endnote*"]
 
+[tool.ruff]
+target-version = "py312"
+
+[tool.ruff.lint]
+# Ruff's conservative default set, pinned so a ruff upgrade cannot widen it.
+select = ["E4", "E7", "E9", "F"]
+
+[tool.ruff.lint.per-file-ignores]
+# Standalone acceptance script: puts the project on sys.path before importing it.
+"tests/six_paper_acceptance.py" = ["E402"]
+
 [tool.setuptools.package-data]
 paper_endnote = ["static/*", "presets/*.toml"]

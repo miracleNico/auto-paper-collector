@@ -9,7 +9,6 @@ eligible. The detailed manifest is intended for ``outputs/`` (git-ignored).
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 import random
 import secrets

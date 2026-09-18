@@ -236,6 +236,13 @@ Text Translation: Unicode (UTF-8)
 .\.venv\Scripts\python.exe -m unittest discover -s tests -p "test_*.py" -v
 ```
 
+代码检查（需先安装开发依赖）：
+
+```powershell
+.\.venv\Scripts\python.exe -m pip install -r requirements-dev.lock
+.\.venv\Scripts\python.exe -m ruff check .
+```
+
 从 EndNote 附件目录按 SHA-256 去重后，以固定随机种子生成 20 篇可复现样本：
 
 ```powershell
@@ -497,6 +504,13 @@ Text Translation: Unicode (UTF-8)
   --output outputs\test-batch-20-sample.json
 ```
 
+静的チェック（開発用の依存関係が必要です）：
+
+```powershell
+.\.venv\Scripts\python.exe -m pip install -r requirements-dev.lock
+.\.venv\Scripts\python.exe -m ruff check .
+```
+
 標準の 20 件は `examples/test_batch_20.csv` です。サンプラーは EndNote ライブラリを変更せず、SHA-256 で重複を除外し、冒頭ページから DOI とタイトルを確認できる本文 PDF のみを採用します。manifest には `--pdf-root` からの相対パスのみを保存します。CARSI と手動セッションはローカル模擬ページと自動テストまで完了していますが、**実際の大学アカウント、購読資料、実文献ライブラリへの書き込みでは未検証です**。機関ログインや実ネットワークを使う開発者向け検証スクリプトは `tests/` にあります。購読コンテンツでは許可された少量のデータだけを使用してください。
 
 オープンアクセスと機関ソースの両方を有効にし、自動機関取得もオンにした場合、各論文で 2 つの経路を同時に開始します。本文の同一性検証に最初に合格した正式版 PDF を採用して、もう一方を停止・清理します。両方が失敗した場合だけ手動キューへ移ります。同じログインセッションを複数ページが競合しないよう、機関ブラウザー操作自体は直列です。PDF 入口の検出が 180 秒を超えると手動キューへ移り、ダウンロード開始後の転送と PDF 検証はこの 180 秒に含まれません。
@@ -739,6 +753,13 @@ Run the unit test suite:
 
 ```powershell
 .\.venv\Scripts\python.exe -m unittest discover -s tests -p "test_*.py" -v
+```
+
+Lint (requires the development dependencies):
+
+```powershell
+.\.venv\Scripts\python.exe -m pip install -r requirements-dev.lock
+.\.venv\Scripts\python.exe -m ruff check .
 ```
 
 Build the reproducible 20-paper sample from read-only EndNote attachment storage:

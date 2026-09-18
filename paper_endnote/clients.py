@@ -10,7 +10,7 @@ from urllib.parse import quote
 import httpx
 
 from .config import Settings
-from .inputs import normalize_doi, title_similarity
+from .inputs import normalize_doi
 from .user_config import InstitutionProfile, institution_openurl, institution_proxy_url, load_preset
 
 

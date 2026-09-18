@@ -77,6 +77,7 @@ class StaticUiPlaywrightTests(unittest.IsolatedAsyncioTestCase):
         self.sources_plan: list[dict] = []
         self.collections_delay = 0.0
         self.collections_fail = False
+        self.session_expired_responses: dict[str, int] = {}
         await self.page.route("**/api/**", self._mock_api)
 
     async def asyncTearDown(self) -> None:
@@ -94,6 +95,17 @@ class StaticUiPlaywrightTests(unittest.IsolatedAsyncioTestCase):
         except json.JSONDecodeError:
             request_payload = {}
         self.api_requests.append((path, request_payload))
+        if self.session_expired_responses.get(path, 0) > 0:
+            self.session_expired_responses[path] -= 1
+            await route.fulfill(
+                status=403,
+                content_type="application/json; charset=utf-8",
+                body=json.dumps(
+                    {"detail": "本地会话已失效，请刷新页面", "code": "session_expired"},
+                    ensure_ascii=False,
+                ),
+            )
+            return
         if path == "/api/state":
             payload = {
                 "settings": {
@@ -241,6 +253,44 @@ class StaticUiPlaywrightTests(unittest.IsolatedAsyncioTestCase):
             content_type="application/json; charset=utf-8",
             body=json.dumps(payload, ensure_ascii=False),
         )
+
+    def _record_root_requests(self) -> list[str]:
+        root_requests: list[str] = []
+        self.page.on(
+            "request",
+            lambda request: root_requests.append(request.method)
+            if urlsplit(request.url).path == "/"
+            else None,
+        )
+        return root_requests
+
+    async def test_api_recovers_session_after_service_restart(self) -> None:
+        await self.page.goto(f"{self.base_url}/index.html")
+        root_requests = self._record_root_requests()
+        self.session_expired_responses["/api/tools/rename-pdfs"] = 1
+
+        result = await self.page.evaluate(
+            "api('/api/tools/rename-pdfs', {method: 'POST', body: '{}'})"
+        )
+
+        self.assertEqual(result["renamed"], 0)
+        rename_calls = [path for path, _ in self.api_requests if path == "/api/tools/rename-pdfs"]
+        self.assertEqual(len(rename_calls), 2)
+        self.assertEqual(root_requests, ["GET"])
+
+    async def test_api_retries_expired_session_only_once(self) -> None:
+        await self.page.goto(f"{self.base_url}/index.html")
+        root_requests = self._record_root_requests()
+        self.session_expired_responses["/api/tools/rename-pdfs"] = 5
+
+        with self.assertRaisesRegex(PlaywrightError, "本地会话已失效，请刷新页面"):
+            await self.page.evaluate(
+                "api('/api/tools/rename-pdfs', {method: 'POST', body: '{}'})"
+            )
+
+        rename_calls = [path for path, _ in self.api_requests if path == "/api/tools/rename-pdfs"]
+        self.assertEqual(len(rename_calls), 2)
+        self.assertEqual(root_requests, ["GET"])
 
     async def test_paper_menu_survives_polling_and_has_close_control(self) -> None:
         await self.page.goto(f"{self.base_url}/index.html")

@@ -122,7 +122,12 @@ async def local_only(request: Request, call_next):
         return PlainTextResponse("Cross-origin request rejected", status_code=403)
     if request.method not in {"GET", "HEAD", "OPTIONS"}:
         if request.cookies.get("paper_endnote_session") != SESSION_TOKEN:
-            return PlainTextResponse("Invalid local session", status_code=403)
+            # Usually a tab left open across a service restart; the UI re-fetches
+            # "/" to pick up the new cookie and retries once on this code.
+            return JSONResponse(
+                status_code=403,
+                content={"detail": "本地会话已失效，请刷新页面", "code": "session_expired"},
+            )
     response = await call_next(request)
     if request.url.path == "/":
         response.set_cookie(

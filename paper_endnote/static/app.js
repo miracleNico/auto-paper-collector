@@ -41,7 +41,7 @@ const esc = value => String(value ?? "").replace(/[&<>"']/g, character => ({
   "'": "&#39;",
 })[character]);
 
-async function api(path, options = {}) {
+async function api(path, options = {}, sessionRetried = false) {
   const response = await fetch(path, {
     credentials: "same-origin",
     ...options,
@@ -52,12 +52,23 @@ async function api(path, options = {}) {
   });
   if (!response.ok) {
     let message = await response.text();
+    let payload = null;
     try {
-      const payload = JSON.parse(message);
+      payload = JSON.parse(message);
       message = typeof payload.detail === "string" ? payload.detail : JSON.stringify(payload.detail || payload);
     } catch (_) {}
     const error = new Error(message || `请求失败（${response.status}）`);
     error.status = response.status;
+    if (response.status === 403 && payload?.code === "session_expired" && !sessionRetried) {
+      // The local service restarted and rejected the request before running it.
+      // Loading "/" re-issues the session cookie; then retry once, keeping any typed input.
+      try {
+        await fetch("/", {credentials: "same-origin", cache: "no-store"});
+      } catch (_) {
+        throw error;
+      }
+      return api(path, options, true);
+    }
     throw error;
   }
   return response.headers.get("content-type")?.includes("json") ? response.json() : response.text();

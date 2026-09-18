@@ -80,7 +80,7 @@
           <label id="rename-zotero-library-wrap"><span class="field-label">Zotero 库</span><select id="rename-zotero-library" disabled><option>正在读取…</option></select></label>
           <label id="rename-collection-wrap"><span class="field-label">范围</span><select id="rename-collection" disabled><option>正在读取…</option></select></label>
           <label id="rename-batch-wrap" hidden><span class="field-label">本机批次</span><select id="rename-batch"></select></label>
-          <div id="rename-endnote-wrap" hidden><label class="field-label" for="rename-endnote-library">EndNote 库</label><span class="path-input"><input id="rename-endnote-library" list="endnote-library-paths" placeholder="选择或粘贴 .enl 的绝对路径"><button id="pick-rename-endnote-library" type="button">选择…</button></span></div>
+          <div id="rename-endnote-wrap" hidden><label class="field-label" for="rename-endnote-library">EndNote 库</label><span class="path-input"><input id="rename-endnote-library" list="endnote-library-paths" placeholder="选择或粘贴 .enl 的绝对路径"><button id="pick-rename-endnote-library" class="folder-picker-button" type="button" aria-label="选择 EndNote 库文件" title="选择 EndNote 库文件"><svg class="folder-picker-icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="M3.5 6.75A1.75 1.75 0 0 1 5.25 5h4.1l1.8 2h7.6a1.75 1.75 0 0 1 1.75 1.75v8.5A1.75 1.75 0 0 1 18.75 19H5.25a1.75 1.75 0 0 1-1.75-1.75V6.75Z"/></svg></button></span></div>
           <div class="card-footer"><p id="rename-result" class="result-text" role="status"></p><button class="primary" type="submit" disabled>开始重命名</button></div>
         </form>
 
@@ -91,7 +91,7 @@
           <label id="export-zotero-library-wrap"><span class="field-label">Zotero 库</span><select id="export-zotero-library" disabled><option>正在读取…</option></select></label>
           <label id="export-collection-wrap"><span class="field-label">范围</span><select id="export-collection" disabled><option>正在读取…</option></select></label>
           <label id="export-batch-wrap" hidden><span class="field-label">本机批次</span><select id="export-batch"></select></label>
-          <div id="export-endnote-wrap" hidden><label class="field-label" for="export-endnote-library">EndNote 库</label><span class="path-input"><input id="export-endnote-library" list="endnote-library-paths" placeholder="选择或粘贴 .enl 的绝对路径"><button id="pick-export-endnote-library" type="button">选择…</button></span></div>
+          <div id="export-endnote-wrap" hidden><label class="field-label" for="export-endnote-library">EndNote 库</label><span class="path-input"><input id="export-endnote-library" list="endnote-library-paths" placeholder="选择或粘贴 .enl 的绝对路径"><button id="pick-export-endnote-library" class="folder-picker-button" type="button" aria-label="选择 EndNote 库文件" title="选择 EndNote 库文件"><svg class="folder-picker-icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="M3.5 6.75A1.75 1.75 0 0 1 5.25 5h4.1l1.8 2h7.6a1.75 1.75 0 0 1 1.75 1.75v8.5A1.75 1.75 0 0 1 18.75 19H5.25a1.75 1.75 0 0 1-1.75-1.75V6.75Z"/></svg></button></span></div>
           <div id="export-picker" class="export-picker" aria-busy="false">
             <div class="export-picker-head">
               <label class="check compact"><input id="export-select-all" type="checkbox" disabled> <span>全选可导出论文</span></label>

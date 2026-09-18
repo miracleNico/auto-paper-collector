@@ -66,6 +66,11 @@ class PaperActionMenuTests(unittest.TestCase):
             self.assertIn(f'id="{prefix}-zotero-library"', self.html)
             self.assertIn(f'id="{prefix}-endnote-library"', self.html)
             self.assertIn(f'id="pick-{prefix}-endnote-library"', self.html)
+        self.assertEqual(self.html.count('class="folder-picker-button"'), 2)
+        self.assertEqual(self.html.count('aria-label="选择 EndNote 库文件"'), 2)
+        self.assertNotIn(">选择…</button>", self.html)
+        self.assertIn(".path-input .folder-picker-button {", self.styles)
+        self.assertIn("margin-top: 0", self.styles)
         self.assertNotIn('id="rename-endnote-library" readonly', self.html)
         self.assertIn('id="export-endnote-wrap"', self.html)
         self.assertIn("function selectedZoteroScope(prefix)", self.javascript)
@@ -106,6 +111,9 @@ class PaperActionMenuTests(unittest.TestCase):
     def test_header_has_confirmed_local_service_shutdown(self) -> None:
         self.assertIn('id="shutdown-service"', self.html)
         self.assertIn('class="danger header-shutdown"', self.html)
+        self.assertIn(".header-actions #system-badge, .header-actions .header-shutdown {", self.styles)
+        self.assertIn("width: 8.75rem", self.styles)
+        self.assertIn("height: 36px", self.styles)
         self.assertIn('window.confirm("关闭本地论文收藏夹服务？', self.javascript)
         self.assertIn('"/api/system/shutdown"', self.javascript)
 

@@ -1088,7 +1088,10 @@ async function loadZoteroCollections(prefix, supplied = null) {
 async function pickEndnoteLibrary(prefix) {
   const input = $(`#${prefix}-endnote-library`);
   const button = $(`#pick-${prefix}-endnote-library`);
-  setButtonBusy(button, true, "选择中…");
+  const originalLabel = button.getAttribute("aria-label") || "选择 EndNote 库文件";
+  button.disabled = true;
+  button.setAttribute("aria-busy", "true");
+  button.setAttribute("aria-label", "正在选择 EndNote 库文件");
   try {
     const result = await api("/api/tools/pick-endnote-library", {
       method: "POST",
@@ -1109,7 +1112,9 @@ async function pickEndnoteLibrary(prefix) {
   } catch (error) {
     toast(error.message);
   } finally {
-    setButtonBusy(button, false);
+    button.disabled = false;
+    button.removeAttribute("aria-busy");
+    button.setAttribute("aria-label", originalLabel);
   }
 }
 

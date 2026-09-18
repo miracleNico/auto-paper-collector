@@ -263,6 +263,49 @@ class StaticUiPlaywrightTests(unittest.IsolatedAsyncioTestCase):
         await expect(menu).not_to_have_attribute("open", "")
         await expect(summary).to_be_focused()
 
+    async def test_header_controls_and_endnote_picker_share_dimensions(self) -> None:
+        await self.page.set_viewport_size({"width": 1200, "height": 800})
+        await self.page.goto(f"{self.base_url}/index.html")
+
+        header_sizes = await self.page.evaluate(
+            """() => {
+                const badge = document.querySelector('#system-badge').getBoundingClientRect();
+                const shutdown = document.querySelector('#shutdown-service').getBoundingClientRect();
+                return {badge: [badge.width, badge.height], shutdown: [shutdown.width, shutdown.height]};
+            }"""
+        )
+        self.assertEqual(header_sizes["badge"], header_sizes["shutdown"])
+
+        await self.page.get_by_role("button", name="工具", exact=True).click()
+        await self.page.locator("#export-source").select_option("endnote")
+        picker = self.page.locator("#pick-export-endnote-library")
+        await expect(picker.locator("svg.folder-picker-icon")).to_have_count(1)
+        input_height = await self.page.locator("#export-endnote-library").evaluate(
+            "node => node.getBoundingClientRect().height"
+        )
+        button_height = await picker.evaluate("node => node.getBoundingClientRect().height")
+        self.assertAlmostEqual(input_height, button_height, delta=0.1)
+        await picker.focus()
+        await expect(picker).to_be_focused()
+
+        await self.page.set_viewport_size({"width": 320, "height": 800})
+        mobile_sizes = await self.page.evaluate(
+            """() => {
+                const badge = document.querySelector('#system-badge').getBoundingClientRect();
+                const shutdown = document.querySelector('#shutdown-service').getBoundingClientRect();
+                return {
+                    badge: [badge.width, badge.height],
+                    shutdown: [shutdown.width, shutdown.height],
+                    overflow: document.documentElement.scrollWidth - window.innerWidth,
+                };
+            }"""
+        )
+        self.assertAlmostEqual(
+            mobile_sizes["badge"][0], mobile_sizes["shutdown"][0], delta=0.1
+        )
+        self.assertEqual(mobile_sizes["badge"][1], mobile_sizes["shutdown"][1])
+        self.assertLessEqual(mobile_sizes["overflow"], 0)
+
     async def test_institution_access_type_switches_visible_fields(self) -> None:
         await self.page.goto(f"{self.base_url}/index.html")
         await self.page.get_by_role("button", name="设置", exact=True).click()

@@ -248,6 +248,9 @@ class BatchFileCleanupTests(unittest.TestCase):
             try:
                 link.symlink_to(outside, target_is_directory=True)
             except OSError as exc:
+                # A skip would silently drop this path-escape guard from CI.
+                if os.environ.get("CI"):
+                    self.fail(f"directory symlinks must be available in CI: {exc}")
                 self.skipTest(f"directory symlinks are unavailable: {exc}")
             with self.assertRaises(BatchCleanupError):
                 cleanup_batch_files(settings, ["paper-link"])

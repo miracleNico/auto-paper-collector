@@ -590,6 +590,9 @@ class LibraryFilesTests(unittest.TestCase):
             try:
                 link.symlink_to(outside)
             except OSError as exc:
+                # A skip would silently drop this path-escape guard from CI.
+                if os.environ.get("CI"):
+                    self.fail(f"file symlinks must be available in CI: {exc}")
                 self.skipTest(f"file symlinks are unavailable: {exc}")
 
             items = list_endnote_pdf_items(library)

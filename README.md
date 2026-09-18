@@ -56,9 +56,9 @@
    `Always Allow`。
 6. 新建任务，填写 Zotero collection 名称，并粘贴 DOI、题名或导入 CSV。
 
-完成后可点击网页右上角的“关闭服务”；它只会停止本地收藏夹服务，不会关闭 Zotero、EndNote 或浏览器。
+完成后可点击网页右上角的“关闭服务”；它只会停止本地收藏夹服务，不会关闭 Zotero、EndNote 或浏览器。服务重启后，还开着的页面不用刷新：下一次操作时我会自己续上会话，填到一半的内容也不会丢喵。
 
-首次启动会创建 `.venv`，并安装 `requirements.lock` 中锁定的依赖。也可以指定端口或禁止自动打开浏览器：
+首次启动时，我会挑选电脑上已安装的最新 Python（3.12 – 3.14）来创建 `.venv`，再装好 `requirements.lock` 中锁定的依赖。也可以指定端口、不自动打开浏览器，或者直接告诉我代理端口：
 
 ```powershell
 .\start.ps1 -Port 8766
@@ -66,7 +66,7 @@
 .\start.ps1 -ProxyPort 7890
 ```
 
-安装依赖时，会依次使用 `-ProxyPort` 指定的本机代理端口、`HTTPS_PROXY` / `HTTP_PROXY` 环境变量或 pip 配置中的代理，以及系统代理（含 PAC 自动配置脚本）；都找不到时会询问本机代理端口，直接回车则直连。
+安装依赖需要联网时，我会按这个顺序找路：`-ProxyPort` 指定的本机代理端口 → `HTTPS_PROXY` / `HTTP_PROXY` 环境变量或 pip 配置里的代理 → 系统代理（PAC 自动配置脚本也认得）。实在找不到，我会停下来问你本机代理的端口；直接按回车，就不走代理直接出门喵。
 
 运行数据库、PDF、配置、Zotero 授权密钥和专用浏览器会话保存在 `runtime/`，不会进入源码包。
 
@@ -236,7 +236,7 @@ Text Translation: Unicode (UTF-8)
 .\.venv\Scripts\python.exe -m unittest discover -s tests -p "test_*.py" -v
 ```
 
-代码检查（需先安装开发依赖）：
+提交前也可以请 ruff 帮小猫挑挑刺（需先安装开发依赖；CI 会跑同一套检查）：
 
 ```powershell
 .\.venv\Scripts\python.exe -m pip install -r requirements-dev.lock
@@ -333,9 +333,9 @@ DOI、論文タイトル、または CSV を渡していただければ、書誌
    `Always Allow` を選びます。
 6. 新しいタスクを作り、Zotero collection 名と DOI、タイトル、または CSV を入力します。
 
-終了時は画面右上の「关闭服务」をクリックできます。停止するのはローカルの収集サービスだけで、Zotero、EndNote、ブラウザーは終了しません。
+終了時は画面右上の「关闭服务」をクリックできます。停止するのはローカルの収集サービスだけで、Zotero、EndNote、ブラウザーは終了しません。サービスを再起動しても、開いたままのページを再読み込みする必要はありません。次の操作のときに猫娘がセッションをつなぎ直すので、入力途中の内容もそのまま残ります。
 
-初回起動では `.venv` が作成され、`requirements.lock` の依存関係がインストールされます。
+初回起動では、インストール済みの Python（3.12 – 3.14）からいちばん新しいものを選んで `.venv` を作り、`requirements.lock` の依存関係をインストールします。ポートの指定、ブラウザーの自動起動の停止、プロキシのポート指定もできます。
 
 ```powershell
 .\start.ps1 -Port 8766
@@ -343,7 +343,7 @@ DOI、論文タイトル、または CSV を渡していただければ、書誌
 .\start.ps1 -ProxyPort 7890
 ```
 
-依存関係のインストール時は、`-ProxyPort` で指定したローカルプロキシのポート、`HTTPS_PROXY` / `HTTP_PROXY` 環境変数または pip 設定のプロキシ、システムプロキシ（PAC 自動構成スクリプトを含む）の順に使用します。どれも見つからない場合はローカルプロキシのポートを尋ね、Enter だけを押すと直接接続します。
+依存関係をダウンロードするときは、`-ProxyPort` で指定したローカルプロキシのポート → `HTTPS_PROXY` / `HTTP_PROXY` 環境変数または pip 設定のプロキシ → システムプロキシ（PAC 自動構成スクリプトにも対応）の順に道を探します。どれも見つからなければ、ローカルプロキシのポートをお尋ねします。Enter だけを押すと、プロキシを使わずに直接つなぎますにゃ。
 
 データベース、PDF、設定、Zotero の認証キー、専用ブラウザープロファイルは
 `runtime/` に保存されます。
@@ -504,7 +504,7 @@ Text Translation: Unicode (UTF-8)
   --output outputs\test-batch-20-sample.json
 ```
 
-静的チェック（開発用の依存関係が必要です）：
+コミット前には、ruff に細かいところまで毛づくろいしてもらえます（開発用の依存関係が必要です。CI でも同じチェックを実行します）：
 
 ```powershell
 .\.venv\Scripts\python.exe -m pip install -r requirements-dev.lock
@@ -589,9 +589,9 @@ The runtime does not depend on a conversational AI or agent. See
 5. Open Settings, authorize local Zotero writes, and select `Always Allow` in Zotero.
 6. Create a task, enter the target Zotero collection, and paste DOIs or titles, or import a CSV file.
 
-When finished, use “关闭服务” in the upper-right corner. It stops only the local collector service, not Zotero, EndNote, or the browser.
+When finished, use “关闭服务” in the upper-right corner. It stops only the local collector service, not Zotero, EndNote, or the browser. If the service restarts, an open page does not need a reload: on your next action I quietly pick the session back up, and anything half-typed stays right where you left it.
 
-The first run creates `.venv` and installs the versions pinned in `requirements.lock`.
+On the first run I pick the newest installed Python (3.12 – 3.14), create `.venv`, and install the versions pinned in `requirements.lock`. You can also choose a port, skip opening the browser, or hand me a proxy port:
 
 ```powershell
 .\start.ps1 -Port 8766
@@ -599,7 +599,7 @@ The first run creates `.venv` and installs the versions pinned in `requirements.
 .\start.ps1 -ProxyPort 7890
 ```
 
-When installing dependencies, the script uses, in order: the local proxy port given with `-ProxyPort`, a proxy from `HTTPS_PROXY` / `HTTP_PROXY` or the pip configuration, then the Windows system proxy (including PAC auto-config scripts). If none is found, it asks for a local proxy port; press Enter to connect directly.
+When dependencies need downloading, I sniff out a route in this order: the local proxy port given with `-ProxyPort`, a proxy from `HTTPS_PROXY` / `HTTP_PROXY` or the pip configuration, then the Windows system proxy (PAC auto-config scripts included). If nothing turns up, I will stop and ask for your local proxy port; just press Enter to go direct.
 
 The database, downloaded files, configuration, Zotero authorization key, and dedicated browser profile are stored under `runtime/`.
 
@@ -755,7 +755,7 @@ Run the unit test suite:
 .\.venv\Scripts\python.exe -m unittest discover -s tests -p "test_*.py" -v
 ```
 
-Lint (requires the development dependencies):
+Before committing, let ruff give the code a quick grooming (needs the development dependencies; CI runs the same checks):
 
 ```powershell
 .\.venv\Scripts\python.exe -m pip install -r requirements-dev.lock

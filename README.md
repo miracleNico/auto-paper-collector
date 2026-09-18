@@ -63,7 +63,10 @@
 ```powershell
 .\start.ps1 -Port 8766
 .\start.ps1 -NoBrowser
+.\start.ps1 -ProxyPort 7890
 ```
+
+安装依赖时，会依次使用 `-ProxyPort` 指定的本机代理端口、`HTTPS_PROXY` / `HTTP_PROXY` 环境变量或 pip 配置中的代理，以及系统代理（含 PAC 自动配置脚本）；都找不到时会询问本机代理端口，直接回车则直连。
 
 运行数据库、PDF、配置、Zotero 授权密钥和专用浏览器会话保存在 `runtime/`，不会进入源码包。
 
@@ -330,7 +333,10 @@ DOI、論文タイトル、または CSV を渡していただければ、書誌
 ```powershell
 .\start.ps1 -Port 8766
 .\start.ps1 -NoBrowser
+.\start.ps1 -ProxyPort 7890
 ```
+
+依存関係のインストール時は、`-ProxyPort` で指定したローカルプロキシのポート、`HTTPS_PROXY` / `HTTP_PROXY` 環境変数または pip 設定のプロキシ、システムプロキシ（PAC 自動構成スクリプトを含む）の順に使用します。どれも見つからない場合はローカルプロキシのポートを尋ね、Enter だけを押すと直接接続します。
 
 データベース、PDF、設定、Zotero の認証キー、専用ブラウザープロファイルは
 `runtime/` に保存されます。
@@ -576,7 +582,10 @@ The first run creates `.venv` and installs the versions pinned in `requirements.
 ```powershell
 .\start.ps1 -Port 8766
 .\start.ps1 -NoBrowser
+.\start.ps1 -ProxyPort 7890
 ```
+
+When installing dependencies, the script uses, in order: the local proxy port given with `-ProxyPort`, a proxy from `HTTPS_PROXY` / `HTTP_PROXY` or the pip configuration, then the Windows system proxy (including PAC auto-config scripts). If none is found, it asks for a local proxy port; press Enter to connect directly.
 
 The database, downloaded files, configuration, Zotero authorization key, and dedicated browser profile are stored under `runtime/`.
 

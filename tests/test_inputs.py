@@ -23,6 +23,25 @@ class InputTests(unittest.TestCase):
     def test_title_similarity(self) -> None:
         self.assertGreater(title_similarity("Attention Is All You Need", "Attention is all you need"), 0.99)
 
+    def test_quoted_title_after_sniffer_sample(self) -> None:
+        import csv
+        import io
+
+        output = io.StringIO()
+        writer = csv.writer(output)
+        writer.writerow(["doi", "title", "year", "author"])
+        for index in range(5):
+            writer.writerow([f"10.1000/{index}", f"Plain title {index}", 2020, "Doe"])
+        title = 'The Market for "Lemons": Quality Uncertainty and the Market Mechanism'
+        writer.writerow(["10.2307/1879431", title, 1970, "George A. Akerlof"])
+
+        parsed = parse_input(output.getvalue())
+        self.assertEqual(len(parsed), 6)
+        self.assertEqual(parsed[-1]["title"], title)
+        self.assertEqual(parsed[-1]["doi"], "10.2307/1879431")
+        self.assertEqual(parsed[-1]["year"], 1970)
+        self.assertEqual(parsed[-1]["author"], "George A. Akerlof")
+
 
 if __name__ == "__main__":
     unittest.main()

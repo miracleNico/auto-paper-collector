@@ -12,6 +12,10 @@ from .redaction import transient_auth_query_keys
 
 ALLOWED_SOURCES = ("open_access", "institution")
 DEFAULT_SOURCES = ("open_access",)
+ALLOWED_ACQUISITION_MODES = (
+    "legacy", "oa_parallel", "publisher_parallel", "full_parallel"
+)
+DEFAULT_ACQUISITION_MODE = "legacy"
 INSTITUTION_ACCESS_TYPES = ("ezproxy", "carsi_saml", "manual_browser")
 DISALLOWED_SOURCE_TOKENS = ("scihub", "sci-hub", "sci_hub", "sci-hub.tw", "scihub.tw")
 PRESET_DIR = Path(__file__).resolve().parent / "presets"
@@ -80,6 +84,7 @@ def _clamp_login_wait(value: object) -> int:
 @dataclass(frozen=True)
 class AcquisitionConfig:
     sources: tuple[str, ...] = DEFAULT_SOURCES
+    acquisition_mode: str = DEFAULT_ACQUISITION_MODE
     ocr: OcrOptions = field(default_factory=OcrOptions)
     institution: InstitutionProfile = field(default_factory=default_institution_profile)
     auto_institution: bool = False
@@ -129,6 +134,14 @@ def normalize_sources(values: list[str] | tuple[str, ...] | None) -> tuple[str, 
     if not seen:
         raise ConfigError("至少选择一个获取来源")
     return tuple(seen)
+
+
+def normalize_acquisition_mode(value: object) -> str:
+    mode = str(value).strip()
+    if mode not in ALLOWED_ACQUISITION_MODES:
+        allowed = "、".join(ALLOWED_ACQUISITION_MODES)
+        raise ConfigError(f"未知获取模式：{mode}。允许值为 {allowed}")
+    return mode
 
 
 def _string_list(value: object) -> tuple[str, ...]:
@@ -300,6 +313,9 @@ def load_acquisition_config(path: Path, *, create: bool = True) -> AcquisitionCo
     login_wait_seconds = _clamp_login_wait(acquisition_raw.get("login_wait_seconds", 600))
     return AcquisitionConfig(
         sources=sources,
+        acquisition_mode=normalize_acquisition_mode(
+            acquisition_raw.get("acquisition_mode", DEFAULT_ACQUISITION_MODE)
+        ),
         ocr=ocr,
         institution=institution,
         auto_institution=auto_institution,
@@ -320,6 +336,7 @@ def dump_acquisition_config(config: AcquisitionConfig) -> str:
     rows = [
         "[acquisition]",
         f"sources = [{', '.join(json.dumps(item) for item in config.sources)}]",
+        f"acquisition_mode = {json.dumps(normalize_acquisition_mode(config.acquisition_mode))}",
         f"auto_institution = {'true' if config.auto_institution else 'false'}",
         f"auto_commit = {'true' if config.auto_commit else 'false'}",
         f"login_wait_seconds = {int(config.login_wait_seconds)}",

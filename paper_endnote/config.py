@@ -6,6 +6,7 @@ from pathlib import Path
 
 from .user_config import (
     AcquisitionConfig,
+    DEFAULT_ACQUISITION_MODE,
     DEFAULT_SOURCES,
     InstitutionProfile,
     OcrOptions,
@@ -31,6 +32,7 @@ class Settings:
     unpaywall_email: str
     config_path: Path
     acquisition_sources: tuple[str, ...] = DEFAULT_SOURCES
+    acquisition_mode: str = DEFAULT_ACQUISITION_MODE
     ocr: OcrOptions = field(default_factory=OcrOptions)
     institution: InstitutionProfile = field(default_factory=default_institution_profile)
     max_pdf_bytes: int = 100 * 1024 * 1024
@@ -67,6 +69,7 @@ class Settings:
             unpaywall_email=os.environ.get("PAPER_ENDNOTE_UNPAYWALL_EMAIL", "").strip(),
             config_path=config_path,
             acquisition_sources=acquisition.sources,
+            acquisition_mode=acquisition.acquisition_mode,
             ocr=acquisition.ocr,
             institution=acquisition.institution,
             auto_institution=acquisition.auto_institution,
@@ -86,6 +89,7 @@ class Settings:
     def acquisition_config(self) -> AcquisitionConfig:
         return AcquisitionConfig(
             sources=self.acquisition_sources,
+            acquisition_mode=self.acquisition_mode,
             ocr=self.ocr,
             institution=self.institution,
             auto_institution=self.auto_institution,

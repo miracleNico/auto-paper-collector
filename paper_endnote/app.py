@@ -58,14 +58,17 @@ from .path_picker import (
 )
 from .reporting import batch_csv
 from .user_config import (
+    ALLOWED_ACQUISITION_MODES,
     ALLOWED_SOURCES,
     ConfigError,
+    DEFAULT_ACQUISITION_MODE,
     DEFAULT_SOURCES,
     INSTITUTION_ACCESS_TYPES,
     OcrOptions,
     institution_from_payload,
     list_presets,
     load_preset,
+    normalize_acquisition_mode,
     normalize_sources,
 )
 
@@ -208,6 +211,7 @@ class SettingsUpdate(BaseModel):
     unpaywall_email: str = ""
     endnote_library: str = ""
     acquisition_sources: list[str] = Field(default_factory=lambda: list(DEFAULT_SOURCES))
+    acquisition_mode: str = DEFAULT_ACQUISITION_MODE
     ocr_enabled: bool = True
     ocr_languages: str = "eng"
     ocr_max_pages: int = 2
@@ -283,6 +287,7 @@ async def state() -> dict[str, Any]:
             "unpaywall_email": settings.unpaywall_email,
             "endnote_library": str(settings.endnote_library) if settings.endnote_library else "",
             "acquisition_sources": list(settings.acquisition_sources),
+            "acquisition_mode": settings.acquisition_mode,
             "ocr_enabled": settings.ocr.enabled,
             "ocr_languages": settings.ocr.languages,
             "ocr_max_pages": settings.ocr.max_pages,
@@ -323,6 +328,7 @@ async def update_settings(payload: SettingsUpdate) -> dict[str, str]:
     provided = payload.model_fields_set
     acquisition_fields = {
         "acquisition_sources",
+        "acquisition_mode",
         "ocr_enabled",
         "ocr_languages",
         "ocr_max_pages",
@@ -395,9 +401,15 @@ async def update_settings(payload: SettingsUpdate) -> dict[str, str]:
             languages=ocr_languages,
             max_pages=ocr_max_pages,
         )
+        acquisition_mode = (
+            normalize_acquisition_mode(payload.acquisition_mode)
+            if "acquisition_mode" in provided
+            else settings.acquisition_mode
+        )
         if provided & acquisition_fields:
             settings.ocr = ocr
             settings.acquisition_sources = sources
+            settings.acquisition_mode = acquisition_mode
             settings.institution = institution
             settings.auto_institution = auto_institution
             if "auto_commit" in provided:
@@ -749,7 +761,7 @@ async def institution_test_access(
 
 @app.get("/api/batches")
 async def list_batches() -> list[dict[str, Any]]:
-    return database.list_batches()
+    return [_batch_with_acquisition_view(batch) for batch in database.list_batches()]
 
 
 @app.post("/api/batches", status_code=201)
@@ -768,6 +780,7 @@ async def create_batch(payload: BatchCreate) -> dict[str, str]:
         institution_config={
             **settings.institution.as_dict(),
             "_acquisition_sources": list(settings.acquisition_sources),
+            "_acquisition_mode": settings.acquisition_mode,
             "_auto_institution": bool(settings.auto_institution),
         },
     )
@@ -800,7 +813,7 @@ async def get_batch(batch_id: str) -> dict[str, Any]:
     batch = database.get_batch(batch_id)
     if not batch:
         raise HTTPException(404, "批次不存在")
-    return batch
+    return _batch_with_acquisition_view(batch)
 
 
 @app.post("/api/batches/{batch_id}/start")
@@ -826,6 +839,8 @@ async def resume_batch(batch_id: str) -> dict[str, str]:
 
 @app.post("/api/batches/{batch_id}/commit")
 async def commit_batch(batch_id: str) -> dict[str, str]:
+    require_batch(batch_id, writable=True)
+    await pipeline.wait_for_batch_acquisition(batch_id)
     require_batch(batch_id, writable=True)
     pipeline.commit(batch_id)
     return {"status": "started"}
@@ -892,68 +907,87 @@ async def candidates(paper_id: str) -> list[dict[str, Any]]:
 
 @app.post("/api/papers/{paper_id}/confirm-metadata")
 async def confirm_metadata(paper_id: str, payload: MetadataConfirm) -> dict[str, str]:
-    require_paper(paper_id, writable=True)
-    metadata = payload.metadata
-    if payload.candidate_id:
-        selected = next((item for item in database.get_candidates(paper_id) if item["id"] == payload.candidate_id), None)
-        if not selected:
-            raise HTTPException(404, "候选题录不存在")
-        metadata = selected["metadata"]
-    if not metadata or not metadata.get("title"):
-        raise HTTPException(400, "需要有效题录")
-    pipeline.confirm_metadata(paper_id, metadata)
+    async with pipeline.paper_operation_guard(paper_id):
+        paper = require_paper(paper_id, writable=True)
+        if paper.get("endnote_status") == "verified":
+            raise HTTPException(409, "该题录已写入目标文献库，不能在此处替换题录")
+        metadata = payload.metadata
+        if payload.candidate_id:
+            selected = next((item for item in database.get_candidates(paper_id) if item["id"] == payload.candidate_id), None)
+            if not selected:
+                raise HTTPException(404, "候选题录不存在")
+            metadata = selected["metadata"]
+        if not metadata or not metadata.get("title"):
+            raise HTTPException(400, "需要有效题录")
+        await pipeline.invalidate_paper_downloads(paper_id, close_pages=True)
+        pipeline.confirm_metadata(paper_id, metadata)
     return {"status": "accepted"}
 
 
 @app.post("/api/papers/{paper_id}/resolve-doi")
 async def resolve_doi(paper_id: str, payload: DOIUpdate) -> dict[str, str]:
-    paper = require_paper(paper_id, writable=True)
     doi = normalize_doi(payload.doi)
     if not doi:
         raise HTTPException(400, "DOI 格式无效")
-    if paper.get("endnote_status") == "verified":
-        raise HTTPException(409, "该题录已写入目标文献库，不能在此处替换 DOI")
-    database.replace_candidates(paper_id, [])
-    database.update_paper(
-        paper_id,
-        input_doi=doi,
-        doi=None,
-        title=None,
-        year=None,
-        authors_json=[],
-        journal=None,
-        metadata_json={},
-        metadata_status="pending",
-        pdf_status="pending",
-        endnote_status="pending",
-        status="queued",
-        version=None,
-        source_url=None,
-        pdf_path=None,
-        pdf_sha256=None,
-        institution_publisher=None,
-        institution_state=None,
-        needs_action=None,
-        error=None,
-    )
-    database.event(paper["batch_id"], f"已补充 DOI，重新解析：{doi}", paper_id=paper_id)
-    pipeline.start(paper["batch_id"])
+    async with pipeline.paper_operation_guard(paper_id):
+        paper = require_paper(paper_id, writable=True)
+        if paper.get("endnote_status") == "verified":
+            raise HTTPException(409, "该题录已写入目标文献库，不能在此处替换 DOI")
+        await pipeline.invalidate_paper_downloads(paper_id, close_pages=True)
+        database.replace_candidates(paper_id, [])
+        database.update_paper(
+            paper_id,
+            input_doi=doi,
+            doi=None,
+            title=None,
+            year=None,
+            authors_json=[],
+            journal=None,
+            metadata_json={},
+            metadata_status="pending",
+            pdf_status="pending",
+            endnote_status="pending",
+            status="queued",
+            version=None,
+            source_url=None,
+            pdf_path=None,
+            pdf_sha256=None,
+            institution_publisher=None,
+            institution_state=None,
+            needs_action=None,
+            error=None,
+        )
+        database.event(paper["batch_id"], f"已补充 DOI，重新解析：{doi}", paper_id=paper_id)
+        pipeline.start(paper["batch_id"])
     return {"status": "queued", "doi": doi}
 
 
 @app.post("/api/papers/{paper_id}/retry")
 async def retry_paper(paper_id: str) -> dict[str, str]:
-    paper = require_paper(paper_id, writable=True)
-    database.reset_paper_for_retry(paper_id)
-    pipeline.start(paper["batch_id"])
+    require_paper(paper_id, writable=True)
+    await pipeline.retry_paper(paper_id)
     return {"status": "queued"}
+
+
+def _batch_with_acquisition_view(batch: dict[str, Any]) -> dict[str, Any]:
+    snapshot = batch.get("institution_config")
+    if not isinstance(snapshot, dict):
+        snapshot = {}
+    mode = snapshot.get("_acquisition_mode", DEFAULT_ACQUISITION_MODE)
+    batch["acquisition_mode"] = (
+        mode if mode in ALLOWED_ACQUISITION_MODES else DEFAULT_ACQUISITION_MODE
+    )
+    batch["acquisition_progress"] = pipeline.acquisition_progress(batch["id"])
+    return batch
 
 
 @app.post("/api/papers/{paper_id}/skip")
 async def skip_paper(paper_id: str) -> dict[str, str]:
-    paper = require_paper(paper_id, writable=True)
-    database.update_paper(paper_id, status="skipped", needs_action=None, error=None)
-    database.event(paper["batch_id"], "已跳过", paper_id=paper_id)
+    async with pipeline.paper_operation_guard(paper_id):
+        paper = require_paper(paper_id, writable=True)
+        await pipeline.invalidate_paper_downloads(paper_id, close_pages=True)
+        database.update_paper(paper_id, status="skipped", needs_action=None, error=None)
+        database.event(paper["batch_id"], "已跳过", paper_id=paper_id)
     return {"status": "skipped"}
 
 
@@ -963,39 +997,44 @@ async def upload_pdf(paper_id: str, file: UploadFile = File(...)) -> dict[str, A
     if not file.filename or not file.filename.casefold().endswith(".pdf"):
         raise HTTPException(400, "请选择 PDF 文件")
     async with pipeline.track_batch_work(paper["batch_id"], cancellable=False):
-        temporary = settings.runtime_dir / "uploads" / paper_id / Path(file.filename).name
-        temporary.parent.mkdir(parents=True, exist_ok=True)
-        size = 0
-        try:
-            with temporary.open("wb") as handle:
-                while chunk := await file.read(1024 * 1024):
-                    size += len(chunk)
-                    if size > settings.max_pdf_bytes:
-                        raise HTTPException(413, "PDF 超过 100 MB 限制")
-                    handle.write(chunk)
-            result = await pipeline.accept_local_pdf(paper_id, temporary)
-            return result
-        finally:
-            temporary.unlink(missing_ok=True)
+        async with pipeline.paper_operation_guard(paper_id):
+            require_paper(paper_id, writable=True)
+            await pipeline.invalidate_paper_downloads(paper_id)
+            temporary = settings.runtime_dir / "uploads" / paper_id / Path(file.filename).name
+            temporary.parent.mkdir(parents=True, exist_ok=True)
+            size = 0
+            try:
+                with temporary.open("wb") as handle:
+                    while chunk := await file.read(1024 * 1024):
+                        size += len(chunk)
+                        if size > settings.max_pdf_bytes:
+                            raise HTTPException(413, "PDF 超过 100 MB 限制")
+                        handle.write(chunk)
+                result = await pipeline.accept_local_pdf(paper_id, temporary)
+                return result
+            finally:
+                temporary.unlink(missing_ok=True)
 
 
 @app.post("/api/papers/{paper_id}/confirm-pdf")
 async def confirm_pdf(paper_id: str, payload: PDFConfirm) -> dict[str, str]:
-    paper = require_paper(paper_id, writable=True)
-    if not payload.accept:
-        if paper.get("pdf_path"):
-            Path(paper["pdf_path"]).unlink(missing_ok=True)
+    async with pipeline.paper_operation_guard(paper_id):
+        paper = require_paper(paper_id, writable=True)
+        await pipeline.invalidate_paper_downloads(paper_id, close_pages=True)
+        if not payload.accept:
+            if paper.get("pdf_path"):
+                Path(paper["pdf_path"]).unlink(missing_ok=True)
+            database.update_paper(
+                paper_id, pdf_status="rejected", status="needs_pdf", pdf_path=None,
+                pdf_sha256=None, needs_action="manual_pdf", error="用户拒绝候选 PDF",
+            )
+            return {"status": "rejected"}
+        if not paper.get("pdf_path"):
+            raise HTTPException(400, "没有待确认的 PDF")
         database.update_paper(
-            paper_id, pdf_status="rejected", status="needs_pdf", pdf_path=None,
-            pdf_sha256=None, needs_action="manual_pdf", error="用户拒绝候选 PDF",
+            paper_id, pdf_status="accepted", status="endnote_pending", version=payload.version,
+            endnote_status="pending", needs_action="commit_endnote", error=None,
         )
-        return {"status": "rejected"}
-    if not paper.get("pdf_path"):
-        raise HTTPException(400, "没有待确认的 PDF")
-    database.update_paper(
-        paper_id, pdf_status="accepted", status="endnote_pending", version=payload.version,
-        endnote_status="pending", needs_action="commit_endnote", error=None,
-    )
     return {"status": "accepted"}
 
 
@@ -1006,7 +1045,8 @@ async def open_paper(
     paper = require_paper(paper_id, writable=True)
     try:
         async with pipeline.track_batch_work(paper["batch_id"], cancellable=True):
-            await pipeline.open_paper_url(paper_id, scholar=scholar, resolver=resolver)
+            async with pipeline.paper_operation_guard(paper_id):
+                await pipeline.open_paper_url(paper_id, scholar=scholar, resolver=resolver)
     except BatchDeletingError:
         raise
     except Exception as exc:
@@ -1019,7 +1059,9 @@ async def acquire_institution(paper_id: str) -> dict[str, Any]:
     paper = require_paper(paper_id, writable=True)
     try:
         async with pipeline.track_batch_work(paper["batch_id"], cancellable=True):
-            result = await pipeline.acquire_institution_pdf(paper_id)
+            async with pipeline.paper_operation_guard(paper_id):
+                await pipeline.invalidate_paper_downloads(paper_id, close_pages=True)
+                result = await pipeline.acquire_institution_pdf(paper_id)
     except NeedsManualInstitutionAction as exc:
         return {"status": "waiting", "action": exc.as_dict()}
     except Exception as exc:
@@ -1032,7 +1074,8 @@ async def continue_institution(paper_id: str) -> dict[str, Any]:
     paper = require_paper(paper_id, writable=True)
     try:
         async with pipeline.track_batch_work(paper["batch_id"], cancellable=True):
-            return await pipeline.continue_institution_pdf(paper_id)
+            async with pipeline.paper_operation_guard(paper_id):
+                return await pipeline.continue_institution_pdf(paper_id)
     except Exception as exc:
         raise HTTPException(409, redact_diagnostic_text(exc)) from exc
 

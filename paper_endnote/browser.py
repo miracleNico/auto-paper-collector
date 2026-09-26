@@ -90,7 +90,10 @@ class BrowserSession:
         self._contexts: dict[str, Any] = {}
         self._context_profile_id: str | None = None
         self._lock = asyncio.Lock()
-        self._acquire_lock = asyncio.Lock()
+        self._login_locks: dict[tuple[str, str], asyncio.Lock] = {}
+        self._paper_locks: dict[str, asyncio.Lock] = {}
+        self._paper_contexts: dict[str, Any] = {}
+        self._paper_operations: dict[str, dict[asyncio.Task, int]] = {}
         self._active_paper_id: str | None = None
         self._download_callback: DownloadCallback | None = None
         self._blocked_papers: set[str] = set()
@@ -98,6 +101,7 @@ class BrowserSession:
         self._page_papers: dict[int, str | None] = {}
         self._pages_by_paper: dict[str, dict[int, Any]] = {}
         self._download_tasks: dict[str, set[asyncio.Task]] = {}
+        self._pending_popup_downloads: set[asyncio.Task] = set()
         self._institution_pages: dict[str, Any] = {}
         self._institution_targets: dict[str, str] = {}
         self._institution_publishers: dict[str, str] = {}
@@ -124,6 +128,79 @@ class BrowserSession:
         if profile_id == "mcgill":
             return base
         return base.parent / f"{base.name}-{profile_id}"
+
+    async def _context_for(self, profile: InstitutionProfile) -> Any:
+        await self.start(profile)
+        context = self._contexts.get(self._profile_id(profile))
+        if context is None:
+            raise BrowserError("机构浏览器会话未启动")
+        return context
+
+    def _login_lock(self, profile: InstitutionProfile, publisher: str) -> asyncio.Lock:
+        locks = self.__dict__.setdefault("_login_locks", {})
+        return locks.setdefault(session_key(profile, publisher), asyncio.Lock())
+
+    def _paper_lock(self, paper_id: str) -> asyncio.Lock:
+        locks = self.__dict__.setdefault("_paper_locks", {})
+        return locks.setdefault(paper_id, asyncio.Lock())
+
+    def publisher_for_url(
+        self, url: str, *, profile: InstitutionProfile | None = None
+    ) -> str:
+        """Recognize configured EZproxy hosts without trusting arbitrary substrings."""
+        profile = self._profile(profile)
+        host = (urlparse(url).hostname or "").casefold()
+        for proxy_host in profile.ezproxy_hosts or ():
+            suffix = "." + proxy_host.casefold().strip(".")
+            if not host.endswith(suffix):
+                continue
+            encoded = host[: -len(suffix)]
+            if encoded in {"ieeexplore-ieee-org", "ieee-org"}:
+                return "ieee"
+            if encoded in {"www-sciencedirect-com", "sciencedirect-com", "elsevier-com"}:
+                return "sciencedirect"
+        return publisher_key(url)
+
+    async def resolve_publisher_for_paper(
+        self, url: str, *, profile: InstitutionProfile | None = None
+    ) -> str:
+        """Resolve a DOI in a background tab before assigning publisher capacity."""
+        profile = self._profile(profile)
+        known = self.publisher_for_url(url, profile=profile)
+        if known != "generic":
+            return known
+        context = await self._context_for(profile)
+        page = await context.new_page()
+        self._bind_page(page, None)
+        try:
+            async with asyncio.timeout(30):
+                await page.goto(url, wait_until="domcontentloaded", timeout=30_000)
+            if self._is_login_url(page.url, profile):
+                return "generic"
+            return self.publisher_for_url(page.url, profile=profile)
+        except Exception:
+            return "generic"
+        finally:
+            with suppress(Exception):
+                await page.close()
+
+    def _track_operation(self, paper_id: str) -> asyncio.Task | None:
+        task = asyncio.current_task()
+        if task is not None:
+            operations = self.__dict__.setdefault("_paper_operations", {}).setdefault(paper_id, {})
+            operations[task] = operations.get(task, 0) + 1
+        return task
+
+    def _forget_operation(self, paper_id: str, task: asyncio.Task | None) -> None:
+        tasks = getattr(self, "_paper_operations", {}).get(paper_id)
+        if tasks is not None and task is not None:
+            count = tasks.get(task, 0)
+            if count <= 1:
+                tasks.pop(task, None)
+            else:
+                tasks[task] = count - 1
+            if not tasks:
+                self._paper_operations.pop(paper_id, None)
 
     async def start(self, profile: InstitutionProfile | None = None) -> None:
         profile = self._profile(profile)
@@ -165,7 +242,6 @@ class BrowserSession:
                 context.on("page", self._handle_context_page)
                 for page in context.pages:
                     self._bind_page(page, None)
-                    await self._reveal(page)
             except Exception as exc:
                 raise BrowserError(
                     f"无法启动专用 Chrome：{redact_diagnostic_text(exc)}"
@@ -184,15 +260,31 @@ class BrowserSession:
         self._bound_pages.add(page_key)
         page.on(
             "download",
-            lambda download: self._schedule_download(
-                download, self._page_papers.get(page_key)
-            ),
+            lambda download: self._handle_page_download(page, download),
         )
+        page.on("popup", lambda popup: self._bind_page(popup, self._page_papers.get(page_key)))
         page.on("close", lambda *_: self._forget_page(page_key))
+
+    def _handle_page_download(self, page, download) -> None:
+        paper_id = self._page_papers.get(id(page))
+        if paper_id:
+            self._schedule_download(download, paper_id)
+            return
+        # A context-level page event can precede its opener binding.
+        with suppress(RuntimeError):
+            task = asyncio.create_task(self._schedule_popup_download(page, download))
+            pending = self.__dict__.setdefault("_pending_popup_downloads", set())
+            pending.add(task)
+            task.add_done_callback(pending.discard)
+
+    async def _schedule_popup_download(self, page, download) -> None:
+        await self._inherit_opener_binding(page)
+        self._schedule_download(download, self._page_papers.get(id(page)))
 
     def _handle_context_page(self, page) -> None:
         """Bind popups to their opener, never to a global active-paper hint."""
-        self._bind_page(page, None)
+        if id(page) not in self._bound_pages:
+            self._bind_page(page, None)
         with suppress(RuntimeError):
             asyncio.create_task(self._inherit_opener_binding(page))
 
@@ -271,10 +363,10 @@ class BrowserSession:
     ) -> None:
         if paper_id and paper_id in self._blocked_papers:
             raise BrowserError("论文所属批次正在删除")
-        await self.start(profile)
+        profile = self._profile(profile)
+        context = await self._context_for(profile)
         self._active_paper_id = paper_id
-        assert self._context is not None
-        page = await self._context.new_page()
+        page = await context.new_page()
         self._bind_page(page, paper_id)
         await page.goto(url, wait_until="domcontentloaded", timeout=45_000)
         await self._reveal(page)
@@ -399,16 +491,13 @@ class BrowserSession:
                 page_url=result["page_url"],
                 detail=f"请在 Chrome 中完成 {profile.name} 登录，然后继续检查",
             )
-        await self.start(profile)
+        context = await self._context_for(profile)
         name = profile.name
-        async with self._acquire_lock:
-            await self.start(profile)
-            assert self._context is not None
-            page = await self._context.new_page()
+        async with self._login_lock(profile, publisher or self.publisher_for_url(entry_url, profile=profile)):
+            page = await context.new_page()
             self._bind_page(page, None)
             try:
                 await self._open_institution_entry(page, entry_url, profile=profile)
-                await self._reveal(page)
                 await page.wait_for_timeout(2000)
                 if not self._is_login_url(page.url, profile):
                     return
@@ -619,6 +708,22 @@ class BrowserSession:
         publisher: str | None = None,
         profile: InstitutionProfile | None = None,
     ) -> dict[str, Any]:
+        task = self._track_operation(paper_id)
+        try:
+            return await self._open_institution_access_impl(
+                paper_id, target_url, publisher=publisher, profile=profile
+            )
+        finally:
+            self._forget_operation(paper_id, task)
+
+    async def _open_institution_access_impl(
+        self,
+        paper_id: str,
+        target_url: str,
+        *,
+        publisher: str | None = None,
+        profile: InstitutionProfile | None = None,
+    ) -> dict[str, Any]:
         """Open and retain one CARSI/manual page for user takeover."""
         if paper_id in self._blocked_papers:
             raise BrowserError("论文所属批次正在删除")
@@ -627,9 +732,11 @@ class BrowserSession:
         access_type = profile_access_type(profile)
         if access_type == "ezproxy":
             raise BrowserError("EZproxy 不使用人工接管入口")
-        await self.start(profile)
-        async with self._acquire_lock:
-            await self.start(profile)
+        context = await self._context_for(profile)
+        login_lock = self._login_lock(
+            profile, publisher or self.publisher_for_url(target_url, profile=profile)
+        )
+        async with login_lock:
             existing = self._institution_pages.get(paper_id)
             if existing is not None:
                 with suppress(Exception):
@@ -646,8 +753,7 @@ class BrowserSession:
                             "page_url": existing.url,
                             "paper_id": paper_id,
                         }
-            assert self._context is not None
-            page = await self._context.new_page()
+            page = await context.new_page()
             bound_paper_id = (
                 None if paper_id.startswith("__institution_login__-") else paper_id
             )
@@ -657,14 +763,24 @@ class BrowserSession:
             self._institution_targets[paper_id] = target_url
             self._institution_profiles[paper_id] = profile
             publisher_hint = publisher if publisher and publisher != "generic" else None
-            resolved_publisher = publisher_hint or publisher_key(target_url)
+            resolved_publisher = publisher_hint or self.publisher_for_url(target_url, profile=profile)
             self._institution_publishers[paper_id] = resolved_publisher
+            redirected_lock: asyncio.Lock | None = None
             try:
                 # DOI URLs do not identify the publisher. Resolve the article
                 # first, then choose a publisher-specific WAYFless URL.
                 await page.goto(target_url, wait_until="domcontentloaded", timeout=60_000)
-                resolved_publisher = publisher_hint or publisher_key(page.url)
+                landed_publisher = self.publisher_for_url(page.url, profile=profile)
+                resolved_publisher = (
+                    publisher_hint
+                    if self._is_login_url(page.url, profile) or landed_publisher == "generic"
+                    else landed_publisher
+                ) or landed_publisher
                 self._institution_publishers[paper_id] = resolved_publisher
+                actual_lock = self._login_lock(profile, resolved_publisher)
+                if actual_lock is not login_lock:
+                    await actual_lock.acquire()
+                    redirected_lock = actual_lock
                 state = self.institution_session_state(resolved_publisher, profile=profile)
                 if state in {SessionState.WAITING.value, SessionState.EXPIRED.value}:
                     wanted_key = session_key(profile, resolved_publisher)
@@ -755,6 +871,9 @@ class BrowserSession:
                         detail=str(exc),
                     ) from exc
                 raise
+            finally:
+                if redirected_lock is not None:
+                    redirected_lock.release()
 
     async def open_institution_login(
         self,
@@ -784,11 +903,9 @@ class BrowserSession:
         profile: InstitutionProfile,
     ) -> None:
         """Bind a fresh article tab to a previously authenticated session."""
-        await self.start(profile)
-        async with self._acquire_lock:
-            await self.start(profile)
-            assert self._context is not None
-            page = await self._context.new_page()
+        context = await self._context_for(profile)
+        async with self._paper_lock(paper_id):
+            page = await context.new_page()
             self._bind_page(page, paper_id)
             self._institution_pages[paper_id] = page
             self._institution_targets[paper_id] = target_url
@@ -894,7 +1011,11 @@ class BrowserSession:
     async def _fetch_pdf(
         self, paper_id: str, candidates: list[dict[str, str]], destination: Path
     ) -> dict[str, Any]:
-        assert self._context is not None
+        # Bound when the article tab is created; another profile can start at
+        # any time without changing the cookies used by this request.
+        context = getattr(self, "_paper_contexts", {}).get(paper_id)
+        if context is None:
+            raise BrowserError("论文没有绑定机构浏览器会话")
         queue = sorted(candidates, key=self._rank_candidate, reverse=True)
         visited: set[str] = set()
         errors: list[str] = []
@@ -905,7 +1026,7 @@ class BrowserSession:
                 continue
             visited.add(url)
             try:
-                response = await self._context.request.get(
+                response = await context.request.get(
                     url,
                     headers={"Accept": "application/pdf,text/html;q=0.8,*/*;q=0.5"},
                     timeout=60_000,
@@ -990,6 +1111,27 @@ class BrowserSession:
         profile: InstitutionProfile | None = None,
         on_download_started: DownloadStartCallback | None = None,
     ) -> dict[str, Any]:
+        task = self._track_operation(paper_id)
+        try:
+            return await self._continue_institution_access_impl(
+                paper_id,
+                target_url,
+                publisher=publisher,
+                profile=profile,
+                on_download_started=on_download_started,
+            )
+        finally:
+            self._forget_operation(paper_id, task)
+
+    async def _continue_institution_access_impl(
+        self,
+        paper_id: str,
+        target_url: str | None = None,
+        *,
+        publisher: str | None = None,
+        profile: InstitutionProfile | None = None,
+        on_download_started: DownloadStartCallback | None = None,
+    ) -> dict[str, Any]:
         """Resume the retained page after the user completes CARSI/manual access."""
         self._ensure_institution_runtime()
         page = self._institution_pages.get(paper_id)
@@ -1046,9 +1188,8 @@ class BrowserSession:
             or publisher
             or publisher_key(target_url or page.url)
         )
-        await self.start(profile)
-        async with self._acquire_lock:
-            await self.start(profile)
+        context = await self._context_for(profile)
+        async with self._paper_lock(paper_id):
             try:
                 page_closed = bool(page.is_closed())
             except Exception:
@@ -1066,6 +1207,7 @@ class BrowserSession:
                     page_url=target_url,
                     detail="机构访问页面已关闭，请重新打开登录流程",
                 )
+            self._bind_page(page, paper_id)
             previous = self.institution_session_state(publisher, profile=profile)
             if self._is_login_url(page.url, profile):
                 state = SessionState.EXPIRED if previous == SessionState.READY.value else SessionState.WAITING
@@ -1079,7 +1221,7 @@ class BrowserSession:
                 await page.goto(target_url, wait_until="domcontentloaded", timeout=60_000)
                 await page.wait_for_timeout(1000)
                 if publisher == "generic":
-                    resolved_publisher = publisher_key(page.url)
+                    resolved_publisher = self.publisher_for_url(page.url, profile=profile)
                     if resolved_publisher != "generic":
                         publisher = resolved_publisher
                         self._institution_publishers[paper_id] = publisher
@@ -1107,7 +1249,6 @@ class BrowserSession:
                     detail="请在当前机构页面导航到这篇论文，再继续检查",
                 )
             self.mark_institution_session(publisher, SessionState.READY, profile=profile)
-            await self._reveal(page)
             page_candidates = await self._candidate_links(page)
             candidates: list[dict[str, str]] = []
             seen_hrefs: set[str] = set()
@@ -1124,9 +1265,13 @@ class BrowserSession:
                     page_url=page.url,
                 )
             destination = self.settings.download_dir / paper_id / "institution-main.pdf"
+            self.__dict__.setdefault("_paper_contexts", {})[paper_id] = context
             if on_download_started:
                 on_download_started()
-            result = await self._fetch_pdf(paper_id, candidates, destination)
+            try:
+                result = await self._fetch_pdf(paper_id, candidates, destination)
+            finally:
+                self._paper_contexts.pop(paper_id, None)
             result.update(
                 {
                     "entry_url": configured_entry_url(profile, publisher, target_url or "") or target_url,
@@ -1149,6 +1294,27 @@ class BrowserSession:
             return result
 
     async def acquire_for_paper(
+        self,
+        paper_id: str,
+        url: str,
+        *,
+        on_download_started: DownloadStartCallback | None = None,
+        publisher: str | None = None,
+        profile: InstitutionProfile | None = None,
+    ) -> dict[str, Any]:
+        task = self._track_operation(paper_id)
+        try:
+            return await self._acquire_for_paper_impl(
+                paper_id,
+                url,
+                on_download_started=on_download_started,
+                publisher=publisher,
+                profile=profile,
+            )
+        finally:
+            self._forget_operation(paper_id, task)
+
+    async def _acquire_for_paper_impl(
         self,
         paper_id: str,
         url: str,
@@ -1219,26 +1385,30 @@ class BrowserSession:
                 page_url=opened["page_url"],
                 detail=f"请在 Chrome 中完成 {profile.name} 登录，然后继续检查",
             )
-        await self.start(profile)
-        async with self._acquire_lock:
-            await self.start(profile)
+        context = await self._context_for(profile)
+        async with self._paper_lock(paper_id):
             self._active_paper_id = paper_id
-            assert self._context is not None
-            page = await self._context.new_page()
+            page = await context.new_page()
             self._bind_page(page, paper_id)
+            self.__dict__.setdefault("_paper_contexts", {})[paper_id] = context
             name = profile.name
             try:
                 entry_url = await self._open_institution_entry(page, url, profile=profile)
-                await self._reveal(page)
                 await page.wait_for_timeout(5000)
                 if self._is_login_url(page.url, profile):
-                    filled = await self._autofill_login(page, profile)
-                    await self._reveal(page)
-                    if not await self._wait_until_logged_in(page, profile):
-                        hint = f"已填入保存的 {name} 账号；" if filled else ""
-                        raise LoginTimeoutError(
-                            f"等待登录超时：{hint}请在 Chrome 中完成 {name} 登录或 2FA"
-                        )
+                    login_publisher = publisher or self.publisher_for_url(url, profile=profile)
+                    async with self._login_lock(profile, login_publisher):
+                        if self.institution_session_state(login_publisher, profile=profile) == SessionState.READY.value:
+                            await page.goto(entry_url, wait_until="domcontentloaded", timeout=60_000)
+                        if self._is_login_url(page.url, profile):
+                            filled = await self._autofill_login(page, profile)
+                            await self._reveal(page)
+                            if not await self._wait_until_logged_in(page, profile):
+                                hint = f"已填入保存的 {name} 账号；" if filled else ""
+                                raise LoginTimeoutError(
+                                    f"等待登录超时：{hint}请在 Chrome 中完成 {name} 登录或 2FA"
+                                )
+                        self.mark_institution_session(login_publisher, SessionState.READY, profile=profile)
                 page_candidates = await self._candidate_links(page)
                 publisher_candidates = publisher_pdf_candidates(page.url)
                 candidates: list[dict[str, str]] = []
@@ -1286,6 +1456,7 @@ class BrowserSession:
                     await self._download_callback(paper_id, destination)
                 return result
             finally:
+                self._paper_contexts.pop(paper_id, None)
                 with suppress(Exception):
                     await page.close()
 
@@ -1294,6 +1465,15 @@ class BrowserSession:
         self._blocked_papers.update(paper_set)
         if self._active_paper_id in paper_set:
             self._active_paper_id = None
+        current = asyncio.current_task()
+        operations = [
+            task
+            for paper_id in paper_set
+            for task in self._paper_operations.get(paper_id, {})
+            if task is not current and not task.done()
+        ]
+        for task in operations:
+            task.cancel()
         pages = [
             page
             for paper_id in paper_set
@@ -1309,6 +1489,15 @@ class BrowserSession:
             await asyncio.gather(
                 *(page.close() for page in pages), return_exceptions=True
             )
+        if operations:
+            await asyncio.gather(*operations, return_exceptions=True)
+        # An unbound popup may still be resolving its opener. Let it finish so
+        # a download from a blocked paper is rejected before directory cleanup.
+        pending = list(self._pending_popup_downloads)
+        if pending:
+            await asyncio.gather(
+                *(asyncio.shield(task) for task in pending), return_exceptions=True
+            )
         downloads = [
             task
             for paper_id in paper_set
@@ -1322,6 +1511,46 @@ class BrowserSession:
             getattr(self, "_institution_targets", {}).pop(paper_id, None)
             getattr(self, "_institution_publishers", {}).pop(paper_id, None)
             getattr(self, "_institution_profiles", {}).pop(paper_id, None)
+            self._paper_contexts.pop(paper_id, None)
+            self._paper_locks.pop(paper_id, None)
+
+    async def invalidate_paper_downloads(
+        self, paper_id: str, *, close_pages: bool = False
+    ) -> None:
+        """Discard old tab downloads before a retry or user PDF decision."""
+        pages = list(self._pages_by_paper.get(paper_id, {}).values())
+        retained = self._institution_pages.get(paper_id)
+        if retained is not None and retained not in pages:
+            pages.append(retained)
+        for page in pages:
+            self._bind_page(page, None)
+        if close_pages:
+            self._institution_pages.pop(paper_id, None)
+            self._institution_targets.pop(paper_id, None)
+            self._institution_publishers.pop(paper_id, None)
+            self._institution_profiles.pop(paper_id, None)
+            for page in pages:
+                with suppress(Exception):
+                    await page.close()
+
+        # An unbound popup may already be resolving its opener. It must finish
+        # after the old opener is unbound and before old downloads are drained.
+        pending = list(self._pending_popup_downloads)
+        if pending:
+            await asyncio.gather(
+                *(asyncio.shield(task) for task in pending), return_exceptions=True
+            )
+
+        while True:
+            downloads = [
+                task for task in self._download_tasks.get(paper_id, set())
+                if not task.done()
+            ]
+            if not downloads:
+                return
+            for task in downloads:
+                task.cancel()
+            await asyncio.gather(*downloads, return_exceptions=True)
 
     async def wait_for_downloads(self, paper_id: str) -> None:
         """Drain downloads that were already started for one paper."""
@@ -1331,11 +1560,35 @@ class BrowserSession:
                 for task in self._download_tasks.get(paper_id, set())
                 if not task.done()
             ]
-            if not downloads:
+            pending = [
+                task for task in getattr(self, "_pending_popup_downloads", set())
+                if not task.done()
+            ]
+            if not downloads and not pending:
                 return
-            await asyncio.gather(*downloads, return_exceptions=True)
+            await asyncio.gather(
+                *downloads,
+                *(asyncio.shield(task) for task in pending),
+                return_exceptions=True,
+            )
 
     async def close(self) -> None:
+        current = asyncio.current_task()
+        operations = {
+            task
+            for tasks in self._paper_operations.values()
+            for task in tasks
+            if task is not current and not task.done()
+        }
+        for task in operations:
+            task.cancel()
+        if operations:
+            await asyncio.gather(*operations, return_exceptions=True)
+        pending = list(self._pending_popup_downloads)
+        for task in pending:
+            task.cancel()
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
         downloads = [
             task for tasks in self._download_tasks.values() for task in tasks
             if not task.done()
@@ -1360,6 +1613,11 @@ class BrowserSession:
         self._page_papers.clear()
         self._pages_by_paper.clear()
         self._bound_pages.clear()
+        self._pending_popup_downloads.clear()
+        self._paper_contexts.clear()
+        self._paper_locks.clear()
+        self._paper_operations.clear()
+        self._login_locks.clear()
         getattr(self, "_institution_pages", {}).clear()
         getattr(self, "_institution_targets", {}).clear()
         getattr(self, "_institution_publishers", {}).clear()

@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import asyncio
 import shutil
+import time
+from collections import Counter
 from contextlib import asynccontextmanager, suppress
 from pathlib import Path
-from typing import Any, AsyncIterator, Callable
+from typing import Any, AsyncIterator, Awaitable, Callable
 
-from .browser import BrowserSession, LoginTimeoutError, PublisherBlockedError
+from .browser import BrowserError, BrowserSession, LoginTimeoutError, PublisherBlockedError
 from .clients import (
     CrossrefClient,
     RemoteServiceError,
@@ -15,13 +17,15 @@ from .clients import (
 )
 from .config import Settings
 from .db import BatchDeletingError, Database
-from .downloader import download_pdf, safe_filename
+from .downloader import close_download_clients, download_pdf, safe_filename
 from .inputs import normalize_doi, title_similarity
 from .institution_access import NeedsManualInstitutionAction, profile_access_type
 from .library_files import downloads_library_dir, export_zotero_endnote_package
 from .pdf_validation import sha256_file, validate_pdf
+from .pdf_worker import close_pdf_workers, validate_pdf_async
 from .publishers import publisher_key
 from .redaction import redact_url
+from .stage_queue import FairStageExecutor
 from .user_config import (
     InstitutionProfile,
     institution_from_payload,
@@ -31,7 +35,18 @@ from .user_config import (
 from .zotero import ZoteroAdapter
 
 
+class BatchPaused(Exception):
+    """A queued stage was not started because the user paused its batch."""
+
+
 class PipelineManager:
+    ACQUISITION_MODES = {
+        "legacy": (1, 1),
+        "oa_parallel": (1, 1),
+        "publisher_parallel": (2, 1),
+        "full_parallel": (4, 2),
+    }
+
     def __init__(self, settings: Settings, database: Database):
         self.settings = settings
         self.db = database
@@ -41,11 +56,35 @@ class PipelineManager:
         self.browser.set_download_callback(self._browser_downloaded)
         self.zotero = ZoteroAdapter(database.get_setting("zotero_api_key", ""))
         self._batch_tasks: dict[str, asyncio.Task] = {}
+        self._restart_requested: set[str] = set()
+        self._closing = False
         self._commit_tasks: dict[str, asyncio.Task] = {}
         self._cancellable_work: dict[str, set[asyncio.Task]] = {}
         self._drain_work: dict[str, set[asyncio.Task]] = {}
         self._deleting_batches: set[str] = set()
         self._commit_lock = asyncio.Lock()
+        self._committing_batches: set[str] = set()
+        metadata_workers = 3 if settings.crossref_mailto else 1
+        self._metadata_queue = FairStageExecutor(metadata_workers, max_pending=16)
+        self._oa_queue = FairStageExecutor(4, max_pending=16)
+        self._validation_queue = FairStageExecutor(2, max_pending=8)
+        self._publisher_resolution_slots = asyncio.Semaphore(2)
+        self._institution_condition = asyncio.Condition()
+        self._institution_active = 0
+        self._institution_by_publisher: Counter[tuple[str, str]] = Counter()
+        self._institution_slot_owners: dict[str, asyncio.Task] = {}
+        self._institution_last_start: dict[tuple[str, str], float] = {}
+        self._institution_last_finish: dict[tuple[str, str], float] = {}
+        self._active_batch_modes: dict[str, str] = {}
+        self._batch_mode_cache: dict[str, str] = {}
+        self._batch_profile_cache: dict[str, InstitutionProfile] = {}
+        self._batch_sources_cache: dict[str, tuple[tuple[str, ...], bool]] = {}
+        self._login_tasks: dict[tuple[str, str], asyncio.Task] = {}
+        self._login_waiters: Counter[tuple[str, str]] = Counter()
+        self._paper_locks: dict[str, asyncio.Lock] = {}
+        self._paper_lock_owners: dict[str, asyncio.Task] = {}
+        self._stage_counts: dict[str, dict[str, Counter[str]]] = {}
+        self.race_delay_seconds = 3.0
         self.institution_gap_seconds = 6.0
         self.institution_discovery_timeout_seconds = 180.0
         self._institution_ready_sessions: set[tuple[str, str]] = set()
@@ -56,9 +95,11 @@ class PipelineManager:
         self._staged_browser_downloads: dict[str, set[Path]] = {}
 
     async def close(self) -> None:
+        self._closing = True
         tasks = [
             *self._batch_tasks.values(),
             *self._commit_tasks.values(),
+            *self._login_tasks.values(),
             *(task for tasks in self._cancellable_work.values() for task in tasks),
         ]
         for task in tasks:
@@ -66,10 +107,283 @@ class PipelineManager:
                 task.cancel()
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
+        draining = [task for work in self._drain_work.values() for task in work]
+        if draining:
+            await asyncio.gather(*draining, return_exceptions=True)
+        await asyncio.gather(
+            self._metadata_queue.close(),
+            self._oa_queue.close(),
+            self._validation_queue.close(),
+        )
         await self.crossref.close()
         await self.unpaywall.close()
         await self.browser.close()
         await self.zotero.close()
+        await close_download_clients()
+        await close_pdf_workers()
+
+    def _acquisition_mode_for_batch(self, batch_id: str) -> str:
+        if batch_id in self._batch_mode_cache:
+            return self._batch_mode_cache[batch_id]
+        batch = self.db.get_batch(batch_id)
+        snapshot = (batch or {}).get("institution_config") or {}
+        mode = str(snapshot.get("_acquisition_mode") or "legacy")
+        selected = mode if mode in self.ACQUISITION_MODES else "legacy"
+        if batch:
+            self._batch_mode_cache[batch_id] = selected
+        return selected
+
+    def acquisition_progress(self, batch_id: str) -> dict[str, dict[str, int]]:
+        counts = self._stage_counts.get(batch_id, {})
+        return {
+            stage: {
+                "running": counts.get(stage, Counter()).get("running", 0),
+                "waiting": counts.get(stage, Counter()).get("waiting", 0),
+            }
+            for stage in ("metadata", "oa", "institution", "validation")
+        }
+
+    @asynccontextmanager
+    async def paper_operation_guard(self, paper_id: str) -> AsyncIterator[None]:
+        current = asyncio.current_task()
+        if current is not None and self._paper_lock_owners.get(paper_id) is current:
+            yield
+            return
+        paper = self.db.get_paper(paper_id)
+        if paper and paper["batch_id"] in self._committing_batches:
+            commit_task = self._commit_tasks.get(paper["batch_id"])
+            if commit_task is not None and commit_task is not current and not commit_task.done():
+                await asyncio.gather(asyncio.shield(commit_task), return_exceptions=True)
+        async with self._paper_locks.setdefault(paper_id, asyncio.Lock()):
+            if current is not None:
+                self._paper_lock_owners[paper_id] = current
+            try:
+                yield
+            finally:
+                self._paper_lock_owners.pop(paper_id, None)
+
+    @asynccontextmanager
+    async def _stage(
+        self, batch_id: str, stage: str, *, waiting: bool = False
+    ) -> AsyncIterator[None]:
+        counter = self._stage_counts.setdefault(batch_id, {}).setdefault(stage, Counter())
+        state = "waiting" if waiting else "running"
+        counter[state] += 1
+        try:
+            yield
+        finally:
+            counter[state] -= 1
+
+    async def _run_stage(
+        self, batch_id: str, stage: str, queue: FairStageExecutor,
+        operation: Callable[[], Awaitable[Any]],
+    ) -> Any:
+        counts = self._stage_counts.setdefault(batch_id, {}).setdefault(stage, Counter())
+        counts["waiting"] += 1
+        started = False
+
+        def on_start() -> None:
+            nonlocal started
+            started = True
+            counts["waiting"] -= 1
+            counts["running"] += 1
+
+        def on_finish() -> None:
+            counts["running"] -= 1
+
+        try:
+            return await queue.run(
+                batch_id, operation, on_start=on_start, on_finish=on_finish
+            )
+        finally:
+            if not started:
+                counts["waiting"] -= 1
+
+    @asynccontextmanager
+    async def _institution_slot(
+        self, batch_id: str, paper: dict[str, Any], mode: str
+    ) -> AsyncIterator[None]:
+        profile = self._institution_profile_for_batch(batch_id)
+        publisher = self._publisher_for_paper(paper, profile)
+        key = (profile.id.casefold(), publisher)
+        counts = self._stage_counts.setdefault(batch_id, {}).setdefault(
+            "institution", Counter()
+        )
+        counts["waiting"] += 1
+        try:
+            async with self._institution_condition:
+                while True:
+                    if self.db.batch_is_paused(batch_id):
+                        raise BatchPaused()
+                    active_modes = list(self._active_batch_modes.values()) or [mode]
+                    total_limit = min(self.ACQUISITION_MODES[item][0] for item in active_modes)
+                    publisher_limit = min(self.ACQUISITION_MODES[item][1] for item in active_modes)
+                    timestamp = (
+                        self._institution_last_finish.get(key, 0.0)
+                        if mode == "oa_parallel"
+                        else self._institution_last_start.get(key, 0.0)
+                    )
+                    delay = (
+                        max(0.0, self.institution_gap_seconds - (time.monotonic() - timestamp))
+                        if mode != "legacy"
+                        else 0.0
+                    )
+                    if (
+                        self._institution_active < total_limit
+                        and self._institution_by_publisher[key] < publisher_limit
+                        and delay == 0
+                    ):
+                        self._institution_active += 1
+                        self._institution_by_publisher[key] += 1
+                        self._institution_last_start[key] = time.monotonic()
+                        break
+                    if delay:
+                        try:
+                            await asyncio.wait_for(
+                                self._institution_condition.wait(), timeout=delay
+                            )
+                        except TimeoutError:
+                            pass
+                    else:
+                        await self._institution_condition.wait()
+        finally:
+            counts["waiting"] -= 1
+        try:
+            current = asyncio.current_task()
+            if current is not None:
+                self._institution_slot_owners[paper["id"]] = current
+            async with self._stage(batch_id, "institution"):
+                yield
+        finally:
+            if self._institution_slot_owners.get(paper["id"]) is asyncio.current_task():
+                self._institution_slot_owners.pop(paper["id"], None)
+            async with self._institution_condition:
+                self._institution_active -= 1
+                self._institution_by_publisher[key] -= 1
+                self._institution_last_finish[key] = time.monotonic()
+                self._institution_condition.notify_all()
+
+    async def _limited_oa_pdf(
+        self, batch_id: str, paper: dict[str, Any], started: asyncio.Event | None = None
+    ) -> dict[str, Any]:
+        async def acquire() -> dict[str, Any]:
+            if self.db.batch_is_paused(batch_id):
+                raise BatchPaused()
+            if started is not None:
+                started.set()
+            start_time = time.monotonic()
+            try:
+                return await self._try_open_access_pdf(paper)
+            finally:
+                with suppress(BatchDeletingError):
+                    self.db.event(batch_id, f"OA 阶段用时 {time.monotonic() - start_time:.1f} 秒", paper_id=paper["id"])
+
+        return await self._run_stage(batch_id, "oa", self._oa_queue, acquire)
+
+    async def _limited_institution_pdf(
+        self, batch_id: str, paper: dict[str, Any], mode: str
+    ) -> dict[str, Any]:
+        if mode != "legacy":
+            paper = await self._resolve_paper_publisher(batch_id, paper)
+            try:
+                await self._ensure_institution_login(batch_id, paper)
+            except (LoginTimeoutError, NeedsManualInstitutionAction, BrowserError) as exc:
+                publisher = str(paper.get("institution_publisher") or "generic")
+                reason = (
+                    exc.reason
+                    if isinstance(exc, NeedsManualInstitutionAction)
+                    else "session_expired"
+                    if isinstance(exc, LoginTimeoutError)
+                    else "login_required"
+                )
+                return {
+                    "success": False,
+                    "source": "institution",
+                    "manual_action": {
+                        "reason": reason,
+                        "publisher": publisher,
+                        "paper_id": paper["id"],
+                        "action": "continue_institution",
+                    },
+                    "error": str(exc),
+                }
+        async with self._institution_slot(batch_id, paper, mode):
+            started = time.monotonic()
+            try:
+                return await self._try_institution_pdf(batch_id, paper)
+            finally:
+                with suppress(BatchDeletingError):
+                    self.db.event(batch_id, f"机构阶段用时 {time.monotonic() - started:.1f} 秒", paper_id=paper["id"])
+
+    async def _resolve_paper_publisher(
+        self, batch_id: str, paper: dict[str, Any]
+    ) -> dict[str, Any]:
+        profile = self._institution_profile_for_batch(batch_id)
+        fallback = paper.get("metadata", {}).get("url") or paper.get("source_url") or ""
+        publisher = self._publisher_for_paper(paper, profile)
+        if publisher != paper.get("institution_publisher") and publisher != "generic":
+            paper = dict(paper)
+            paper["institution_publisher"] = publisher
+            self.db.update_paper(paper["id"], institution_publisher=publisher)
+        if publisher != "generic":
+            return paper
+        resolver = getattr(self.browser, "resolve_publisher_for_paper", None)
+        if resolver is None:
+            return paper
+        target = fallback or f"https://doi.org/{paper.get('doi') or ''}"
+        async with self._publisher_resolution_slots:
+            resolved = await resolver(target, profile=profile)
+        if not resolved or resolved == "generic":
+            return paper
+        updated = dict(paper)
+        updated["institution_publisher"] = resolved
+        self.db.update_paper(paper["id"], institution_publisher=resolved)
+        return updated
+
+    async def _ensure_institution_login(
+        self, batch_id: str, paper: dict[str, Any]
+    ) -> None:
+        profile = self._institution_profile_for_batch(batch_id)
+        if profile_access_type(profile) != "ezproxy":
+            return
+        fallback = paper.get("metadata", {}).get("url") or paper.get("source_url") or ""
+        publisher = self._publisher_for_paper(paper, profile)
+        key = (profile.id.casefold(), publisher)
+        if key in self._institution_ready_sessions or key in self._institution_login_failures:
+            return
+        task = self._login_tasks.get(key)
+        if task is None or task.done():
+            target = paper.get("source_url") or self._institution_entry(
+                doi=paper.get("doi"),
+                fallback=fallback or f"https://doi.org/{paper.get('doi') or ''}",
+                profile=profile,
+            )
+
+            async def login() -> None:
+                try:
+                    await self.browser.ensure_logged_in(
+                        target, profile=profile, publisher=publisher
+                    )
+                    self._institution_ready_sessions.add(key)
+                    marker = getattr(self.browser, "mark_institution_session", None)
+                    if marker is not None:
+                        marker(publisher, "ready", profile=profile)
+                except LoginTimeoutError:
+                    self._institution_login_failures.add(key)
+                    raise
+
+            task = asyncio.create_task(login())
+            self._login_tasks[key] = task
+        self._login_waiters[key] += 1
+        try:
+            await asyncio.shield(task)
+        finally:
+            self._login_waiters[key] -= 1
+            if self._login_waiters[key] <= 0:
+                self._login_waiters.pop(key, None)
+                if not task.done():
+                    task.cancel()
+                    await asyncio.gather(task, return_exceptions=True)
 
     @asynccontextmanager
     async def zotero_operation_guard(self) -> AsyncIterator[None]:
@@ -85,16 +399,82 @@ class PipelineManager:
     def start(self, batch_id: str) -> None:
         self.db.assert_batch_writable(batch_id)
         self._institution_profile_for_batch(batch_id)
+        self.db.update_batch(batch_id, status="running", paused=0, error=None)
         current = self._batch_tasks.get(batch_id)
         if current and not current.done():
+            # A retry or quick pause/resume can arrive while the old batch
+            # coroutine is winding down. Run another scan after it exits.
+            self._restart_requested.add(batch_id)
             return
-        self.db.update_batch(batch_id, status="running", paused=0, error=None)
-        self._batch_tasks[batch_id] = asyncio.create_task(self._run_batch(batch_id))
+        self._restart_requested.discard(batch_id)
+        self._active_batch_modes[batch_id] = self._acquisition_mode_for_batch(batch_id)
+        task = asyncio.create_task(self._run_batch(batch_id))
+        self._batch_tasks[batch_id] = task
+        task.add_done_callback(
+            lambda completed, identity=batch_id: self._forget_active_batch(identity, completed)
+        )
+
+    def _forget_active_batch(self, batch_id: str, completed: asyncio.Task) -> None:
+        if self._batch_tasks.get(batch_id) is not completed:
+            return
+        self._active_batch_modes.pop(batch_id, None)
+        restart = batch_id in self._restart_requested
+        self._restart_requested.discard(batch_id)
+        async def notify_waiters() -> None:
+            async with self._institution_condition:
+                self._institution_condition.notify_all()
+        asyncio.create_task(notify_waiters())
+        if restart and not self._closing and batch_id not in self._deleting_batches:
+            self._restart_batch_if_needed(batch_id)
+
+    def _restart_batch_if_needed(self, batch_id: str) -> None:
+        batch = self.db.get_batch(batch_id)
+        if not batch or batch["paused"] or self._closing or batch_id in self._deleting_batches:
+            return
+        if any(
+            paper["status"] in {
+                "queued", "matching", "ready", "looking_for_pdf", "institution_pending",
+            }
+            for paper in batch["papers"]
+        ):
+            self.start(batch_id)
 
     def pause(self, batch_id: str) -> None:
         self.db.assert_batch_writable(batch_id)
         self.db.update_batch(batch_id, status="paused", paused=1)
         self.db.event(batch_id, "批次已暂停")
+        async def notify_waiters() -> None:
+            async with self._institution_condition:
+                self._institution_condition.notify_all()
+        asyncio.create_task(notify_waiters())
+
+    async def retry_paper(self, paper_id: str) -> None:
+        paper = self.db.get_paper(paper_id)
+        if not paper:
+            raise KeyError(paper_id)
+        async with self.paper_operation_guard(paper_id):
+            await self.invalidate_paper_downloads(paper_id, close_pages=True)
+            self.db.reset_paper_for_retry(paper_id)
+        self.start(paper["batch_id"])
+
+    async def invalidate_paper_downloads(
+        self, paper_id: str, *, close_pages: bool = False
+    ) -> None:
+        invalidate = getattr(self.browser, "invalidate_paper_downloads", None)
+        if invalidate is not None:
+            await invalidate(paper_id, close_pages=close_pages)
+
+    async def wait_for_batch_acquisition(self, batch_id: str) -> None:
+        while True:
+            task = self._batch_tasks.get(batch_id)
+            if task is None or task is asyncio.current_task():
+                return
+            if not task.done():
+                await asyncio.shield(task)
+            # Let its completion callback schedule a pending retry/resume.
+            await asyncio.sleep(0)
+            if self._batch_tasks.get(batch_id) is task:
+                return
 
     def resume(self, batch_id: str) -> None:
         self.start(batch_id)
@@ -161,6 +541,10 @@ class PipelineManager:
 
     async def _run_batch(self, batch_id: str) -> None:
         self._institution_profile_for_batch(batch_id)
+        mode = self._acquisition_mode_for_batch(batch_id)
+        if mode != "legacy":
+            await self._run_parallel_batch(batch_id, mode)
+            return
         try:
             while True:
                 batch = self.db.get_batch(batch_id)
@@ -176,19 +560,28 @@ class PipelineManager:
                     self.db.update_batch(batch_id, status="completed")
                     self.db.event(batch_id, "网络与题录准备阶段已完成")
                     if self.settings.auto_commit:
-                        self.commit(batch_id)
+                        self.commit(batch_id, wait_for_acquisition=False)
                         await asyncio.shield(self._commit_tasks[batch_id])
                     return
                 paper = actionable[0]
                 try:
-                    if paper["status"] == "institution_pending":
-                        await self._process_institution_paper(batch_id, paper)
-                        if self.institution_gap_seconds:
-                            await asyncio.sleep(self.institution_gap_seconds)
-                    else:
-                        await self._process_paper(batch_id, paper)
+                    async with self.paper_operation_guard(paper["id"]):
+                        paper = self.db.get_paper(paper["id"])
+                        if paper is None or paper["status"] not in {
+                            "queued", "matching", "ready", "looking_for_pdf",
+                            "institution_pending",
+                        }:
+                            continue
+                        if paper["status"] == "institution_pending":
+                            await self._process_institution_paper(batch_id, paper)
+                        else:
+                            await self._process_paper(batch_id, paper)
+                    if paper["status"] == "institution_pending" and self.institution_gap_seconds:
+                        await asyncio.sleep(self.institution_gap_seconds)
                 except asyncio.CancelledError:
                     raise
+                except BatchPaused:
+                    return
                 except LoginTimeoutError as exc:
                     profile = self._institution_profile_for_batch(batch_id)
                     fallback = paper.get("metadata", {}).get("url") or paper.get("source_url") or ""
@@ -218,9 +611,126 @@ class PipelineManager:
             self.db.update_batch(batch_id, status="failed", error=str(exc))
             self.db.event(batch_id, f"批次失败：{exc}", level="error")
 
+    async def _run_parallel_batch(self, batch_id: str, mode: str) -> None:
+        self._active_batch_modes[batch_id] = mode
+        tasks: list[asyncio.Task] = []
+        try:
+            while True:
+                batch = self.db.get_batch(batch_id)
+                if not batch or batch["paused"]:
+                    return
+                actionable = [
+                    paper for paper in batch["papers"]
+                    if paper["status"] in {
+                        "queued", "matching", "ready", "looking_for_pdf",
+                        "institution_pending",
+                    }
+                ]
+                if not actionable:
+                    self.db.update_batch(batch_id, status="completed")
+                    self.db.event(batch_id, "网络与题录准备阶段已完成")
+                    if self.settings.auto_commit:
+                        self.commit(batch_id, wait_for_acquisition=False)
+                        await asyncio.shield(self._commit_tasks[batch_id])
+                    return
+                tasks = [
+                    asyncio.create_task(self._process_parallel_paper(batch_id, paper, mode))
+                    for paper in actionable
+                ]
+                await asyncio.gather(*tasks)
+                tasks = []
+        except (asyncio.CancelledError, BatchDeletingError):
+            return
+        except Exception as exc:
+            self.db.update_batch(batch_id, status="failed", error=str(exc))
+            self.db.event(batch_id, f"批次失败：{exc}", level="error")
+        finally:
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            if tasks:
+                await asyncio.gather(*tasks, return_exceptions=True)
+            self._active_batch_modes.pop(batch_id, None)
+            async with self._institution_condition:
+                self._institution_condition.notify_all()
+
+    async def _process_parallel_paper(
+        self, batch_id: str, paper: dict[str, Any], mode: str
+    ) -> None:
+        paper_id = paper["id"]
+        async with self.paper_operation_guard(paper_id):
+            try:
+                if self.db.batch_is_paused(batch_id):
+                    return
+                paper = self.db.get_paper(paper_id)
+                if not paper or paper["status"] not in {
+                    "queued", "matching", "ready", "looking_for_pdf",
+                    "institution_pending",
+                }:
+                    return
+                if paper["status"] == "institution_pending":
+                    paper = await self._resolve_paper_publisher(batch_id, paper)
+                    await self._ensure_institution_login(batch_id, paper)
+                    await self._process_institution_paper(batch_id, paper)
+                    return
+                if paper["metadata_status"] != "verified":
+                    async def resolve_metadata() -> None:
+                        if self.db.batch_is_paused(batch_id):
+                            raise BatchPaused()
+                        started = time.monotonic()
+                        await self._resolve_metadata(batch_id, paper)
+                        self.db.event(
+                            batch_id,
+                            f"题录阶段用时 {time.monotonic() - started:.1f} 秒",
+                            paper_id=paper_id,
+                        )
+                    await self._run_stage(
+                        batch_id, "metadata", self._metadata_queue, resolve_metadata
+                    )
+                    paper = self.db.get_paper(paper_id)
+                    if not paper or paper["metadata_status"] != "verified":
+                        return
+                if self.db.batch_is_paused(batch_id):
+                    return
+                if paper["pdf_status"] in {"verified", "accepted"}:
+                    self.db.update_paper(
+                        paper_id, status="endnote_pending", endnote_status="pending",
+                        needs_action="commit_endnote",
+                    )
+                    return
+                await self._find_pdf(batch_id, paper)
+            except asyncio.CancelledError:
+                raise
+            except BatchPaused:
+                return
+            except LoginTimeoutError as exc:
+                profile = self._institution_profile_for_batch(batch_id)
+                fallback = paper.get("metadata", {}).get("url") or paper.get("source_url") or ""
+                key = (
+                    profile.id.casefold(),
+                    str(paper.get("institution_publisher") or publisher_key(fallback)),
+                )
+                self._institution_login_failures.add(key)
+                self._downgrade_remaining_institution(batch_id, str(exc), failed_key=key)
+                self.db.update_paper(
+                    paper_id, status="needs_pdf", pdf_status="not_found",
+                    needs_action="manual_institution", institution_state="expired",
+                    error=str(exc),
+                )
+            except BatchDeletingError:
+                raise
+            except Exception as exc:
+                self.db.update_paper(
+                    paper_id, status="failed", needs_action="retry", error=str(exc)
+                )
+                self.db.event(
+                    batch_id, f"处理失败：{exc}", level="error", paper_id=paper_id
+                )
+
     async def _process_paper(self, batch_id: str, paper: dict[str, Any]) -> None:
         if paper["metadata_status"] != "verified":
-            await self._resolve_metadata(batch_id, paper)
+            async with self._stage(batch_id, "metadata"):
+                await self._resolve_metadata(batch_id, paper)
             paper = self.db.get_paper(paper["id"])
             if not paper or paper["metadata_status"] != "verified":
                 return
@@ -295,6 +805,46 @@ class PipelineManager:
             **self.settings.pdf_ocr_kwargs(),
         )
 
+    async def _validate_pdf_for_paper(
+        self, paper: dict[str, Any], path: Path
+    ):
+        if self._acquisition_mode_for_batch(paper["batch_id"]) == "legacy":
+            async with self._stage(paper["batch_id"], "validation"):
+                return self._validate_pdf(
+                    path, expected_doi=paper.get("doi"), expected_title=paper.get("title")
+                )
+        batch_id = paper["batch_id"]
+        async def validate():
+            started = time.monotonic()
+            task = asyncio.create_task(
+                validate_pdf_async(
+                    path,
+                    expected_doi=paper.get("doi"),
+                    expected_title=paper.get("title"),
+                    **self.settings.pdf_ocr_kwargs(),
+                )
+            )
+            self._drain_work.setdefault(batch_id, set()).add(task)
+            try:
+                try:
+                    result = await asyncio.shield(task)
+                except asyncio.CancelledError:
+                    await asyncio.gather(task, return_exceptions=True)
+                    raise
+                return result
+            finally:
+                self._drain_work.get(batch_id, set()).discard(task)
+                with suppress(BatchDeletingError):
+                    self.db.event(
+                        batch_id,
+                        f"PDF 校验用时 {time.monotonic() - started:.1f} 秒",
+                        paper_id=paper["id"],
+                    )
+
+        return await self._run_stage(
+            batch_id, "validation", self._validation_queue, validate
+        )
+
     def _intact_existing_pdf(self, paper: dict[str, Any]) -> Path | None:
         if paper.get("pdf_status") not in {"verified", "accepted"}:
             return None
@@ -320,6 +870,9 @@ class PipelineManager:
         return None
 
     def _institution_profile_for_batch(self, batch_id: str) -> InstitutionProfile:
+        cached = self._batch_profile_cache.get(batch_id)
+        if cached is not None:
+            return cached
         batch = self.db.get_batch(batch_id)
         if not batch:
             raise KeyError(batch_id)
@@ -333,9 +886,12 @@ class PipelineManager:
             {
                 "_acquisition_sources": list(self.settings.acquisition_sources),
                 "_auto_institution": bool(self.settings.auto_institution),
+                "_acquisition_mode": "legacy",
             },
         )
-        return institution_from_payload(snapshot)
+        profile = institution_from_payload(snapshot)
+        self._batch_profile_cache[batch_id] = profile
+        return profile
 
     def current_institution_snapshot(self) -> dict[str, Any]:
         """Return the credential-free institution policy saved with a new batch."""
@@ -343,11 +899,15 @@ class PipelineManager:
             **self.settings.institution.as_dict(),
             "_acquisition_sources": list(self.settings.acquisition_sources),
             "_auto_institution": bool(self.settings.auto_institution),
+            "_acquisition_mode": "legacy",
         }
 
     def _acquisition_options_for_batch(
         self, batch_id: str
     ) -> tuple[tuple[str, ...], bool]:
+        cached = self._batch_sources_cache.get(batch_id)
+        if cached is not None:
+            return cached
         # Also upgrades a legacy/profile-only snapshot exactly once.
         self._institution_profile_for_batch(batch_id)
         batch = self.db.get_batch(batch_id)
@@ -365,10 +925,24 @@ class PipelineManager:
             sources = tuple(self.settings.acquisition_sources)
         if not sources:
             sources = ("open_access",)
-        return sources, bool(snapshot.get("_auto_institution", False))
+        options = (sources, bool(snapshot.get("_auto_institution", False)))
+        self._batch_sources_cache[batch_id] = options
+        return options
 
     def _institution_profile_for_paper(self, paper: dict[str, Any]) -> InstitutionProfile:
         return self._institution_profile_for_batch(paper["batch_id"])
+
+    def _publisher_for_paper(
+        self, paper: dict[str, Any], profile: InstitutionProfile
+    ) -> str:
+        fallback = paper.get("metadata", {}).get("url") or paper.get("source_url") or ""
+        stored = str(paper.get("institution_publisher") or "")
+        plain = publisher_key(fallback)
+        resolver = getattr(self.browser, "publisher_for_url", None)
+        mapped = resolver(fallback, profile=profile) if resolver is not None else plain
+        if mapped != "generic" and stored in {"", "generic", plain}:
+            return mapped
+        return stored or mapped
 
     @staticmethod
     def _resolved_publisher(result: dict[str, Any], fallback: str) -> str:
@@ -399,12 +973,20 @@ class PipelineManager:
         self.db.update_paper(paper["id"], status="looking_for_pdf", pdf_status="searching", error=None)
         doi = paper.get("doi")
         sources, auto_institution = self._acquisition_options_for_batch(batch_id)
+        mode = self._acquisition_mode_for_batch(batch_id)
         if (
             "open_access" in sources
             and "institution" in sources
             and auto_institution
         ):
-            await self._race_pdf_sources(batch_id, paper)
+            await self._race_pdf_sources(
+                batch_id, paper, mode=mode
+            )
+            return
+        if mode != "legacy" and "open_access" in sources:
+            await self._race_pdf_sources(
+                batch_id, paper, mode=mode, allow_institution=False
+            )
             return
         if "open_access" in sources:
             location = await self.unpaywall.best_location(doi) if doi else None
@@ -413,7 +995,7 @@ class PipelineManager:
                 destination = self.settings.download_dir / paper["id"] / filename
                 try:
                     await download_pdf(location.pdf_url, destination, self.settings)
-                    result = self._validate_pdf(destination, expected_doi=doi, expected_title=paper.get("title"))
+                    result = await self._validate_pdf_for_paper(paper, destination)
                     if result.identity == "verified" and result.role == "main":
                         self.db.update_paper(
                             paper["id"], pdf_status="verified", status="endnote_pending", version="published",
@@ -511,9 +1093,7 @@ class PipelineManager:
                     "error": "开放候选不是可自动采用的正式发表版 PDF",
                 }
             await download_pdf(location.pdf_url, destination, self.settings)
-            result = self._validate_pdf(
-                destination, expected_doi=doi, expected_title=paper.get("title")
-            )
+            result = await self._validate_pdf_for_paper(paper, destination)
             if result.identity == "verified" and result.role == "main":
                 return {
                     "success": True,
@@ -622,9 +1202,7 @@ class PipelineManager:
                     profile=profile,
                 )
             path = Path(browser_result.get("path") or destination)
-            result = self._validate_pdf(
-                path, expected_doi=doi, expected_title=paper.get("title")
-            )
+            result = await self._validate_pdf_for_paper(paper, path)
             if result.identity == "verified" and result.role == "main":
                 actual_publisher = self._resolved_publisher(browser_result, publisher)
                 ready_key = (profile.id.casefold(), actual_publisher)
@@ -743,7 +1321,7 @@ class PipelineManager:
             if keep_resolved is None or resolved != keep_resolved:
                 resolved.unlink(missing_ok=True)
 
-    def _browser_stage_outcomes(
+    async def _browser_stage_outcomes(
         self, paper: dict[str, Any], known: list[dict[str, Any]]
     ) -> list[dict[str, Any]]:
         """Validate browser downloads captured while a two-source race was active."""
@@ -758,11 +1336,7 @@ class PipelineManager:
             resolved = path.resolve()
             if resolved in known_paths or not resolved.is_file():
                 continue
-            result = self._validate_pdf(
-                resolved,
-                expected_doi=paper.get("doi"),
-                expected_title=paper.get("title"),
-            )
+            result = await self._validate_pdf_for_paper(paper, resolved)
             base = {
                 "source": "institution",
                 "source_url": paper.get("source_url") or self._institution_entry(
@@ -790,19 +1364,45 @@ class PipelineManager:
                 outcomes.append({**base, "success": False})
         return outcomes
 
-    async def _race_pdf_sources(self, batch_id: str, paper: dict[str, Any]) -> None:
+    async def _race_pdf_sources(
+        self, batch_id: str, paper: dict[str, Any], *,
+        mode: str = "legacy", allow_institution: bool = True
+    ) -> None:
         """Race OA and institution for one paper; commit exactly one winner."""
         paper_id = paper["id"]
         self._staged_browser_papers.add(paper_id)
         self._staged_browser_downloads[paper_id] = set()
-        oa_task = asyncio.create_task(self._try_open_access_pdf(paper))
-        institution_task = asyncio.create_task(
-            self._try_institution_pdf(batch_id, paper)
-        )
-        pending: set[asyncio.Task] = {oa_task, institution_task}
+        oa_started = asyncio.Event()
+        oa_task = asyncio.create_task(self._limited_oa_pdf(batch_id, paper, oa_started))
+        pending: set[asyncio.Task] = {oa_task}
         outcomes: list[dict[str, Any]] = []
         keep_path: Path | None = None
         try:
+            if mode == "oa_parallel":
+                await asyncio.wait({oa_task}, return_when=asyncio.FIRST_COMPLETED)
+            elif mode in {"publisher_parallel", "full_parallel"}:
+                waiter = asyncio.create_task(oa_started.wait())
+                try:
+                    await asyncio.wait(
+                        {oa_task, waiter}, return_when=asyncio.FIRST_COMPLETED
+                    )
+                finally:
+                    waiter.cancel()
+                    await asyncio.gather(waiter, return_exceptions=True)
+                if oa_started.is_set() and not oa_task.done():
+                    await asyncio.wait({oa_task}, timeout=self.race_delay_seconds)
+            oa_succeeded = False
+            if oa_task.done() and not oa_task.cancelled():
+                try:
+                    oa_succeeded = bool(oa_task.result().get("success"))
+                except Exception:
+                    pass
+            paused = self.db.batch_is_paused(batch_id)
+            if allow_institution and (mode == "legacy" or (not oa_succeeded and not paused)):
+                institution_task = asyncio.create_task(
+                    self._limited_institution_pdf(batch_id, paper, mode)
+                )
+                pending.add(institution_task)
             winner: dict[str, Any] | None = None
             while pending and winner is None:
                 done, pending = await asyncio.wait(
@@ -813,6 +1413,8 @@ class PipelineManager:
                         outcome = task.result()
                     except asyncio.CancelledError:
                         continue
+                    except BatchPaused:
+                        raise
                     except Exception as exc:
                         outcome = {"success": False, "error": str(exc)}
                     outcomes.append(outcome)
@@ -825,10 +1427,12 @@ class PipelineManager:
                         await asyncio.gather(*pending, return_exceptions=True)
                     pending.clear()
 
+            if self.db.batch_is_paused(batch_id) and winner is None:
+                raise BatchPaused()
             wait_for_downloads = getattr(self.browser, "wait_for_downloads", None)
             if wait_for_downloads is not None:
                 await wait_for_downloads(paper_id)
-            staged_outcomes = self._browser_stage_outcomes(paper, outcomes)
+            staged_outcomes = await self._browser_stage_outcomes(paper, outcomes)
             outcomes.extend(staged_outcomes)
             if winner is None:
                 winner = next(
@@ -935,7 +1539,11 @@ class PipelineManager:
                         paper_id,
                         pdf_status="not_found",
                         status="needs_pdf",
-                        version=None,
+                        version={
+                            "publishedVersion": "published",
+                            "acceptedVersion": "accepted",
+                            "submittedVersion": "preprint",
+                        }.get(candidate.get("version")),
                         source_url=candidate.get("source_url"),
                         pdf_path=None,
                         pdf_sha256=None,
@@ -955,7 +1563,7 @@ class PipelineManager:
                             == "session_expired"
                             else "waiting" if manual else "unknown"
                         ),
-                        error="；".join(errors) or "两条自动获取路径均未取得可验证 PDF",
+                        error="；".join(errors) or "自动获取未取得可验证 PDF",
                         endnote_status="pending",
                     )
                     self.db.event(
@@ -973,11 +1581,17 @@ class PipelineManager:
                 task.cancel()
             await asyncio.gather(*pending, return_exceptions=True)
             raise
+        except BatchPaused:
+            for task in pending:
+                task.cancel()
+            if pending:
+                await asyncio.gather(*pending, return_exceptions=True)
+            raise
         finally:
             self._cleanup_race_files(paper_id, keep=keep_path)
             self._staged_browser_downloads.pop(paper_id, None)
             self._staged_browser_papers.discard(paper_id)
-        if self.institution_gap_seconds:
+        if mode == "legacy" and self.institution_gap_seconds:
             await asyncio.sleep(self.institution_gap_seconds)
 
     def confirm_metadata(self, paper_id: str, metadata: dict[str, Any]) -> None:
@@ -998,7 +1612,7 @@ class PipelineManager:
         destination.parent.mkdir(parents=True, exist_ok=True)
         if source.resolve() != destination.resolve():
             shutil.copy2(source, destination)
-        result = self._validate_pdf(destination, expected_doi=paper.get("doi"), expected_title=paper.get("title"))
+        result = await self._validate_pdf_for_paper(paper, destination)
         if result.identity == "rejected":
             destination.unlink(missing_ok=True)
             raise ValueError(result.reason)
@@ -1065,10 +1679,7 @@ class PipelineManager:
             fallback=scholar_search_url(paper.get("title") or paper["input_text"]),
             profile=profile,
         )
-        publisher = str(
-            paper.get("institution_publisher")
-            or publisher_key(paper.get("metadata", {}).get("url") or entry)
-        )
+        publisher = self._publisher_for_paper(paper, profile)
         session_key = (profile.id.casefold(), publisher)
         if (
             profile_access_type(profile) == "ezproxy"
@@ -1084,22 +1695,25 @@ class PipelineManager:
             self.db.event(batch_id, f"{profile.name or '机构'} 会话已就绪，开始逐篇获取")
         try:
             download_started = False
-            async with asyncio.timeout(self.institution_discovery_timeout_seconds) as discovery_timeout:
-                def mark_download_started() -> None:
-                    nonlocal download_started
-                    if download_started:
-                        return
-                    download_started = True
-                    discovery_timeout.reschedule(None)
-                    self.db.event(
-                        batch_id,
-                        "已定位 PDF 入口；下载与校验阶段不计入发现超时",
-                        paper_id=paper["id"],
-                    )
+            async with self._institution_slot(
+                batch_id, paper, self._acquisition_mode_for_batch(batch_id)
+            ):
+                async with asyncio.timeout(self.institution_discovery_timeout_seconds) as discovery_timeout:
+                    def mark_download_started() -> None:
+                        nonlocal download_started
+                        if download_started:
+                            return
+                        download_started = True
+                        discovery_timeout.reschedule(None)
+                        self.db.event(
+                            batch_id,
+                            "已定位 PDF 入口；下载与校验阶段不计入发现超时",
+                            paper_id=paper["id"],
+                        )
 
-                await self.acquire_institution_pdf(
-                    paper["id"], on_download_started=mark_download_started
-                )
+                    await self.acquire_institution_pdf(
+                        paper["id"], on_download_started=mark_download_started,
+                    )
         except TimeoutError as exc:
             if not discovery_timeout.expired():
                 message = str(exc).strip() or "下载或 PDF 校验阶段超时"
@@ -1143,6 +1757,8 @@ class PipelineManager:
                 needs_action="manual_pdf", error=str(exc),
             )
             self.db.event(batch_id, f"出版社拒绝，转入人工队列：{exc}", level="warning", paper_id=paper["id"])
+        except BatchPaused:
+            raise
         except Exception as exc:
             self.db.update_paper(
                 paper["id"], status="needs_pdf", pdf_status="not_found",
@@ -1177,22 +1793,30 @@ class PipelineManager:
         target = self._institution_entry(
             doi=doi, fallback=fallback, profile=profile
         )
-        publisher = str(
-            paper.get("institution_publisher") or publisher_key(fallback)
-        )
+        publisher = self._publisher_for_paper(paper, profile)
         self.db.event(
             paper["batch_id"],
             f"正在使用专用 Chrome 会话尝试单篇 {profile.name or '机构'} 获取",
             paper_id=paper_id,
         )
         try:
-            result = await self.browser.acquire_for_paper(
-                paper_id,
-                target,
-                on_download_started=on_download_started,
-                publisher=publisher,
-                profile=profile,
-            )
+            async def browse() -> dict[str, Any]:
+                return await self.browser.acquire_for_paper(
+                    paper_id,
+                    target,
+                    on_download_started=on_download_started,
+                    publisher=publisher,
+                    profile=profile,
+                )
+
+            if self._institution_slot_owners.get(paper_id) is asyncio.current_task():
+                result = await browse()
+            else:
+                async with self._institution_slot(
+                    paper["batch_id"], paper,
+                    self._acquisition_mode_for_batch(paper["batch_id"]),
+                ):
+                    result = await browse()
             updated = self.db.get_paper(paper_id)
             if not updated or updated.get("pdf_status") != "verified":
                 raise ValueError(updated.get("error") if updated else "PDF 下载后的身份核验未通过")
@@ -1243,6 +1867,8 @@ class PipelineManager:
                 paper_id=paper_id,
             )
             raise
+        except BatchPaused:
+            raise
         except Exception as exc:
             self.db.update_paper(
                 paper_id, status="needs_pdf", pdf_status="not_found", needs_action="manual_pdf", error=str(exc)
@@ -1273,41 +1899,43 @@ class PipelineManager:
         target = self._institution_entry(
             doi=paper.get("doi"), fallback=fallback, profile=profile
         )
-        publisher = str(
-            paper.get("institution_publisher") or publisher_key(fallback)
-        )
+        publisher = self._publisher_for_paper(paper, profile)
         download_started = False
         try:
-            async with asyncio.timeout(
-                self.institution_discovery_timeout_seconds
-            ) as discovery_timeout:
-                def mark_download_started() -> None:
-                    nonlocal download_started
-                    if download_started:
-                        return
-                    download_started = True
-                    discovery_timeout.reschedule(None)
+            async with self._institution_slot(
+                paper["batch_id"], paper,
+                self._acquisition_mode_for_batch(paper["batch_id"]),
+            ):
+                async with asyncio.timeout(
+                    self.institution_discovery_timeout_seconds
+                ) as discovery_timeout:
+                    def mark_download_started() -> None:
+                        nonlocal download_started
+                        if download_started:
+                            return
+                        download_started = True
+                        discovery_timeout.reschedule(None)
 
-                try:
-                    result = await self.browser.continue_institution_access(
-                        paper_id,
-                        target,
-                        publisher=publisher,
-                        profile=profile,
-                        on_download_started=mark_download_started,
-                    )
-                except NeedsManualInstitutionAction as exc:
-                    if exc.reason != "institution_entry_not_found":
-                        raise
-                    # A restart intentionally forgets in-memory session claims.
-                    # Reopen the same paper flow and ask the user to authenticate.
-                    result = await self.browser.acquire_for_paper(
-                        paper_id,
-                        target,
-                        publisher=publisher,
-                        profile=profile,
-                        on_download_started=mark_download_started,
-                    )
+                    try:
+                        result = await self.browser.continue_institution_access(
+                            paper_id,
+                            target,
+                            publisher=publisher,
+                            profile=profile,
+                            on_download_started=mark_download_started,
+                        )
+                    except NeedsManualInstitutionAction as exc:
+                        if exc.reason != "institution_entry_not_found":
+                            raise
+                        # A restart intentionally forgets in-memory session claims.
+                        # Reopen the same paper flow and ask the user to authenticate.
+                        result = await self.browser.acquire_for_paper(
+                            paper_id,
+                            target,
+                            publisher=publisher,
+                            profile=profile,
+                            on_download_started=mark_download_started,
+                        )
             updated = self.db.get_paper(paper_id)
             if not updated or updated.get("pdf_status") != "verified":
                 raise ValueError(updated.get("error") if updated else "PDF 下载后的身份核验未通过")
@@ -1508,20 +2136,30 @@ class PipelineManager:
             url = paper.get("source_url") or scholar_search_url(paper.get("doi") or paper.get("title") or paper["input_text"])
         await self.browser.open_for_paper(paper_id, url, profile=profile)
 
-    def commit(self, batch_id: str) -> None:
+    def commit(self, batch_id: str, *, wait_for_acquisition: bool = True) -> None:
         self.db.assert_batch_writable(batch_id)
         current = self._commit_tasks.get(batch_id)
         if current and not current.done():
             return
-        self._commit_tasks[batch_id] = asyncio.create_task(self._commit_batch(batch_id))
+        self._commit_tasks[batch_id] = asyncio.create_task(
+            self._commit_batch(batch_id, wait_for_acquisition=wait_for_acquisition)
+        )
 
-    async def _commit_batch(self, batch_id: str) -> None:
+    async def _commit_batch(
+        self, batch_id: str, *, wait_for_acquisition: bool = True
+    ) -> None:
+        if wait_for_acquisition:
+            await self.wait_for_batch_acquisition(batch_id)
         with self.db.allow_deleting_writes():
             async with self._commit_lock:
                 batch = self.db.get_batch(batch_id)
                 if not batch:
                     return
-                await self._commit_zotero_batch(batch)
+                self._committing_batches.add(batch_id)
+                try:
+                    await self._commit_zotero_batch(batch)
+                finally:
+                    self._committing_batches.discard(batch_id)
 
     async def export_endnote(self, batch_id: str) -> dict[str, Any]:
         async with self.zotero_operation_guard():
@@ -1558,51 +2196,70 @@ class PipelineManager:
             self.db.event(batch_id, f"Zotero 准备失败：{exc}", level="error")
             return
 
-        for paper in self.db.get_batch(batch_id)["papers"]:
-            if paper["metadata_status"] != "verified" or paper["endnote_status"] == "verified":
-                continue
-            operation_id = self.db.start_operation(
-                paper["id"], "zotero_commit", {"collection": collection_name, "collection_key": collection_key}
-            )
-            self.db.update_paper(paper["id"], endnote_status="pending_commit")
-            metadata = dict(paper.get("metadata") or {})
-            metadata.update({
-                "doi": paper.get("doi"), "title": paper.get("title"), "year": paper.get("year"),
-                "authors": paper.get("authors") or [], "journal": paper.get("journal") or "",
-            })
-            pdf_path = (
-                Path(paper["pdf_path"])
-                if paper.get("pdf_path") and paper["pdf_status"] in {"verified", "accepted"}
-                else None
-            )
-            try:
-                result = await self.zotero.commit_paper(collection_key, metadata, pdf_path)
-                has_full_text = bool(pdf_path or result.get("existing_full_text"))
-                fields = {
-                    "endnote_status": "verified",
-                    "status": "complete" if has_full_text else "needs_pdf",
-                    "record_number": result.get("record_number"),
-                    "needs_action": (
-                        None
-                        if has_full_text
-                        else (
-                            "manual_institution"
-                            if paper.get("needs_action") == "manual_institution"
-                            else "manual_pdf"
-                        )
-                    ),
-                }
-                if has_full_text:
-                    fields["error"] = None
-                self.db.update_paper(paper["id"], **fields)
-                self.db.finish_operation(operation_id, "verified", result)
-                self.db.event(batch_id, "Zotero 写入及对账完成", paper_id=paper["id"])
-            except Exception as exc:
-                self.db.finish_operation(operation_id, "uncertain", {"error": str(exc)})
-                self.db.update_paper(
-                    paper["id"], endnote_status="uncertain", status="failed",
-                    needs_action="reconcile_endnote", error=str(exc),
+        for original in self.db.get_batch(batch_id)["papers"]:
+            async with self.paper_operation_guard(original["id"]):
+                paper = self.db.get_paper(original["id"])
+                if (
+                    not paper
+                    or paper["metadata_status"] != "verified"
+                    or paper["endnote_status"] in {"verified", "uncertain", "pending_commit"}
+                ):
+                    continue
+                operation_id = self.db.start_operation(
+                    paper["id"], "zotero_commit", {"collection": collection_name, "collection_key": collection_key}
                 )
-                self.db.event(batch_id, f"Zotero 提交状态不确定：{exc}", level="error", paper_id=paper["id"])
-        self.db.update_batch(batch_id, status="completed", error=None)
+                self.db.update_paper(paper["id"], endnote_status="pending_commit")
+                metadata = dict(paper.get("metadata") or {})
+                metadata.update({
+                    "doi": paper.get("doi"), "title": paper.get("title"), "year": paper.get("year"),
+                    "authors": paper.get("authors") or [], "journal": paper.get("journal") or "",
+                })
+                pdf_path = (
+                    Path(paper["pdf_path"])
+                    if paper.get("pdf_path") and paper["pdf_status"] in {"verified", "accepted"}
+                    else None
+                )
+                try:
+                    result = await self.zotero.commit_paper(collection_key, metadata, pdf_path)
+                    has_full_text = bool(pdf_path or result.get("existing_full_text"))
+                    fields = {
+                        "endnote_status": "verified",
+                        "status": "complete" if has_full_text else "needs_pdf",
+                        "record_number": result.get("record_number"),
+                        "needs_action": (
+                            None
+                            if has_full_text
+                            else (
+                                "manual_institution"
+                                if paper.get("needs_action") == "manual_institution"
+                                else "manual_pdf"
+                            )
+                        ),
+                    }
+                    if has_full_text:
+                        fields["error"] = None
+                    self.db.update_paper(paper["id"], **fields)
+                    self.db.finish_operation(operation_id, "verified", result)
+                    self.db.event(batch_id, "Zotero 写入及对账完成", paper_id=paper["id"])
+                except asyncio.CancelledError:
+                    self.db.finish_operation(
+                        operation_id, "uncertain", {"error": "Zotero 提交期间任务取消"}
+                    )
+                    self.db.update_paper(
+                        paper["id"], endnote_status="uncertain", status="failed",
+                        needs_action="reconcile_endnote",
+                        error="Zotero 提交期间任务取消，需先人工对账",
+                    )
+                    raise
+                except Exception as exc:
+                    self.db.finish_operation(operation_id, "uncertain", {"error": str(exc)})
+                    self.db.update_paper(
+                        paper["id"], endnote_status="uncertain", status="failed",
+                        needs_action="reconcile_endnote", error=str(exc),
+                    )
+                    self.db.event(batch_id, f"Zotero 提交状态不确定：{exc}", level="error", paper_id=paper["id"])
+        current = self.db.get_batch(batch_id)
+        actionable = {"queued", "matching", "ready", "looking_for_pdf", "institution_pending"}
+        if current and not any(paper["status"] in actionable for paper in current["papers"]):
+            self.db.update_batch(batch_id, status="completed", error=None)
         self.db.event(batch_id, "Zotero 提交阶段结束")

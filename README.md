@@ -133,6 +133,7 @@ doi,title,year,author
 ```toml
 [acquisition]
 sources = ["open_access", "institution"]
+acquisition_mode = "legacy"
 auto_institution = true
 auto_commit = true
 login_wait_seconds = 600
@@ -273,7 +274,7 @@ Text Translation: Unicode (UTF-8)
 
 测试集定义在 `examples/test_batch_20.csv`。抽样器只读 EndNote 文件，先排除重复文件、补充材料和无法从首页可靠确认 DOI/题名的 PDF。生成的 manifest 只保存相对于 `--pdf-root` 的路径，不暴露本地库名。CARSI 与手动会话目前只完成本地模拟页面和自动化测试，**尚未进行真实高校账号、订阅资源或真实文献库写入验收**。需要机构登录或真实网络访问的开发者验收脚本位于 `tests/`；请仅对获准内容使用小规模测试集。
 
-当开放与机构来源都已启用、且自动机构获取已打开时，每篇论文的两条路径会同时开始。首个通过主文身份校验的正式版 PDF 获胜，另一条路径随即取消并清理；两路都失败才进入人工队列。为避免多个页面争用同一登录会话，机构浏览器操作仍保持串行。PDF 入口发现超过 180 秒会进入人工队列；一旦开始尝试下载，传输和 PDF 校验时间不计入该 180 秒。
+设置中的“获取并行模式”有四档：默认的“当前实现”在批内逐篇处理、单篇双源竞速；“OA 并行”允许最多 4 篇同时查找开放全文，失败后机构逐篇处理；“跨出版社 + OA”允许最多 2 篇机构获取且同出版社逐篇；“完全并行”允许最多 4 篇机构获取、同出版社最多 2 篇。后两档先启动 OA，3 秒未成功或已失败才启动机构路径。新设置只影响新批次。登录仍需用户完成；机构访问需遵守所在机构和出版社的使用条款。PDF 入口发现超过 180 秒会进入人工队列；排队、登录、下载与 PDF 校验时间不计入该 180 秒。
 
 若只想比较合法开放候选而不下载任何 PDF，可运行元数据基准：
 
@@ -296,7 +297,7 @@ Text Translation: Unicode (UTF-8)
 - 未安装 Tesseract 时，扫描件不会被自动确认。
 - Zotero 本地 API 必须由用户启用并授权。
 - EndNote 导入需要用户完成；重复导入可能产生重复题录。
-- 本工具不会绕过付费墙，也不会并发抓取订阅资源。
+- 本工具不会绕过付费墙；机构并行模式仅适用于允许此用法的授权资源。
 
 ---
 
@@ -426,6 +427,7 @@ doi,title,year,author
 ```toml
 [acquisition]
 sources = ["open_access", "institution"]
+acquisition_mode = "legacy"
 auto_institution = true
 auto_commit = true
 login_wait_seconds = 600
@@ -556,7 +558,7 @@ Text Translation: Unicode (UTF-8)
 
 標準の 20 件は `examples/test_batch_20.csv` です。サンプラーは EndNote ライブラリを変更せず、SHA-256 で重複を除外し、冒頭ページから DOI とタイトルを確認できる本文 PDF のみを採用します。manifest には `--pdf-root` からの相対パスのみを保存します。CARSI と手動セッションはローカル模擬ページと自動テストまで完了していますが、**実際の大学アカウント、購読資料、実文献ライブラリへの書き込みでは未検証です**。機関ログインや実ネットワークを使う開発者向け検証スクリプトは `tests/` にあります。購読コンテンツでは許可された少量のデータだけを使用してください。
 
-オープンアクセスと機関ソースの両方を有効にし、自動機関取得もオンにした場合、各論文で 2 つの経路を同時に開始します。本文の同一性検証に最初に合格した正式版 PDF を採用して、もう一方を停止・清理します。両方が失敗した場合だけ手動キューへ移ります。同じログインセッションを複数ページが競合しないよう、機関ブラウザー操作自体は直列です。PDF 入口の検出が 180 秒を超えると手動キューへ移り、ダウンロード開始後の転送と PDF 検証はこの 180 秒に含まれません。
+取得の並列モードは 4 段階です。既定の `legacy` は従来どおりバッチ内で論文を順番に処理し、各論文の OA と機関経路を同時に試します。`oa_parallel` は OA を最大 4 件並行し、失敗後に機関経路を順番に処理します。`publisher_parallel` は機関経路を最大 2 件（同じ出版社では 1 件）、`full_parallel` は最大 4 件（同じ出版社では 2 件）処理します。後者 2 つは OA の開始から 3 秒経っても成功しなければ機関経路を開始します。新しい設定は新規バッチに適用されます。機関と出版社の利用条件を確認してください。PDF 入口の検出上限 180 秒には、待機・ログイン・転送・検証時間を含めません。
 
 PDF を取得せず、合法なオープン候補だけを比較する場合は次を実行します。
 
@@ -579,7 +581,7 @@ PDF を取得せず、合法なオープン候補だけを比較する場合は�
 - Tesseract がない場合、スキャン PDF は自動確定されません。
 - Zotero ローカル API はユーザーによる有効化と承認が必要です。
 - EndNote への取り込みは手動です。同じファイルを繰り返し取り込むと重複する場合があります。
-- ペイウォール回避や購読コンテンツの並列収集は行いません。
+- ペイウォールは回避しません。機関の並列モードは、その利用が許可される資料にのみ使用してください。
 
 ---
 
@@ -706,6 +708,7 @@ Acquisition, OCR, and institutional-profile settings are stored in `runtime/conf
 ```toml
 [acquisition]
 sources = ["open_access", "institution"]
+acquisition_mode = "legacy"
 auto_institution = true
 auto_commit = true
 login_wait_seconds = 600
@@ -842,7 +845,7 @@ Build the reproducible 20-paper sample from read-only EndNote attachment storage
 
 The canonical fixture is `examples/test_batch_20.csv`. The sampler deduplicates files by SHA-256 and accepts only main PDFs whose DOI and title can be confirmed from the opening pages. Its manifest stores only paths relative to `--pdf-root`, so the local library name is not exposed. CARSI and manual sessions have been checked only with local simulated pages and automated tests; **they have not been validated with a real university account, subscription resource, or live reference-library write**. Developer acceptance scripts that use institutional login or the live network remain under `tests/`; use only small, authorized datasets.
 
-When both sources and automatic institutional retrieval are enabled, the open-access and institutional paths start concurrently for each paper. The first published-version main PDF to pass identity validation wins; the other path is cancelled and cleaned up. Only a double failure moves the paper to the manual queue. Institutional browser operations remain serialized so that pages do not compete for the same authenticated session. PDF-entry discovery is limited to 180 seconds; transfer and validation time stop counting once a download attempt starts.
+The acquisition setting offers four modes. The default `legacy` mode processes papers one at a time while racing OA and institutional sources for each paper. `oa_parallel` runs up to four OA attempts, then handles institutional fallbacks one at a time. `publisher_parallel` permits two institutional attempts across different publishers; `full_parallel` permits four, including up to two at the same publisher. The last two modes start the institutional path when OA fails or has not succeeded three seconds after actually starting. A setting change applies to new batches. Follow the institution's and publisher's terms. The 180-second PDF-entry discovery timer excludes queueing, login, transfer, and validation.
 
 Run the lawful candidate-only benchmark without downloading any PDF:
 
@@ -865,7 +868,7 @@ Publisher flows are intentionally distinct. IEEE prefers proxied `stampPDF` / `i
 - Scanned PDFs are not automatically accepted when Tesseract is unavailable.
 - The Zotero local API must be enabled and authorized by the user.
 - EndNote import remains a user action; repeated imports may create duplicate records.
-- The application does not bypass paywalls or perform concurrent harvesting of subscription content.
+- The application does not bypass paywalls. Use institutional concurrency only where your access terms permit it.
 
 ---
 

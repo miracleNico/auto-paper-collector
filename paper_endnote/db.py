@@ -322,6 +322,14 @@ class Database:
             batch["papers"] = [self._decode_paper(dict(item)) for item in papers]
             return batch
 
+    def batch_is_paused(self, batch_id: str) -> bool:
+        """Read only the control flag used by queued acquisition workers."""
+        with self.connect() as connection:
+            row = connection.execute(
+                "SELECT paused FROM batches WHERE id=?", (batch_id,)
+            ).fetchone()
+        return row is None or bool(row[0])
+
     @staticmethod
     def _decode_batch(batch: dict[str, Any]) -> dict[str, Any]:
         raw = batch.pop("institution_config_json", None)

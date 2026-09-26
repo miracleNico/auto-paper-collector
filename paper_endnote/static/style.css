@@ -315,7 +315,7 @@ label.check.compact { align-items: center; margin: 0; font-size: .75rem; }
 .task-detail.loading { display: grid; place-items: center; }
 .task-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 1rem; margin-bottom: .8rem; }
 .task-head h2 { max-width: 42rem; margin-bottom: .28rem; font-size: clamp(1.25rem, 2vw, 1.55rem); overflow-wrap: anywhere; }
-.task-subtitle { display: flex; align-items: center; gap: .45rem; margin: 0; color: var(--muted); font-size: .8rem; }
+.task-subtitle { display: flex; align-items: center; gap: .45rem; flex-wrap: wrap; margin: 0; color: var(--muted); font-size: .8rem; }
 .task-actions { display: flex; flex: 0 0 auto; align-items: center; justify-content: flex-end; gap: .28rem; flex-wrap: wrap; }
 .task-actions > button,
 .task-actions > .more-actions > summary {
@@ -340,6 +340,9 @@ label.check.compact { align-items: center; margin: 0; font-size: .75rem; }
 .progress-meta { display: flex; align-items: center; justify-content: space-between; gap: .8rem; margin: 1rem 0 .4rem; color: var(--muted); font-size: .75rem; }
 .progress { height: 9px; overflow: hidden; border-radius: 999px; background: #e9f0f7; }
 .progress span { display: block; height: 100%; border-radius: inherit; background: linear-gradient(90deg, var(--blue-400), var(--pink-400)); transition: width .35s ease; }
+.acquisition-progress { display: flex; flex-wrap: wrap; gap: .35rem .7rem; margin: .7rem 0 0; color: var(--muted); font-size: .7rem; }
+.acquisition-progress span { padding: .35rem .55rem; border-radius: 8px; background: #f4f8fc; white-space: nowrap; }
+.acquisition-progress strong { color: var(--ink-soft); }
 .summary-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: .65rem; margin: 1rem 0; }
 .summary-card { min-width: 0; padding: .8rem; border: 1px solid var(--line); border-radius: 16px; background: #fbfdff; }
 .summary-card:nth-child(2) { background: var(--blue-50); }
@@ -418,6 +421,7 @@ td.actions { min-width: 190px; max-width: 270px; }
 
 .settings-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 1rem; align-items: start; }
 .settings-card { padding: 1.2rem; }
+.settings-note { margin: -.2rem 0 .65rem; color: var(--muted); font-size: .72rem; line-height: 1.5; }
 .settings-card.wide { grid-column: 1 / -1; }
 .settings-title { display: flex; align-items: center; gap: .7rem; margin-bottom: 1rem; }
 .settings-title .settings-icon { width: 35px; height: 35px; margin: 0; border-radius: 12px; color: var(--blue-600); background: var(--blue-100); font-size: .9rem; }

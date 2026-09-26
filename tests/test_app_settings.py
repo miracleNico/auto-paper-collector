@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import tempfile
 import unittest
 from html.parser import HTMLParser
@@ -8,6 +9,7 @@ from unittest.mock import AsyncMock, patch
 
 from paper_endnote.config import Settings
 from paper_endnote.db import Database
+from paper_endnote.pipeline import PipelineManager
 from paper_endnote.user_config import (
     InstitutionProfile,
     OcrOptions,
@@ -63,6 +65,71 @@ def _settings(root: Path) -> Settings:
 
 
 class SettingsUpdateTests(unittest.IsolatedAsyncioTestCase):
+    async def test_retry_waits_for_in_flight_auto_commit(self) -> None:
+        from paper_endnote import app as app_module
+
+        class HoldingZotero:
+            def __init__(self) -> None:
+                self.started = asyncio.Event()
+                self.release = asyncio.Event()
+
+            async def ensure_collection(self, name: str, *, create: bool) -> str:
+                return "COL1"
+
+            async def commit_paper(self, collection_key, metadata, pdf_path):
+                self.started.set()
+                await self.release.wait()
+                return {"record_number": "ITEM1", "existing_full_text": False}
+
+        with tempfile.TemporaryDirectory() as directory:
+            settings = _settings(Path(directory))
+            settings.acquisition_mode = "oa_parallel"
+            settings.auto_commit = True
+            database = Database(settings.database_path)
+            manager = PipelineManager(settings, database)
+            zotero = HoldingZotero()
+            manager.zotero = zotero
+            batch_id = database.create_batch(
+                name="auto commit",
+                target_library="Test",
+                library_mode="new",
+                items=[{"input_text": "10.1000/a", "doi": "10.1000/a"}],
+                institution_config={
+                    **settings.institution.as_dict(),
+                    "_acquisition_mode": "oa_parallel",
+                    "_acquisition_sources": ["open_access"],
+                    "_auto_institution": False,
+                },
+            )
+            paper_id = database.get_batch(batch_id)["papers"][0]["id"]
+            database.update_paper(
+                paper_id,
+                doi="10.1000/a",
+                title="Example Paper",
+                metadata_status="verified",
+                pdf_status="not_found",
+                endnote_status="pending",
+                status="endnote_pending",
+            )
+            manager.start(batch_id)
+            await asyncio.wait_for(zotero.started.wait(), timeout=2)
+            with (
+                patch.object(app_module, "pipeline", manager),
+                patch.object(app_module, "database", database),
+                patch.object(manager, "start"),
+            ):
+                retry = asyncio.create_task(app_module.retry_paper(paper_id))
+                try:
+                    await asyncio.sleep(0.05)
+                    self.assertFalse(retry.done(), "重试必须等待正在提交的 Zotero 写入")
+                finally:
+                    zotero.release.set()
+                    await asyncio.wait_for(manager.wait_for_batch_acquisition(batch_id), timeout=2)
+                    await asyncio.wait_for(retry, timeout=2)
+            updated = database.get_paper(paper_id)
+            self.assertEqual(updated["status"], "ready")
+            self.assertEqual(updated["endnote_status"], "verified")
+
     async def test_clearing_institution_returns_to_oa_only(self) -> None:
         from paper_endnote import app as app_module
 
@@ -100,6 +167,7 @@ class SettingsUpdateTests(unittest.IsolatedAsyncioTestCase):
 
         with tempfile.TemporaryDirectory() as directory:
             settings = _settings(Path(directory))
+            settings.acquisition_mode = "publisher_parallel"
             settings.institution = InstitutionProfile(
                 id="example-u",
                 name="Example University",
@@ -128,8 +196,70 @@ class SettingsUpdateTests(unittest.IsolatedAsyncioTestCase):
                 snapshot["_acquisition_sources"], ["open_access", "institution"]
             )
             self.assertTrue(snapshot["_auto_institution"])
+            self.assertEqual(snapshot["_acquisition_mode"], "publisher_parallel")
             self.assertNotIn("password", snapshot)
             self.assertNotIn("cookie", snapshot)
+
+    async def test_mode_setting_applies_only_to_new_batches(self) -> None:
+        from paper_endnote import app as app_module
+
+        with tempfile.TemporaryDirectory() as directory:
+            settings = _settings(Path(directory))
+            database = Database(settings.database_path)
+            payload = app_module.BatchCreate(
+                name="snapshot",
+                items_text="10.1000/example",
+                target_library="Test",
+                library_mode="new",
+                start_immediately=False,
+            )
+            with (
+                patch.object(app_module, "settings", settings),
+                patch.object(app_module, "database", database),
+            ):
+                first = await app_module.create_batch(payload)
+                await app_module.update_settings(
+                    app_module.SettingsUpdate(acquisition_mode="full_parallel")
+                )
+                second = await app_module.create_batch(payload)
+
+            self.assertEqual(settings.acquisition_mode, "full_parallel")
+            self.assertEqual(
+                load_acquisition_config(settings.config_path, create=False).acquisition_mode,
+                "full_parallel",
+            )
+            self.assertEqual(
+                database.get_batch(first["id"])["institution_config"]["_acquisition_mode"],
+                "legacy",
+            )
+            self.assertEqual(
+                database.get_batch(second["id"])["institution_config"]["_acquisition_mode"],
+                "full_parallel",
+            )
+
+    async def test_old_batch_api_defaults_to_legacy_and_exposes_progress(self) -> None:
+        from paper_endnote import app as app_module
+
+        with tempfile.TemporaryDirectory() as directory:
+            database = Database(_settings(Path(directory)).database_path)
+            batch_id = database.create_batch(
+                name="old batch", target_library="Test", library_mode="new", items=[]
+            )
+            progress = {
+                stage: {"running": 0, "waiting": 0}
+                for stage in ("metadata", "oa", "institution", "validation")
+            }
+            with (
+                patch.object(app_module, "database", database),
+                patch.object(app_module.pipeline, "acquisition_progress", return_value=progress),
+            ):
+                detail = await app_module.get_batch(batch_id)
+                listing = await app_module.list_batches()
+
+            self.assertEqual(detail["acquisition_mode"], "legacy")
+            self.assertEqual(detail["acquisition_progress"], progress)
+            self.assertEqual(listing[0]["acquisition_mode"], "legacy")
+            self.assertEqual(listing[0]["acquisition_progress"], progress)
 
     async def test_switching_from_carsi_to_manual_clears_hidden_carsi_links(self) -> None:
         from paper_endnote import app as app_module

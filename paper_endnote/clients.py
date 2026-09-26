@@ -2,8 +2,12 @@ from __future__ import annotations
 
 import asyncio
 import html
+import math
 import re
+import weakref
 from dataclasses import dataclass
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 from typing import Any
 from urllib.parse import quote
 
@@ -16,6 +20,103 @@ from .user_config import InstitutionProfile, institution_openurl, institution_pr
 
 class RemoteServiceError(RuntimeError):
     pass
+
+
+class _CrossrefBudget:
+    """One event loop's shared Crossref connection and dispatch budget."""
+
+    def __init__(self) -> None:
+        self.public = asyncio.Semaphore(1)
+        self.polite = asyncio.Semaphore(3)
+        self.dispatch_lock = asyncio.Lock()
+        self.next_send = {"doi": 0.0, "search": 0.0}
+        self.minimum_intervals = {"doi": 0.0, "search": 0.0}
+        self.blocked_until = 0.0
+
+    async def wait_to_send(self, kind: str, configured_interval: float) -> None:
+        loop = asyncio.get_running_loop()
+        while True:
+            async with self.dispatch_lock:
+                now = loop.time()
+                if self.blocked_until > now:
+                    delay = self.blocked_until - now
+                else:
+                    interval = max(
+                        configured_interval,
+                        self.minimum_intervals[kind],
+                        1.0 if kind == "search" else 0.0,
+                    )
+                    send_at = max(now, self.next_send[kind])
+                    self.next_send[kind] = send_at + interval
+                    delay = send_at - now
+                    break
+            await asyncio.sleep(min(delay, 60.0))
+        while True:
+            delay = send_at - loop.time()
+            if delay <= 0:
+                break
+            await asyncio.sleep(min(delay, 60.0))
+        # A 429 could arrive while a request is waiting for its reserved slot.
+        while True:
+            async with self.dispatch_lock:
+                delay = self.blocked_until - loop.time()
+            if delay <= 0:
+                return
+            await asyncio.sleep(min(delay, 60.0))
+
+    async def observe(self, response: httpx.Response, retry_delay: float = 0.0) -> None:
+        interval = _crossref_header_interval(response)
+        async with self.dispatch_lock:
+            if interval is not None:
+                for kind in self.minimum_intervals:
+                    self.minimum_intervals[kind] = max(self.minimum_intervals[kind], interval)
+            if retry_delay:
+                self.blocked_until = max(
+                    self.blocked_until, asyncio.get_running_loop().time() + retry_delay
+                )
+
+
+_crossref_budgets: weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, _CrossrefBudget] = weakref.WeakKeyDictionary()
+
+
+def _crossref_budget() -> _CrossrefBudget:
+    loop = asyncio.get_running_loop()
+    budget = _crossref_budgets.get(loop)
+    if budget is None:
+        budget = _CrossrefBudget()
+        _crossref_budgets[loop] = budget
+    return budget
+
+
+def _crossref_header_interval(response: httpx.Response) -> float | None:
+    try:
+        limit = int(response.headers["x-rate-limit-limit"])
+        raw_interval = response.headers["x-rate-limit-interval"].strip().casefold()
+        match = re.fullmatch(r"(\d+(?:\.\d+)?)\s*(ms|s|m|h)?", raw_interval)
+        if limit <= 0 or not match:
+            return None
+        multiplier = {"ms": 0.001, "s": 1.0, "m": 60.0, "h": 3600.0}[match.group(2) or "s"]
+        return float(match.group(1)) * multiplier / limit
+    except (KeyError, TypeError, ValueError, ZeroDivisionError):
+        return None
+
+
+def _retry_after_seconds(response: httpx.Response, attempt: int) -> float:
+    raw = response.headers.get("retry-after", "").strip()
+    try:
+        if raw:
+            seconds = float(raw)
+            if math.isfinite(seconds):
+                return max(0.0, seconds)
+    except ValueError:
+        try:
+            when = parsedate_to_datetime(raw)
+            if when.tzinfo is None:
+                when = when.replace(tzinfo=timezone.utc)
+            return max(0.0, (when - datetime.now(timezone.utc)).total_seconds())
+        except (TypeError, ValueError, OverflowError):
+            pass
+    return float(min(2**attempt, 8))
 
 
 def _year(work: dict[str, Any]) -> int | None:
@@ -61,21 +162,25 @@ class CrossrefClient:
         self.settings = settings
         headers = {"User-Agent": self._user_agent()}
         self.client = httpx.AsyncClient(headers=headers, timeout=settings.request_timeout_seconds, follow_redirects=True)
-        self._lock = asyncio.Lock()
-        self._last_request = 0.0
 
     def _user_agent(self) -> str:
         suffix = f"; mailto:{self.settings.crossref_mailto}" if self.settings.crossref_mailto else ""
         return f"PaperEndNote/0.1 (local research workflow{suffix})"
 
     async def _get(self, url: str, **params: Any) -> dict[str, Any]:
-        async with self._lock:
-            now = asyncio.get_running_loop().time()
-            delay = self.settings.crossref_min_interval_seconds - (now - self._last_request)
-            if delay > 0:
-                await asyncio.sleep(delay)
-            response = await self.client.get(url, params=params)
-            self._last_request = asyncio.get_running_loop().time()
+        budget = _crossref_budget()
+        kind = "search" if url.rstrip("/").endswith("/works") else "doi"
+        semaphore = budget.polite if self.settings.crossref_mailto else budget.public
+        for attempt in range(3):
+            async with semaphore:
+                await budget.wait_to_send(kind, self.settings.crossref_min_interval_seconds)
+                response = await self.client.get(
+                    url, params=params, headers={"User-Agent": self._user_agent()}
+                )
+                retry_delay = _retry_after_seconds(response, attempt) if response.status_code == 429 else 0.0
+                await budget.observe(response, retry_delay)
+            if response.status_code != 429 or attempt == 2:
+                break
         try:
             response.raise_for_status()
         except httpx.HTTPStatusError as exc:

@@ -33,6 +33,15 @@ const state = {
 
 const $ = selector => document.querySelector(selector);
 const $$ = selector => [...document.querySelectorAll(selector)];
+const ACQUISITION_MODES = {
+  legacy: {label: "逐篇获取", description: "逐篇处理；单篇在来源可用时同时尝试 OA 与机构。仅影响新批次。"},
+  oa_parallel: {label: "OA 并行、机构逐篇", description: "最多 4 篇同时尝试 OA；每篇 OA 失败后进入机构队列。仅影响新批次。"},
+  publisher_parallel: {label: "跨出版社 + OA 并行", description: "最多 4 篇同时尝试 OA、2 篇机构获取；同出版社逐篇，OA 3 秒未成功后可启动机构。仅影响新批次；启用机构并行前请核对使用条款。"},
+  full_parallel: {label: "完全并行", description: "最多 4 篇 OA、4 篇机构获取；同出版社可有 2 篇重叠。仅影响新批次；启用机构并行前请核对使用条款。"},
+};
+const ACQUISITION_STAGES = [
+  ["metadata", "题录"], ["oa", "OA"], ["institution", "机构"], ["validation", "校验"],
+];
 const esc = value => String(value ?? "").replace(/[&<>"']/g, character => ({
   "&": "&amp;",
   "<": "&lt;",
@@ -261,6 +270,8 @@ async function loadSystem() {
   $("#endnote-library").value = cfg.endnote_library || "";
   $("#source-open-access").checked = (cfg.acquisition_sources || []).includes("open_access");
   $("#source-institution").checked = (cfg.acquisition_sources || []).includes("institution");
+  $("#acquisition-mode").value = ACQUISITION_MODES[cfg.acquisition_mode] ? cfg.acquisition_mode : "legacy";
+  updateAcquisitionModeDescription();
   $("#auto-institution").checked = cfg.auto_institution === true;
   $("#auto-commit").checked = cfg.auto_commit !== false;
   $("#login-wait-seconds").value = cfg.login_wait_seconds || 600;
@@ -341,6 +352,12 @@ function parsePublisherLoginUrls(value) {
     urls[publisher] = url;
   }
   return urls;
+}
+
+function updateAcquisitionModeDescription() {
+  const mode = $("#acquisition-mode").value;
+  $("#acquisition-mode-description").textContent =
+    (ACQUISITION_MODES[mode] || ACQUISITION_MODES.legacy).description;
 }
 
 function renderBatchList() {
@@ -462,9 +479,15 @@ function renderBatchDetail(batch) {
   const batchError = batch.error === "Zotero 本地 API 未启用" && state.system?.zotero?.ready
     ? "上次提交时 Zotero 本地 API 未启用；当前已连接，可重新提交。"
     : batch.error;
+  const mode = ACQUISITION_MODES[batch.acquisition_mode] || ACQUISITION_MODES.legacy;
+  const stageProgress = batch.acquisition_progress || {};
+  const acquisitionProgress = ACQUISITION_STAGES.map(([stage, label]) => {
+    const values = stageProgress[stage] || {};
+    return `<span><strong>${label}</strong> 运行 ${Number(values.running) || 0} · 等待 ${Number(values.waiting) || 0}</span>`;
+  }).join("");
   $("#task-detail").innerHTML = `
     <div class="task-head">
-      <div><h2>${esc(batch.name)}</h2><p class="task-subtitle">${statusChip(batch.status)}<span>Zotero · ${esc(batch.target_library || "未命名")}</span></p></div>
+      <div><h2>${esc(batch.name)}</h2><p class="task-subtitle">${statusChip(batch.status)}<span>Zotero · ${esc(batch.target_library || "未命名")}</span><span>获取模式 · ${esc(mode.label)}</span></p></div>
       <div class="task-actions">
         <button type="button" data-action="${paused ? "resume" : "pause"}">${paused ? "继续任务" : "暂停"}</button>
         <button class="primary" type="button" data-action="commit">提交 Zotero</button>
@@ -481,6 +504,7 @@ function renderBatchDetail(batch) {
     </div>
     <div class="progress-meta"><span>已完成 ${counts.complete} / ${papers.length}</span><strong>${pct}%</strong></div>
     <div class="progress" role="progressbar" aria-label="批次完成进度" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${pct}"><span style="width:${pct}%"></span></div>
+    <div class="acquisition-progress" aria-label="获取阶段进度">${acquisitionProgress}</div>
     <div class="summary-grid">
       <div class="summary-card"><b>${papers.length}</b><span>论文总数</span></div>
       <div class="summary-card"><b>${counts.pdf}</b><span>PDF 已验证</span></div>
@@ -1343,6 +1367,8 @@ $("#batch-form").addEventListener("submit", async event => {
   }
 });
 
+$("#acquisition-mode").addEventListener("change", updateAcquisitionModeDescription);
+
 $("#settings-form").addEventListener("submit", async event => {
   event.preventDefault();
   const button = event.currentTarget.querySelector("button[type='submit']");
@@ -1358,6 +1384,7 @@ $("#settings-form").addEventListener("submit", async event => {
       unpaywall_email: $("#unpaywall-email").value,
       endnote_library: $("#endnote-library").value,
       acquisition_sources: sources,
+      acquisition_mode: $("#acquisition-mode").value,
       ocr_enabled: $("#ocr-enabled").checked,
       ocr_languages: $("#ocr-languages").value,
       ocr_max_pages: Number($("#ocr-max-pages").value || 2),

@@ -144,6 +144,13 @@
           <label class="check"><input id="source-institution" type="checkbox"><span>机构订阅（EZProxy / CARSI / 手动浏览器）</span></label>
           <label class="check"><input id="auto-institution" type="checkbox"><span>自动尝试机构获取</span></label>
           <label class="check"><input id="auto-commit" type="checkbox" checked><span>获取后自动提交 Zotero</span></label>
+          <label><span class="field-label">获取并行模式</span><select id="acquisition-mode">
+            <option value="legacy">当前实现：逐篇获取</option>
+            <option value="oa_parallel">OA 并行、机构逐篇（推荐）</option>
+            <option value="publisher_parallel">跨出版社 + OA 并行</option>
+            <option value="full_parallel">完全并行（同出版社可重叠）</option>
+          </select></label>
+          <p id="acquisition-mode-description" class="settings-note">逐篇处理；单篇在来源可用时同时尝试 OA 与机构。仅影响新批次。</p>
           <label><span class="field-label">登录等待秒数 <button class="help-button" type="button" data-help="为机构登录、验证码或双重验证预留的等待时间。" aria-label="登录等待帮助">?</button></span><input id="login-wait-seconds" type="number" min="30" max="1800" value="600"></label>
         </section>
 

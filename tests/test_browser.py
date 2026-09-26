@@ -4,6 +4,7 @@ import asyncio
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 
 from paper_endnote.browser import BrowserSession
 from paper_endnote.publishers import is_publisher_block, publisher_pdf_candidates
@@ -16,6 +17,28 @@ from paper_endnote.user_config import (
 
 
 class BrowserSessionTests(unittest.TestCase):
+    def test_configured_proxy_hosts_map_to_publisher_without_substring_guessing(self) -> None:
+        profile = InstitutionProfile(
+            id="example", name="Example", ezproxy_hosts=("proxy.example.edu",)
+        )
+        session = BrowserSession(SimpleNamespace(institution=profile))
+        self.assertEqual(
+            session.publisher_for_url(
+                "https://ieeexplore-ieee-org.proxy.example.edu/document/1"
+            ),
+            "ieee",
+        )
+        self.assertEqual(
+            session.publisher_for_url(
+                "https://www-sciencedirect-com.proxy.example.edu/science/article/1"
+            ),
+            "sciencedirect",
+        )
+        self.assertNotEqual(
+            session.publisher_for_url("https://ieeexplore-ieee-org.evil.example/document/1"),
+            "ieee",
+        )
+
     def test_profile_directories_are_isolated_for_non_ascii_school_ids(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             settings = type(
@@ -143,6 +166,468 @@ class _FakeContext:
 
 
 class BrowserSessionAsyncTests(unittest.IsolatedAsyncioTestCase):
+    async def test_retry_invalidation_closes_old_article_tab(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            session = BrowserSession(SimpleNamespace(download_dir=Path(directory)))
+
+            class Page:
+                def __init__(self):
+                    self.handlers = {}
+                    self.closed = False
+
+                def on(self, event, handler):
+                    self.handlers[event] = handler
+
+                async def close(self):
+                    self.closed = True
+
+            page = Page()
+            session._bind_page(page, "paper-retry")
+            session._institution_pages["paper-retry"] = page
+            session._institution_targets["paper-retry"] = "https://example.invalid/old"
+            await session.invalidate_paper_downloads(
+                "paper-retry", close_pages=True
+            )
+            self.assertTrue(page.closed)
+            self.assertNotIn("paper-retry", session._institution_pages)
+            self.assertIsNone(session._page_papers[id(page)])
+
+    async def test_invalidate_old_pages_drains_callbacks_and_allows_new_binding(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            session = BrowserSession(SimpleNamespace(download_dir=Path(directory)))
+            save_started = asyncio.Event()
+            opener_ready = asyncio.Event()
+            delivered: list[str] = []
+
+            async def callback(paper_id, _path):
+                delivered.append(paper_id)
+
+            session.set_download_callback(callback)
+
+            class Page:
+                def __init__(self, opener=None, wait_for_opener=False):
+                    self.handlers = {}
+                    self._opener = opener
+                    self.wait_for_opener = wait_for_opener
+
+                def on(self, event, handler):
+                    self.handlers[event] = handler
+
+                async def opener(self):
+                    if self.wait_for_opener:
+                        await opener_ready.wait()
+                    return self._opener
+
+            class SlowDownload:
+                suggested_filename = "old.pdf"
+
+                async def save_as(self, path):
+                    Path(path).write_bytes(b"partial")
+                    save_started.set()
+                    await asyncio.Event().wait()
+
+            class ImmediateDownload:
+                suggested_filename = "new.pdf"
+
+                async def save_as(self, path):
+                    Path(path).write_bytes(b"%PDF-1.4\n")
+
+            old_page = Page()
+            old_popup = Page(old_page)
+            pending_popup = Page(old_page, wait_for_opener=True)
+            session._bind_page(old_page, "paper-retry")
+            session._bind_page(old_popup, "paper-retry")
+            old_page.handlers["download"](SlowDownload())
+            await save_started.wait()
+            session._handle_context_page(pending_popup)
+            pending_popup.handlers["download"](ImmediateDownload())
+
+            invalidation = asyncio.create_task(
+                session.invalidate_paper_downloads("paper-retry")
+            )
+            await asyncio.sleep(0)
+            self.assertFalse(invalidation.done())
+            opener_ready.set()
+            await asyncio.wait_for(invalidation, timeout=2)
+            self.assertIsNone(session._page_papers[id(old_page)])
+            self.assertIsNone(session._page_papers[id(old_popup)])
+            self.assertEqual(delivered, [])
+            self.assertFalse((Path(directory) / "paper-retry" / "manual-old.pdf").exists())
+
+            old_page.handlers["download"](ImmediateDownload())
+            await session.wait_for_downloads("paper-retry")
+            self.assertEqual(delivered, [])
+
+            new_page = Page()
+            session._bind_page(new_page, "paper-retry")
+            new_page.handlers["download"](ImmediateDownload())
+            await session.wait_for_downloads("paper-retry")
+            self.assertEqual(delivered, ["paper-retry"])
+
+    async def test_popup_download_stays_with_its_opener_when_context_event_follows(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            session = BrowserSession(SimpleNamespace(download_dir=Path(directory)))
+            saved: list[tuple[str, Path]] = []
+
+            async def callback(paper_id, path):
+                saved.append((paper_id, path))
+
+            session.set_download_callback(callback)
+
+            class Page:
+                def __init__(self, opener=None):
+                    self.handlers = {}
+                    self._opener = opener
+
+                def on(self, event, handler):
+                    self.handlers[event] = handler
+
+                async def opener(self):
+                    return self._opener
+
+            class Download:
+                suggested_filename = "article.pdf"
+
+                async def save_as(self, path):
+                    Path(path).write_bytes(b"%PDF-1.4\n")
+
+            opener_a = Page()
+            opener_b = Page()
+            popup_b = Page(opener_b)
+            session._bind_page(opener_a, "paper-a")
+            session._bind_page(opener_b, "paper-b")
+            opener_b.handlers["popup"](popup_b)
+            session._handle_context_page(popup_b)
+            self.assertEqual(session._page_papers[id(popup_b)], "paper-b")
+            popup_b.handlers["download"](Download())
+            await session.wait_for_downloads("paper-b")
+            self.assertEqual([paper for paper, _ in saved], ["paper-b"])
+            self.assertTrue(saved[0][1].exists())
+
+    async def test_wait_for_downloads_includes_popup_waiting_for_opener(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            session = BrowserSession(SimpleNamespace(download_dir=Path(directory)))
+            opener_ready = asyncio.Event()
+            saved: list[str] = []
+
+            async def callback(paper_id, _path):
+                saved.append(paper_id)
+
+            session.set_download_callback(callback)
+
+            class Page:
+                def __init__(self, opener=None):
+                    self.handlers = {}
+                    self._opener = opener
+
+                def on(self, event, handler):
+                    self.handlers[event] = handler
+
+                async def opener(self):
+                    await opener_ready.wait()
+                    return self._opener
+
+            class Download:
+                suggested_filename = "article.pdf"
+
+                async def save_as(self, path):
+                    Path(path).write_bytes(b"%PDF-1.4\n")
+
+            opener = Page()
+            popup = Page(opener)
+            session._bind_page(opener, "paper-b")
+            session._handle_context_page(popup)
+            popup.handlers["download"](Download())
+            waiter = asyncio.create_task(session.wait_for_downloads("paper-b"))
+            await asyncio.sleep(0)
+            self.assertFalse(waiter.done())
+            opener_ready.set()
+            await asyncio.wait_for(waiter, timeout=2)
+            self.assertEqual(saved, ["paper-b"])
+
+    async def test_stop_papers_cancels_in_flight_pdf_request(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            profile = InstitutionProfile(id="school", name="School")
+            session = BrowserSession(
+                SimpleNamespace(institution=profile, download_dir=Path(directory))
+            )
+            request_started = asyncio.Event()
+
+            class Request:
+                async def get(self, *_args, **_kwargs):
+                    request_started.set()
+                    await asyncio.Event().wait()
+
+            class Page:
+                url = "https://publisher.example/article"
+
+                def __init__(self):
+                    self.closed = False
+                    self.handlers = {}
+
+                def on(self, event, callback):
+                    self.handlers[event] = callback
+
+                async def wait_for_timeout(self, _milliseconds):
+                    return None
+
+                async def close(self):
+                    self.closed = True
+
+            class Context:
+                request = Request()
+
+                def __init__(self):
+                    self.page = Page()
+
+                async def new_page(self):
+                    return self.page
+
+            context = Context()
+
+            async def context_for(_profile):
+                return context
+
+            async def open_entry(_page, url, **_kwargs):
+                return url
+
+            async def links(_page):
+                return [{"text": "PDF", "href": "https://publisher.example/main.pdf"}]
+
+            session._context_for = context_for
+            session._open_institution_entry = open_entry
+            session._candidate_links = links
+            task = asyncio.create_task(
+                session.acquire_for_paper(
+                    "paper-stop", "https://publisher.example/article", profile=profile
+                )
+            )
+            await asyncio.wait_for(request_started.wait(), timeout=2)
+            await session.stop_papers(["paper-stop"])
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+            self.assertTrue(context.page.closed)
+            self.assertNotIn("paper-stop", session._paper_contexts)
+            self.assertFalse((Path(directory) / "paper-stop" / "institution-main.pdf").exists())
+
+    async def test_same_publisher_tabs_overlap_and_keep_profile_cookies(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            profile_a = InstitutionProfile(id="school-a", name="A")
+            profile_b = InstitutionProfile(id="school-b", name="B")
+            session = BrowserSession(
+                SimpleNamespace(institution=profile_a, download_dir=Path(directory))
+            )
+            entered = asyncio.Event()
+            release = asyncio.Event()
+            active = 0
+            peak = 0
+            requests: list[tuple[str, str]] = []
+
+            class Response:
+                status = 200
+                headers = {"content-type": "application/pdf"}
+
+                def __init__(self, content: bytes):
+                    self.content = content
+
+                async def body(self):
+                    return self.content
+
+            class Request:
+                def __init__(self, school: str):
+                    self.school = school
+
+                async def get(self, url: str, **_kwargs):
+                    nonlocal active, peak
+                    requests.append((self.school, url))
+                    active += 1
+                    peak = max(peak, active)
+                    if len(requests) == 3:
+                        entered.set()
+                    await release.wait()
+                    active -= 1
+                    return Response(f"%PDF-1.4\n{self.school}:{url}".encode())
+
+            class Page:
+                def __init__(self):
+                    self.url = ""
+                    self.closed = False
+                    self.handlers = {}
+
+                def on(self, event, handler):
+                    self.handlers[event] = handler
+
+                async def wait_for_timeout(self, _milliseconds):
+                    return None
+
+                async def title(self):
+                    return "Paper"
+
+                async def close(self):
+                    self.closed = True
+
+            class Context:
+                def __init__(self, school):
+                    self.request = Request(school)
+                    self.pages = []
+
+                async def new_page(self):
+                    page = Page()
+                    self.pages.append(page)
+                    return page
+
+            contexts = {"school-a": Context("A"), "school-b": Context("B")}
+
+            async def context_for(profile):
+                context = contexts[profile.id]
+                session._context = context  # Simulate another profile starting.
+                await asyncio.sleep(0)
+                return context
+
+            async def open_entry(page, url, **_kwargs):
+                page.url = url
+                return url
+
+            async def links(page):
+                return [{"text": "PDF", "href": page.url + ".pdf"}]
+
+            async def unexpected_reveal(_page):
+                self.fail("automatic article tabs must not be brought to front")
+
+            session._context_for = context_for
+            session._open_institution_entry = open_entry
+            session._candidate_links = links
+            session._reveal = unexpected_reveal
+            urls = [
+                ("paper-a1", "https://publisher.example/a1", profile_a),
+                ("paper-a2", "https://publisher.example/a2", profile_a),
+                ("paper-b1", "https://publisher.example/b1", profile_b),
+            ]
+            tasks = [
+                asyncio.create_task(session.acquire_for_paper(paper, url, profile=profile))
+                for paper, url, profile in urls
+            ]
+            await asyncio.wait_for(entered.wait(), timeout=2)
+            self.assertEqual(peak, 3)
+            self.assertEqual([school for school, _ in requests].count("A"), 2)
+            release.set()
+            results = await asyncio.gather(*tasks)
+            for (paper, url, profile), result in zip(urls, results):
+                content = Path(result["path"]).read_bytes()
+                self.assertIn(f"{profile.name}:{url}.pdf".encode(), content)
+                self.assertTrue(contexts[profile.id].pages)
+                self.assertTrue(contexts[profile.id].pages[-1].closed)
+
+    async def test_ready_manual_session_uses_two_same_publisher_tabs(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            profile = InstitutionProfile(id="school", name="School", access_type="manual_browser")
+            session = BrowserSession(
+                SimpleNamespace(institution=profile, download_dir=Path(directory))
+            )
+            session.mark_institution_session("publisher.example", "ready", profile=profile)
+            both_fetching = asyncio.Event()
+            release = asyncio.Event()
+            entered: list[str] = []
+
+            class Page:
+                def __init__(self):
+                    self.url = ""
+                    self.handlers = {}
+                    self.closed = False
+
+                def on(self, event, handler):
+                    self.handlers[event] = handler
+
+                async def goto(self, url, **_kwargs):
+                    self.url = url
+
+                async def wait_for_timeout(self, _milliseconds):
+                    return None
+
+                def is_closed(self):
+                    return self.closed
+
+                async def title(self):
+                    return "Paper"
+
+                async def close(self):
+                    self.closed = True
+
+            class Context:
+                def __init__(self):
+                    self.pages = []
+
+                async def new_page(self):
+                    page = Page()
+                    self.pages.append(page)
+                    return page
+
+            context = Context()
+
+            async def context_for(_profile):
+                return context
+
+            async def links(page):
+                return [{"text": "PDF", "href": page.url + ".pdf"}]
+
+            async def fetch(paper_id, _candidates, destination):
+                entered.append(paper_id)
+                if len(entered) == 2:
+                    both_fetching.set()
+                await release.wait()
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                destination.write_bytes(b"%PDF-1.4\n")
+                return {"source_url": destination.name, "path": str(destination)}
+
+            session._context_for = context_for
+            session._candidate_links = links
+            session._fetch_pdf = fetch
+            tasks = [
+                asyncio.create_task(
+                    session.acquire_for_paper(
+                        paper_id, f"https://publisher.example/{paper_id}", profile=profile
+                    )
+                )
+                for paper_id in ("paper-1", "paper-2")
+            ]
+            await asyncio.wait_for(both_fetching.wait(), timeout=2)
+            self.assertEqual(set(entered), {"paper-1", "paper-2"})
+            release.set()
+            await asyncio.gather(*tasks)
+            self.assertEqual(len(context.pages), 2)
+            self.assertTrue(all(page.closed for page in context.pages))
+
+    async def test_doi_preflight_uses_background_tab_and_closes_it(self) -> None:
+        profile = InstitutionProfile(id="school-a", name="A")
+        session = BrowserSession(SimpleNamespace(institution=profile))
+
+        class Page:
+            url = ""
+            closed = False
+
+            def on(self, *_args):
+                return None
+
+            async def goto(self, _url, **_kwargs):
+                self.url = "https://ieeexplore.ieee.org/document/42"
+
+            async def close(self):
+                self.closed = True
+
+        page = Page()
+
+        class Context:
+            async def new_page(self):
+                return page
+
+        async def context_for(_profile):
+            return Context()
+
+        session._context_for = context_for
+        result = await session.resolve_publisher_for_paper("https://doi.org/10.1000/test")
+        self.assertEqual(result, "ieee")
+        self.assertTrue(page.closed)
+
     async def test_popup_inherits_its_opener_paper_binding(self) -> None:
         session = BrowserSession.__new__(BrowserSession)
         session._page_papers = {}
@@ -265,7 +750,6 @@ class BrowserSessionAsyncTests(unittest.IsolatedAsyncioTestCase):
                 },
             )()
             session._context = _FakeContext(page)
-            session._acquire_lock = asyncio.Lock()
             session._active_paper_id = None
             session._blocked_papers = set()
             session._download_callback = None

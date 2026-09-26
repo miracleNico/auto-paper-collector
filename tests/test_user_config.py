@@ -14,6 +14,7 @@ from paper_endnote.user_config import (
     institution_proxy_url,
     load_acquisition_config,
     load_preset,
+    normalize_acquisition_mode,
     normalize_sources,
 )
 
@@ -55,15 +56,33 @@ class UserConfigTests(unittest.TestCase):
             self.assertEqual(original.institution.id, "")
             self.assertEqual(original.institution.access_type, "ezproxy")
             self.assertEqual(original.sources, ("open_access",))
+            self.assertEqual(original.acquisition_mode, "legacy")
             self.assertFalse(original.auto_institution)
             path.write_text(dump_acquisition_config(original), encoding="utf-8")
             loaded = load_acquisition_config(path, create=False)
             self.assertEqual(loaded.sources, ("open_access",))
+            self.assertEqual(loaded.acquisition_mode, "legacy")
             self.assertEqual(loaded.institution.ezproxy_hosts, ())
             self.assertTrue(loaded.ocr.enabled)
             self.assertFalse(loaded.auto_institution)
             self.assertTrue(loaded.auto_commit)
             self.assertEqual(loaded.login_wait_seconds, 600)
+
+    def test_acquisition_mode_roundtrip_and_validation(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "config.toml"
+            config = AcquisitionConfig(acquisition_mode="full_parallel")
+            path.write_text(dump_acquisition_config(config), encoding="utf-8")
+            self.assertEqual(
+                load_acquisition_config(path, create=False).acquisition_mode,
+                "full_parallel",
+            )
+            self.assertEqual(normalize_acquisition_mode("oa_parallel"), "oa_parallel")
+            with self.assertRaisesRegex(ConfigError, "未知获取模式"):
+                normalize_acquisition_mode("unlimited")
+            path.write_text('[acquisition]\nacquisition_mode = "unlimited"\n', encoding="utf-8")
+            with self.assertRaisesRegex(ConfigError, "未知获取模式"):
+                load_acquisition_config(path, create=False)
 
     def test_existing_institution_choices_and_profile_are_preserved(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

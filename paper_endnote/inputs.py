@@ -64,7 +64,9 @@ def parse_input(text: str) -> list[dict[str, Any]]:
             dialect = csv.Sniffer().sniff("\n".join(lines[:5]), delimiters=",\t;")
         except csv.Error:
             dialect = csv.excel
-        for row in csv.DictReader(io.StringIO("\n".join(lines)), dialect=dialect):
+        # Sniffer only sees the first five lines and may infer doublequote=False
+        # when an escaped quote first appears later in a standard CSV file.
+        for row in csv.DictReader(io.StringIO("\n".join(lines)), dialect=dialect, doublequote=True):
             parsed = _from_mapping(row)
             if parsed:
                 items.append(parsed)

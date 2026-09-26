@@ -1,0 +1,51 @@
+domain	query	clue
+machine-learning	deep learning LeCun Bengio Hinton	LeCun 等那篇深度学习综述
+machine-learning	ImageNet classification deep convolutional neural networks Krizhevsky	AlexNet 那篇 ImageNet 深度卷积分类论文
+machine-learning	deep residual learning image recognition He Zhang	何恺明的残差图像识别论文
+machine-learning	mastering game Go deep neural networks tree search Silver	Silver 等用深度网络与树搜索下围棋的论文
+machine-learning	human level control deep reinforcement learning Mnih	Mnih 等深度强化学习达到人类水平控制的论文
+genetics	programmable dual RNA guided DNA endonuclease Jinek	Jinek 等双 RNA 引导的可编程 DNA 核酸酶论文
+genetics	multiplex genome engineering CRISPR Cas Cong	Cong 等 CRISPR 多重基因组工程论文
+genetics	highly accurate protein structure prediction AlphaFold Jumper	Jumper 等 AlphaFold 高精度蛋白结构预测论文
+genetics	initial sequencing analysis human genome Lander	人类基因组首次测序分析那篇 Lander 论文
+genetics	molecular structure nucleic acids deoxyribose nucleic acid Watson Crick	Watson 与 Crick 的 DNA 分子结构短文
+medicine	safety efficacy BNT162b2 mRNA Covid vaccine Polack	Polack 等 BNT162b2 疫苗安全有效性试验
+medicine	dexamethasone hospitalized patients Covid Horby	住院新冠患者用地塞米松的 RECOVERY 试验
+medicine	SGLT2 inhibition dapagliflozin heart failure reduced ejection fraction McMurray	McMurray 等达格列净治疗射血分数降低心衰试验
+medicine	once weekly semaglutide adults overweight obesity Wilding	Wilding 等每周司美格鲁肽治疗肥胖试验
+medicine	Mediterranean diet primary prevention cardiovascular disease Estruch 2018	Estruch 等地中海饮食预防心血管病的 2018 修订试验
+neuroscience	default mode brain function Raichle	Raichle 等大脑默认模式论文
+neuroscience	grid cells microstructure spatial map entorhinal cortex Hafting	Hafting 等内嗅皮层空间地图微结构论文
+neuroscience	a quantitative description membrane current conduction excitation nerve Hodgkin Huxley	Hodgkin Huxley 神经膜电流和兴奋传导模型
+neuroscience	a neural substrate prediction reward Schultz Dayan Montague	Schultz 等奖励预测的神经基础论文
+neuroscience	intrinsic functional connectivity default mode hypothesis Greicius	Greicius 等默认模式假说功能连接分析
+climate	planetary boundaries guiding human development changing planet Steffen	Steffen 等指导人类发展的行星边界论文
+climate	safe operating space humanity Rockstrom	Rockstrom 等人类安全活动空间论文
+climate	global warming 1.5 degree trajectories earth system anthropocene Steffen	Steffen 等人类世地球系统轨迹论文
+climate	extremely high temperatures climate change attribution human influence Fischer Knutti	Fischer Knutti 全球极端高温与降水中的人为贡献
+climate	global carbon budget 2023 Friedlingstein	Friedlingstein 等 2023 全球碳预算论文
+ecology	global biodiversity scenarios year 2100 Sala	Sala 等 2100 年全球生物多样性情景论文
+ecology	extinction risk climate change Thomas 2004	Thomas 等气候变化导致物种灭绝风险论文
+ecology	biodiversity ecosystem functioning human wellbeing Cardinale	Cardinale 等生物多样性丧失及其人类影响论文
+ecology	worldwide decline entomofauna drivers Sanchez Bayo	Sanchez Bayo 等全球昆虫衰退驱动因素综述
+ecology	high resolution global maps forest cover change Hansen	Hansen 等森林覆盖变化高分辨率全球地图
+physics	electric field effect atomically thin carbon films Novoselov	Novoselov 等原子级薄碳膜电场效应论文
+physics	observation gravitational waves binary black hole merger Abbott	Abbott 等首次双黑洞引力波观测论文
+physics	observation new particle search standard model Higgs boson ATLAS	ATLAS 发现希格斯候选新粒子的论文
+physics	quantum supremacy programmable superconducting processor Arute	Arute 等可编程超导处理器量子优势论文
+physics	first M87 event horizon telescope results shadow supermassive black hole	M87 事件视界望远镜首组结果中的黑洞阴影论文
+chemistry	metal halide perovskites visible light sensitizers photovoltaic cells Kojima	Kojima 等金属卤化物钙钛矿可见光光伏敏化剂论文
+chemistry	organometal halide perovskites high efficiency hybrid solar cells Lee	Lee 等有机金属卤化物钙钛矿高效混合太阳能电池
+chemistry	issues challenges facing rechargeable lithium batteries Tarascon Armand	Tarascon Armand 可充锂电池问题与挑战论文
+chemistry	lithium ion batteries advanced materials Goodenough Park	Goodenough Park 锂离子电池展望论文
+chemistry	porous crystalline covalent organic frameworks Cote	Cote 等多孔晶态共价有机框架论文
+economics	prospect theory analysis decision under risk Kahneman Tversky	Kahneman Tversky 风险决策前景理论论文
+economics	market lemons quality uncertainty market mechanism Akerlof	Akerlof 柠檬市场质量不确定性论文
+economics	pricing options corporate liabilities Black Scholes	Black Scholes 期权与公司负债定价论文
+economics	behavioral model rational choice Simon	Simon 理性选择行为模型论文
+economics	colonial origins comparative development empirical investigation Acemoglu Johnson Robinson	Acemoglu 等比较发展殖民起源实证论文
+networks	mathematical theory communication Shannon 1948	Shannon 的通信数学理论论文
+networks	dynamic small world networks Watts Strogatz	Watts Strogatz 小世界网络动力学论文
+networks	emergence scaling random networks Barabasi Albert	Barabasi Albert 随机网络标度涌现论文
+networks	fundamental properties human mobility patterns Gonzalez Hidalgo Barabasi	Gonzalez 等人类移动模式基本特征论文
+networks	delay tolerant networking approach interplanetary internet Fall	Fall 的延迟容忍网络体系架构论文

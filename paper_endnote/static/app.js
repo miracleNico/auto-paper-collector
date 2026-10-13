@@ -91,6 +91,16 @@ function toast(message) {
   node.timer = setTimeout(() => node.classList.remove("show"), 3800);
 }
 
+function remindAcquisitionEmails() {
+  const settings = state.system?.settings;
+  if (!settings || (String(settings.crossref_email || "").trim() && String(settings.unpaywall_email || "").trim())) return;
+  const node = $("#email-reminder");
+  node.textContent = "推荐先填写Unpaywall/Crossref邮箱再获取哦~ 可以是任何真实邮箱~";
+  node.classList.add("show");
+  clearTimeout(node.timer);
+  node.timer = setTimeout(() => node.classList.remove("show"), 3000);
+}
+
 const STATUS_LABELS = {
   draft: "未开始",
   running: "处理中",
@@ -614,6 +624,7 @@ function bindPaperActions(papers) {
     try {
       if (action === "metadata") return showCandidates(paper);
       if (action === "pdf") return showPdfReview(paper);
+      if (["open", "scholar", "resolver", "institution", "continue-institution", "retry"].includes(action)) remindAcquisitionEmails();
       setButtonBusy(button, true, ["institution", "continue-institution"].includes(action) ? "获取中…" : "处理中…");
       if (["open", "scholar", "resolver"].includes(action)) {
         await api(`/api/papers/${encodeURIComponent(paper.id)}/open?scholar=${action === "scholar"}&resolver=${action === "resolver"}`, {method: "POST", body: "{}"});
@@ -688,6 +699,7 @@ async function batchAction(action) {
   const batchId = state.selectedBatch;
   const button = $(`[data-action='${action}']`);
   if (!batchId || state.deletingBatchIds.has(batchId)) return;
+  if (action === "resume") remindAcquisitionEmails();
   const messages = {commit: "已启动 Zotero 提交", pause: "批次已暂停", resume: "批次已继续", "open-endnote-export": "已打开导出文件夹"};
   setButtonBusy(button, true, "处理中…");
   try {
@@ -1346,6 +1358,7 @@ $("#list-file").addEventListener("change", async event => {
 
 $("#batch-form").addEventListener("submit", async event => {
   event.preventDefault();
+  remindAcquisitionEmails();
   const button = event.currentTarget.querySelector("button[type='submit']");
   setButtonBusy(button, true, "创建中…");
   try {

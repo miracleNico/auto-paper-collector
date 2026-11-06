@@ -93,7 +93,9 @@
 
 3. 结果默认放在 `outputs/paper-input/<时间戳>/`。在“新建任务”里导入或粘贴这份 CSV 就能开工；如果做过检索或筛选，同名的 `.sources.md` 会列出来源链接和还没确认的论文。
 
-skill 只负责备好清单，不会自己启动采集，也不会写入 Zotero 或 EndNote。什么时候出发，还是由你说了算喵。
+skill 默认交付清单和来源记录。要求“更广泛地找论文”时，它会扩展同义词、多来源、作者与引用链，并阅读 abstract 判断研究主线，相关性接近时优先领域顶刊／旗舰会议。详见 [扩大检索与筛选](skills/auto-paper-find-skill/references/search-strategy.md)。
+
+采集、题录恢复、取消跳过、并行模式、PDF 整理及 Zotero／EndNote 的操作方法见 [项目操作手册](skills/auto-paper-find-skill/references/project-workflow.md)。你明确要求启动、采集、入库或导出后，skill 会接着执行相应步骤。
 
 ### 小猫的工作路线
 
@@ -390,7 +392,9 @@ DOI、論文タイトル、または CSV を渡していただければ、書誌
 
 3. 結果は既定で `outputs/paper-input/<タイムスタンプ>/` に保存されます。「新しいタスク」画面でこの CSV を取り込むか貼り付ければ準備完了です。検索や絞り込みを行った場合は、同名の `.sources.md` に出典リンクと未確認の論文がまとめられています。
 
-skill の仕事はリストの準備までです。収集を始めたり Zotero や EndNote に書き込んだりはしないので、出発の合図はいつもどおりあなたからお願いしますにゃ。
+skill は既定で取り込み用リストと出典メモを作成します。広い検索では同義語、複数の索引、著者、引用関係をたどり、abstract で研究の主題を確認します。関連性が近い論文では分野の主要誌・旗艦会議を優先します。[検索方針](skills/auto-paper-find-skill/references/search-strategy.md)を参照してください。
+
+[プロジェクト操作手順](skills/auto-paper-find-skill/references/project-workflow.md)には並列取得、書誌情報の修復、スキップ解除、PDF 整理、Zotero／EndNote の操作をまとめています。収集・登録・エクスポートを明示的に依頼した場合は、その操作まで続けます。
 
 ### お仕事の流れ
 
@@ -671,7 +675,9 @@ Only remember "that paper that introduced the Transformer", or just want "ten pa
 
 3. Results land in `outputs/paper-input/<timestamp>/` by default. Import or paste the CSV on the New task page and you are ready to go. If any searching or filtering happened, a matching `.sources.md` lists the source links and the papers still awaiting confirmation.
 
-The skill only prepares the list: it never starts a collection run or writes to Zotero or EndNote, so when to set off is still your call. I will be ready when you are.
+By default, the skill delivers an importable list and source notes. For broader searches, it expands synonyms, sources, authors and citation trails, then reads abstracts to assess relevance. Leading journals and flagship conferences receive priority among similarly relevant papers. See the [search strategy](skills/auto-paper-find-skill/references/search-strategy.md).
+
+The [project workflow](skills/auto-paper-find-skill/references/project-workflow.md) covers acquisition modes, metadata recovery, restoring skipped papers, PDF tools and Zotero/EndNote operations. When you explicitly request acquisition, library writes or export, the skill continues through those steps.
 
 ### How the paper-pawline works
 
